@@ -8,4 +8,14 @@ repository = "https://github.com/debasishg/porcupine-rust"
 keywords = ["linearizability", "distributed-systems", "concurrency", "testing"]
 categories = ["development-tools::testing"]
 
+[features]
+# Enable model-based testing via quint-connect trace replay.
+# Requires the `quint-connect` CLI to be installed.
+quint-mbt = []
+
 [dependencies]
+
+[dev-dependencies]
+proptest = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
