@@ -82,7 +82,7 @@ module Porcupine {
 
   // INV-HIST-01: well-formed history — all timestamps valid.
   pure def histWellFormed(hist: List[Op]): bool =
-    hist.forall(op => op.call_ts >= 0 and op.ret_ts >= op.call_ts)
+    hist.indices().forall(i => hist[i].call_ts >= 0 and hist[i].ret_ts >= hist[i].call_ts)
 
   // INV-HIST-02: real-time order — if A finishes before B starts, A must be
   // linearized before B in any valid linearization.
@@ -93,11 +93,12 @@ module Porcupine {
   // operation's call timestamp strictly precedes its own call timestamp
   // (INV-HIST-03).
   pure def isMinimal(op: Op, hist: List[Op], lin: Set[int]): bool =
-    hist.forall(other =>
+    hist.indices().forall(i => {
+      val other = hist[i]
       lin.contains(other.id) or
       other.id == op.id or
       other.call_ts >= op.call_ts
-    )
+    })
 
   // Sequential register model step:
   // Returns (ok, next_state) where ok = true iff (input, output) is consistent.
@@ -110,7 +111,9 @@ module Porcupine {
 
   // Collect all operations eligible to be linearized next.
   pure def frontier(hist: List[Op], lin: Set[int]): List[Op] =
-    hist.filter(op => not(lin.contains(op.id)) and isMinimal(op, hist, lin))
+    hist.foldl([], (acc, op) =>
+      if (not(lin.contains(op.id)) and isMinimal(op, hist, lin)) acc.append(op) else acc
+    )
 
   // ---------------------------------------------------------------------------
   // Initial state
@@ -130,7 +133,7 @@ module Porcupine {
   // Try to linearize one minimal operation.
   // If the model step succeeds, push the choice onto the stack.
   // If the model step fails, do not advance (caller must try next candidate).
-  action tryLinearize(op: Op) = {
+  action tryLinearize(op: Op): bool = {
     val step = registerStep(reg, op)
     if (step.ok) {
       all {
@@ -151,7 +154,7 @@ module Porcupine {
 
   // Backtrack: undo the most recent linearization choice.
   action backtrack = {
-    val top = stack.last()
+    val top = stack[stack.length() - 1]
     all {
       linearized' = linearized.exclude(Set(top.op_id)),
       reg'        = top.pre_reg,
@@ -161,19 +164,29 @@ module Porcupine {
   }
 
   // Top-level DFS step: pick one minimal op and try to linearize it.
+  // Once result is decided ("Ok" or "Illegal"), stutter.
   action step = {
-    val candidates = frontier(HISTORY, linearized)
-    if (candidates.length() > 0) {
-      nondet op = candidates.oneOf()
-      tryLinearize(op)
-    } else if (stack.length() > 0) {
-      backtrack
-    } else {
+    if (result != "Unknown") {
       all {
-        result'     = "Illegal",
         linearized' = linearized,
         reg'        = reg,
+        result'     = result,
         stack'      = stack
+      }
+    } else {
+      val candidates = frontier(HISTORY, linearized)
+      if (candidates.length() > 0) {
+        nondet i = candidates.indices().oneOf()
+        tryLinearize(candidates[i])
+      } else if (stack.length() > 0) {
+        backtrack
+      } else {
+        all {
+          result'     = "Illegal",
+          linearized' = linearized,
+          reg'        = reg,
+          stack'      = stack
+        }
       }
     }
   }
@@ -187,10 +200,10 @@ module Porcupine {
     histWellFormed(HISTORY)
 
   // INV-HIST-03: every op in the frontier is truly minimal.
-  val minimalCallFrontier: bool =
-    frontier(HISTORY, linearized).forall(op =>
-      isMinimal(op, HISTORY, linearized)
-    )
+  val minimalCallFrontier: bool = {
+    val fr = frontier(HISTORY, linearized)
+    fr.indices().forall(i => isMinimal(fr[i], HISTORY, linearized))
+  }
 
   // INV-LIN-04: cache soundness — the linearized set uniquely identifies the
   // DFS node (together with reg). We express this structurally: no two stack
