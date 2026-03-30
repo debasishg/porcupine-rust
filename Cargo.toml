@@ -1,0 +1,11 @@
+[package]
+name = "porcupine"
+version = "0.1.0"
+edition = "2024"
+description = "A fast linearizability checker for testing concurrent and distributed systems"
+license = "MIT"
+repository = "https://github.com/debasishg/porcupine-rust"
+keywords = ["linearizability", "distributed-systems", "concurrency", "testing"]
+categories = ["development-tools::testing"]
+
+[dependencies]
