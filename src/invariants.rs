@@ -2,10 +2,6 @@
 //
 // Every macro here corresponds to an `INV-*` identifier in `docs/spec.md`.
 // Run `/spec-sync` to verify that no INV-* ID exists in one place but not the other.
-//
-// Macros exported below but not yet called at all DFS call-sites (implementation
-// is still a stub) produce spurious unused warnings — suppressed here.
-#![allow(unused_macros, unused_imports)]
 
 // ---------------------------------------------------------------------------
 // INV-HIST-01: Well-Formed History
@@ -38,6 +34,12 @@ macro_rules! assert_well_formed {
 /// earlier call timestamp.
 ///
 /// # INV-HIST-03
+///
+/// Note: this macro is designed for use with `Operation` slices. In the DFS
+/// (`checker.rs`) INV-HIST-03 is enforced structurally — `head_next()` always
+/// returns the first live call in time-sorted order, so minimality is guaranteed
+/// by construction rather than by an explicit assertion.
+#[allow(unused_macros)]
 macro_rules! assert_minimal_call {
     ($op:expr, $all_ops:expr, $linearized_ids:expr) => {
         #[cfg(debug_assertions)]
@@ -93,6 +95,11 @@ macro_rules! assert_partition_independent {
 /// model state (same bitset key + same state → same result).
 ///
 /// # INV-LIN-04
+///
+/// Note: in `checker.rs` the cache lookup already checks `state == cached_state`
+/// via `PartialEq` inside `cache_contains`. This macro is available for any
+/// future context where the check needs to be made explicitly at a call-site.
+#[allow(unused_macros)]
 macro_rules! assert_cache_sound {
     ($cached_state:expr, $current_state:expr) => {
         debug_assert!(
@@ -102,7 +109,12 @@ macro_rules! assert_cache_sound {
     };
 }
 
+// assert_cache_sound and assert_minimal_call are enforced structurally in
+// checker.rs (see INV-HIST-03 and INV-LIN-04 notes on each macro). They are
+// exported here for optional explicit use at future call-sites.
+#[allow(unused_imports)]
 pub(crate) use assert_cache_sound;
+#[allow(unused_imports)]
 pub(crate) use assert_minimal_call;
 pub(crate) use assert_partition_independent;
 pub(crate) use assert_well_formed;

@@ -2,6 +2,7 @@
 ///
 /// Port of <https://github.com/anishathalye/porcupine>.
 pub mod checker;
+pub(crate) mod bitset;
 pub(crate) mod invariants;
 pub mod model;
 pub mod types;
