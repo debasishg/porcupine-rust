@@ -15,7 +15,7 @@
 
 #![cfg(feature = "quint-mbt")]
 
-use porcupine::{CheckResult, Model, Operation};
+use porcupine::{CheckResult, Event, EventKind, Model, Operation};
 use serde::Deserialize;
 use std::process::Command;
 
@@ -134,5 +134,115 @@ fn mbt_trace_matches_rust_checker() {
         "MBT mismatch: Quint says {:?}, Rust says {:?}. \
          The Rust implementation diverges from the formal model.",
         quint_result, rust_result
+    );
+}
+
+/// Convert the example history into a time-sorted event slice.
+///
+/// Event order is determined by each operation's timestamps:
+///   op0: write(1)  [call=0,  ret=10]
+///   op1: read→1    [call=5,  ret=15]
+///   op2: write(2)  [call=12, ret=20]
+///   op3: read→2    [call=18, ret=25]
+///
+/// Sorted by (timestamp, calls-before-returns-at-ties):
+///   t=0:  call op0  (id=0)
+///   t=5:  call op1  (id=1)
+///   t=10: ret  op0  (id=0)
+///   t=12: call op2  (id=2)
+///   t=15: ret  op1  (id=1)
+///   t=18: call op3  (id=3)
+///   t=20: ret  op2  (id=2)
+///   t=25: ret  op3  (id=3)
+fn example_history_as_events() -> Vec<Event<RegisterInput, i64>> {
+    vec![
+        // t=0: call op0 write(1)
+        Event { client_id: 0, kind: EventKind::Call,   input: Some(RegisterInput { is_write: true,  value: 1 }), output: None,    id: 0 },
+        // t=5: call op1 read
+        Event { client_id: 1, kind: EventKind::Call,   input: Some(RegisterInput { is_write: false, value: 0 }), output: None,    id: 1 },
+        // t=10: ret op0
+        Event { client_id: 0, kind: EventKind::Return, input: None,                                               output: Some(0), id: 0 },
+        // t=12: call op2 write(2)
+        Event { client_id: 2, kind: EventKind::Call,   input: Some(RegisterInput { is_write: true,  value: 2 }), output: None,    id: 2 },
+        // t=15: ret op1 → 1
+        Event { client_id: 1, kind: EventKind::Return, input: None,                                               output: Some(1), id: 1 },
+        // t=18: call op3 read
+        Event { client_id: 3, kind: EventKind::Call,   input: Some(RegisterInput { is_write: false, value: 0 }), output: None,    id: 3 },
+        // t=20: ret op2
+        Event { client_id: 2, kind: EventKind::Return, input: None,                                               output: Some(0), id: 2 },
+        // t=25: ret op3 → 2
+        Event { client_id: 3, kind: EventKind::Return, input: None,                                               output: Some(2), id: 3 },
+    ]
+}
+
+/// Verify that `check_events` and `check_operations` agree on the Quint example
+/// history.  This is a pure Rust cross-API check that exercises the full event
+/// pipeline (renumber → convert_entries → DFS) against the known-good result
+/// produced by `check_operations`.
+///
+/// Exercises INV-LIN-01 (Soundness) and INV-LIN-02 (Completeness) for the
+/// event path.
+#[test]
+fn mbt_check_events_agrees_with_check_operations() {
+    let history = example_history();
+    let events  = example_history_as_events();
+    let model   = RegisterModel;
+
+    let ops_result    = porcupine::checker::check_operations(&model, &history);
+    let events_result = porcupine::checker::check_events(&model, &events);
+
+    assert_eq!(
+        events_result, ops_result,
+        "check_events ({:?}) and check_operations ({:?}) must agree on the Quint \
+         example history; the event pipeline diverges from the operation pipeline.",
+        events_result, ops_result
+    );
+    // The example history is linearizable: op0, op1, op2, op3 in order.
+    assert_eq!(ops_result, CheckResult::Ok,
+        "The Quint example history must be linearizable");
+}
+
+/// Run `quint run` to generate an ITF trace, then verify that `check_events`
+/// on the same history returns the same result as the Quint model.
+///
+/// This makes the MBT harness validate both public entry points against the
+/// formal model, not only `check_operations`.
+///
+/// Exercises INV-LIN-01 (Soundness) and INV-LIN-02 (Completeness).
+#[test]
+fn mbt_check_events_matches_quint_trace() {
+    let trace_path = std::env::temp_dir().join("porcupine_mbt_events_trace.itf.json");
+    let status = Command::new("quint")
+        .args([
+            "run",
+            "tla/Porcupine.qnt",
+            "--out-itf",
+            trace_path.to_str().unwrap(),
+            "--max-steps",
+            "20",
+        ])
+        .status()
+        .expect("Failed to run `quint` — is it installed? (npm install -g @informalsystems/quint)");
+
+    assert!(status.success(), "`quint run` exited with non-zero status");
+
+    let trace_json = std::fs::read_to_string(&trace_path)
+        .expect("Failed to read ITF trace output");
+    let trace: ItfTrace = serde_json::from_str(&trace_json)
+        .expect("Failed to parse ITF trace JSON");
+
+    let final_state = trace.states.last()
+        .expect("ITF trace has no states");
+
+    let quint_result  = quint_result_to_check_result(&final_state.result);
+    let events        = example_history_as_events();
+    let model         = RegisterModel;
+    let events_result = porcupine::checker::check_events(&model, &events);
+
+    assert_eq!(
+        events_result, quint_result,
+        "MBT event mismatch: Quint says {:?}, check_events says {:?}. \
+         The event pipeline diverges from the formal model.",
+        quint_result, events_result
     );
 }

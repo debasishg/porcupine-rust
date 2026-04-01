@@ -5,7 +5,7 @@
 ///
 /// Run:  cargo test --test property_tests
 use proptest::prelude::*;
-use porcupine::{CheckResult, Model, Operation};
+use porcupine::{CheckResult, Event, EventKind, Model, Operation};
 
 // ---------------------------------------------------------------------------
 // A concrete sequential model: an integer register.
@@ -318,4 +318,160 @@ proptest! {
         prop_assert_eq!(whole, CheckResult::Ok,
             "INV-LIN-03: sequential KV history must be linearizable");
     }
+}
+
+// ===========================================================================
+// check_events property tests
+//
+// These mirror the check_operations properties above, exercising the event-
+// based entry point and the renumber/convert_entries pipeline.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Helpers: convert a sequential Operation history to an ordered Event slice.
+//
+// For a sequential (non-overlapping) history the events are already in time
+// order: each op's call comes before its return, and ops don't interleave.
+// We emit events in the natural order: call_0, ret_0, call_1, ret_1, ...
+// ---------------------------------------------------------------------------
+
+fn sequential_ops_to_events(
+    ops: &[Operation<RegisterInput, i64>],
+) -> Vec<Event<RegisterInput, i64>> {
+    ops.iter()
+        .enumerate()
+        .flat_map(|(i, op)| {
+            [
+                Event {
+                    client_id: op.client_id,
+                    kind: EventKind::Call,
+                    input: Some(op.input.clone()),
+                    output: None,
+                    id: i as u64,
+                },
+                Event {
+                    client_id: op.client_id,
+                    kind: EventKind::Return,
+                    input: None,
+                    output: Some(op.output.clone()),
+                    id: i as u64,
+                },
+            ]
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// INV-LIN-01 + INV-LIN-02: sequential events are always linearizable
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// A purely sequential event history must always be linearizable.
+    /// Mirrors prop_sequential_history_is_linearizable for the event path.
+    /// INV-LIN-01 + INV-LIN-02.
+    #[test]
+    fn prop_events_sequential_history_is_linearizable(len in 1usize..8) {
+        let history = sequential_history(len);
+        let events  = sequential_ops_to_events(&history);
+        let result  = porcupine::checker::check_events(&RegisterModel, &events);
+        prop_assert_eq!(result, CheckResult::Ok,
+            "Sequential history expressed as events must be linearizable (INV-LIN-01)");
+    }
+}
+
+proptest! {
+    /// A single-operation event history is trivially linearizable.
+    /// INV-LIN-01.
+    #[test]
+    fn prop_events_single_op_is_linearizable(value in -100i64..100) {
+        let history = single_op_history(value);
+        let events  = sequential_ops_to_events(&history);
+        let result  = porcupine::checker::check_events(&RegisterModel, &events);
+        prop_assert_eq!(result, CheckResult::Ok,
+            "Single-op event history must be linearizable (INV-LIN-01)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-API equivalence: check_events and check_operations must agree
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// For any sequential register history, check_events and check_operations
+    /// must return the same result.
+    ///
+    /// This is the strongest single property for the event path: any bug in
+    /// renumber, convert_entries, or the event partition pipeline that causes
+    /// the two APIs to diverge will be caught here.
+    /// INV-LIN-01 + INV-LIN-02.
+    #[test]
+    fn prop_events_agree_with_operations_on_sequential_history(len in 1usize..8) {
+        let history = sequential_history(len);
+        let events  = sequential_ops_to_events(&history);
+        let ops_result    = porcupine::checker::check_operations(&RegisterModel, &history);
+        let events_result = porcupine::checker::check_events(&RegisterModel, &events);
+        prop_assert_eq!(ops_result, events_result,
+            "check_operations and check_events must agree on the same sequential history");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INV-LIN-02: a known non-linearizable history must be detected via events
+// ---------------------------------------------------------------------------
+
+/// The same illegal history used in prop_illegal_history_is_detected, but
+/// expressed as an event stream.  After write(1) fully completes, a read
+/// that returns 0 has no valid linearization.
+fn illegal_register_history_as_events() -> Vec<Event<RegisterInput, i64>> {
+    // Equivalent to the 2-op illegal history used in prop_illegal_history_is_detected:
+    //   write(1) fully completes (ret before read's call), then read returns 0.
+    // Event slice order (index = time):
+    //   t=0: call write(1)   [id=0]
+    //   t=1: ret  write      [id=0]  ← write completes
+    //   t=2: call read       [id=1]  ← starts AFTER write (t=2 > t=1)
+    //   t=3: ret  read→0     [id=1]  ← returns 0, must be 1 — illegal
+    vec![
+        Event { client_id: 0, kind: EventKind::Call,   input: Some(RegisterInput { is_write: true,  value: 1 }), output: None,    id: 0 },
+        Event { client_id: 0, kind: EventKind::Return, input: None,                                               output: Some(0), id: 0 },
+        Event { client_id: 1, kind: EventKind::Call,   input: Some(RegisterInput { is_write: false, value: 0 }), output: None,    id: 1 },
+        Event { client_id: 1, kind: EventKind::Return, input: None,                                               output: Some(0), id: 1 },
+    ]
+}
+
+#[test]
+fn prop_events_illegal_history_is_detected() {
+    let events = illegal_register_history_as_events();
+    let result = porcupine::checker::check_events(&RegisterModel, &events);
+    assert_eq!(result, CheckResult::Illegal,
+        "INV-LIN-02: a non-linearizable event history must be detected as Illegal");
+}
+
+// ---------------------------------------------------------------------------
+// INV-LIN-04: cache soundness — identical event inputs yield identical results
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// Two calls to check_events with identical input must return identical results.
+    /// INV-LIN-04.
+    #[test]
+    fn prop_events_cache_sound_deterministic(len in 1usize..6) {
+        let history = sequential_history(len);
+        let events  = sequential_ops_to_events(&history);
+        let r1 = porcupine::checker::check_events(&RegisterModel, &events);
+        let r2 = porcupine::checker::check_events(&RegisterModel, &events);
+        prop_assert_eq!(r1, r2,
+            "INV-LIN-04: identical event inputs must yield identical results");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INV-LIN-01: empty event history is always Ok
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prop_events_empty_history_is_ok() {
+    let events: Vec<Event<RegisterInput, i64>> = vec![];
+    let result = porcupine::checker::check_events(&RegisterModel, &events);
+    assert_eq!(result, CheckResult::Ok,
+        "INV-LIN-01: empty event history must be linearizable");
 }

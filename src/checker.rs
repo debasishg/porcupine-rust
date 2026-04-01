@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bitset::Bitset;
-use crate::invariants::{assert_partition_independent, assert_well_formed};
+use crate::invariants::{assert_partition_independent, assert_well_formed, assert_well_formed_events};
 use crate::model::Model;
 use crate::types::{CheckResult, Event, EventKind, Operation};
 
@@ -36,7 +36,7 @@ enum EntryValue<I, O> {
 #[derive(Clone)]
 struct Entry<I, O> {
     id:    usize, // operation id (0-indexed); call and return share the same id
-    time:  i64,
+    time:  u64,   // u64 to avoid silent overflow when timestamps are near u64::MAX
     value: EntryValue<I, O>,
 }
 
@@ -45,8 +45,8 @@ struct Entry<I, O> {
 fn make_entries<I: Clone, O: Clone>(ops: &[Operation<I, O>]) -> Vec<Entry<I, O>> {
     let mut entries = Vec::with_capacity(ops.len() * 2);
     for (id, op) in ops.iter().enumerate() {
-        entries.push(Entry { id, time: op.call as i64,        value: EntryValue::Call(op.input.clone()) });
-        entries.push(Entry { id, time: op.return_time as i64, value: EntryValue::Return(op.output.clone()) });
+        entries.push(Entry { id, time: op.call,        value: EntryValue::Call(op.input.clone()) });
+        entries.push(Entry { id, time: op.return_time, value: EntryValue::Return(op.output.clone()) });
     }
     entries.sort_by(|a, b| {
         a.time.cmp(&b.time).then_with(|| {
@@ -84,7 +84,7 @@ fn convert_entries<I: Clone, O: Clone>(events: &[Event<I, O>]) -> Vec<Entry<I, O
             EventKind::Call   => EntryValue::Call(ev.input.clone().expect("Call event must have input")),
             EventKind::Return => EntryValue::Return(ev.output.clone().expect("Return event must have output")),
         };
-        Entry { id: ev.id as usize, time: i as i64, value }
+        Entry { id: ev.id as usize, time: i as u64, value }
     }).collect()
 }
 
@@ -382,6 +382,10 @@ pub fn check_operations<M: Model>(model: &M, history: &[Operation<M::Input, M::O
 
 /// Check an event-based history for linearizability.
 pub fn check_events<M: Model>(model: &M, history: &[Event<M::Input, M::Output>]) -> CheckResult {
+    // INV-HIST-01 (event form): every id has exactly one Call and one Return,
+    // Call has input=Some, Return has output=Some, and Call precedes its Return.
+    assert_well_formed_events!(history);
+
     let partitions: Vec<Vec<Entry<M::Input, M::Output>>> =
         if let Some(parts) = model.partition_events(history) {
             assert_partition_independent!(parts);
@@ -396,4 +400,516 @@ pub fn check_events<M: Model>(model: &M, history: &[Event<M::Input, M::Output>])
         };
 
     check_parallel(model, partitions)
+}
+
+// ===========================================================================
+// Unit tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Model;
+    use crate::types::{CheckResult, Event, EventKind, Operation};
+
+    // -----------------------------------------------------------------------
+    // Minimal integer register model used throughout these tests.
+    //
+    // State:   i32   (current register value; initialised to 0)
+    // Input:   RegInput { is_write, value }
+    // Output:  i32   (observed register value for reads; ignored for writes)
+    //
+    // step:
+    //   write(v) → always valid, next state = v
+    //   read      → valid iff output == state; next state unchanged
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone)]
+    struct Reg;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct RegInput {
+        is_write: bool,
+        value:    i32,
+    }
+
+    impl Model for Reg {
+        type State  = i32;
+        type Input  = RegInput;
+        type Output = i32;
+
+        fn init(&self) -> i32 { 0 }
+
+        fn step(&self, state: &i32, input: &RegInput, output: &i32) -> Option<i32> {
+            if input.is_write {
+                Some(input.value)
+            } else if *output == *state {
+                Some(*state)
+            } else {
+                None
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper constructors
+    // -----------------------------------------------------------------------
+
+    fn write(v: i32) -> RegInput { RegInput { is_write: true,  value: v } }
+    fn read()        -> RegInput { RegInput { is_write: false, value: 0 } }
+
+    fn op(id: u64, input: RegInput, output: i32, call: u64, ret: u64)
+        -> Operation<RegInput, i32>
+    {
+        Operation { client_id: id, input, output, call, return_time: ret }
+    }
+
+    fn call_ev(id: u64, input: RegInput) -> Event<RegInput, i32> {
+        Event { client_id: id, kind: EventKind::Call, input: Some(input), output: None, id }
+    }
+    fn ret_ev(id: u64, output: i32) -> Event<RegInput, i32> {
+        Event { client_id: id, kind: EventKind::Return, input: None, output: Some(output), id }
+    }
+
+    // -----------------------------------------------------------------------
+    // make_entries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn make_entries_empty_produces_no_entries() {
+        let entries = make_entries::<RegInput, i32>(&[]);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn make_entries_single_op_produces_two_entries() {
+        let entries = make_entries(&[op(0, write(1), 0, 5, 15)]);
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[0].value, EntryValue::Call(_)));
+        assert!(matches!(entries[1].value, EntryValue::Return(_)));
+        assert_eq!(entries[0].time, 5);
+        assert_eq!(entries[1].time, 15);
+        assert_eq!(entries[0].id, 0);
+        assert_eq!(entries[1].id, 0);
+    }
+
+    #[test]
+    fn make_entries_call_before_return_at_equal_timestamps() {
+        // Instantaneous op (call == return_time). INV-HIST-02 tie-breaking:
+        // Call must sort before Return at equal timestamps.
+        let entries = make_entries(&[op(0, write(1), 0, 10, 10)]);
+        assert!(matches!(entries[0].value, EntryValue::Call(_)),
+            "Call must precede Return when timestamps are equal");
+    }
+
+    #[test]
+    fn make_entries_time_sorted_across_two_ops() {
+        // op A: call=5, ret=15   op B: call=0, ret=10
+        // Expected order: CallB(0), CallA(5), RetB(10), RetA(15)
+        let entries = make_entries(&[
+            op(0, write(1), 0, 5, 15),
+            op(1, write(2), 0, 0, 10),
+        ]);
+        assert_eq!(entries.len(), 4);
+        assert_eq!([entries[0].time, entries[1].time, entries[2].time, entries[3].time],
+                   [0, 5, 10, 15]);
+        assert!(matches!(entries[0].value, EntryValue::Call(_)));
+        assert!(matches!(entries[1].value, EntryValue::Call(_)));
+        assert!(matches!(entries[2].value, EntryValue::Return(_)));
+        assert!(matches!(entries[3].value, EntryValue::Return(_)));
+    }
+
+    #[test]
+    fn make_entries_large_timestamps_do_not_overflow() {
+        // Pre-fix, timestamps near u64::MAX were cast to i64, wrapping to
+        // negative values and inverting the sort order.
+        let t = u64::MAX - 10;
+        let entries = make_entries(&[
+            op(0, write(1), 0, t,     t + 5),
+            op(1, write(2), 0, t + 1, t + 6),
+        ]);
+        // Expected: CallA(t), CallB(t+1), RetA(t+5), RetB(t+6)
+        assert_eq!(entries[0].id, 0);
+        assert_eq!(entries[1].id, 1);
+        assert!(entries[0].time < entries[1].time);
+        assert!(entries[1].time < entries[2].time);
+        assert!(entries[2].time < entries[3].time);
+    }
+
+    // -----------------------------------------------------------------------
+    // renumber
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn renumber_empty_produces_empty() {
+        let out = renumber::<RegInput, i32>(&[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn renumber_contiguous_ids_are_unchanged() {
+        let events = vec![
+            call_ev(0, write(1)), ret_ev(0, 0),
+            call_ev(1, read()),   ret_ev(1, 0),
+        ];
+        let out = renumber(&events);
+        assert_eq!([out[0].id, out[1].id, out[2].id, out[3].id], [0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn renumber_noncontiguous_ids_become_0_based() {
+        let events = vec![
+            Event { client_id: 0, kind: EventKind::Call,   input: Some(write(5)), output: None,    id: 100 },
+            Event { client_id: 0, kind: EventKind::Return, input: None,           output: Some(0), id: 100 },
+            Event { client_id: 1, kind: EventKind::Call,   input: Some(read()),   output: None,    id: 999 },
+            Event { client_id: 1, kind: EventKind::Return, input: None,           output: Some(5), id: 999 },
+        ];
+        let out = renumber(&events);
+        // Call and Return for the same op share their new id.
+        assert_eq!(out[0].id, out[1].id);
+        assert_eq!(out[2].id, out[3].id);
+        // The two ops get distinct ids in {0, 1}.
+        assert_ne!(out[0].id, out[2].id);
+        assert!(out[0].id < 2 && out[2].id < 2);
+    }
+
+    #[test]
+    fn renumber_preserves_event_kind_and_payload() {
+        let events = vec![call_ev(7, write(42)), ret_ev(7, 0)];
+        let out = renumber(&events);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0].kind, EventKind::Call));
+        assert!(matches!(out[1].kind, EventKind::Return));
+        assert_eq!(out[0].id, out[1].id);
+    }
+
+    // -----------------------------------------------------------------------
+    // convert_entries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn convert_entries_uses_slice_index_as_time() {
+        let events = vec![call_ev(0, write(1)), ret_ev(0, 0)];
+        let entries = convert_entries(&events);
+        assert_eq!(entries[0].time, 0);
+        assert_eq!(entries[1].time, 1);
+    }
+
+    #[test]
+    fn convert_entries_maps_kinds_and_ids_correctly() {
+        let events = vec![call_ev(0, write(1)), ret_ev(0, 0)];
+        let entries = convert_entries(&events);
+        assert!(matches!(entries[0].value, EntryValue::Call(_)));
+        assert!(matches!(entries[1].value, EntryValue::Return(_)));
+        assert_eq!(entries[0].id, 0);
+        assert_eq!(entries[1].id, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // NodeArena — lift / unlift symmetry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn arena_lift_and_unlift_restores_two_op_list() {
+        // op A: [0,15]  op B: [5,10]  (A wraps B)
+        // Sorted entries: 1=callA, 2=callB, 3=retB, 4=retA  match: 1↔4, 2↔3
+        let entries = make_entries(&[
+            op(0, write(1), 0, 0, 15),
+            op(1, write(2), 0, 5, 10),
+        ]);
+        let mut arena = NodeArena::from_entries(entries);
+
+        arena.lift(1); // remove nodes 1 and 4 → list: 0 → 2 → 3
+        assert_eq!(arena.head_next(), Some(2));
+        assert_eq!(arena.nodes[2].next, Some(3));
+        assert_eq!(arena.nodes[3].next, None);
+
+        arena.unlift(1); // full list restored: 0 → 1 → 2 → 3 → 4
+        assert_eq!(arena.head_next(), Some(1));
+        assert_eq!(arena.nodes[1].next, Some(2));
+        assert_eq!(arena.nodes[2].next, Some(3));
+        assert_eq!(arena.nodes[3].next, Some(4));
+        assert_eq!(arena.nodes[4].next, None);
+    }
+
+    #[test]
+    fn arena_nested_lift_unlift_restores_three_op_list() {
+        // Three ops: A[0,30], B[5,20], C[25,35].
+        // Sorted: callA(1), callB(2), retB(3), callC(4), retA(5), retC(6)
+        //         match: 1↔5, 2↔3, 4↔6
+        let entries = make_entries(&[
+            op(0, write(1), 0,  0, 30),
+            op(1, write(2), 0,  5, 20),
+            op(2, read(),   1, 25, 35),
+        ]);
+        let mut arena = NodeArena::from_entries(entries);
+
+        arena.lift(1); // remove 1,5 → list: 0→2→3→4→6
+        arena.lift(2); // remove 2,3 → list: 0→4→6
+        assert_eq!(arena.head_next(), Some(4));
+        assert_eq!(arena.nodes[4].next, Some(6));
+
+        arena.unlift(2); // restore 2,3 → list: 0→2→3→4→6
+        assert_eq!(arena.head_next(), Some(2));
+        assert_eq!(arena.nodes[2].next, Some(3));
+        assert_eq!(arena.nodes[3].next, Some(4));
+
+        arena.unlift(1); // restore 1,5 → full list: 0→1→2→3→4→5→6
+        assert_eq!(arena.head_next(), Some(1));
+        assert_eq!(arena.nodes[1].next, Some(2));
+        assert_eq!(arena.nodes[4].next, Some(5));
+        assert_eq!(arena.nodes[5].next, Some(6));
+        assert_eq!(arena.nodes[6].next, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // check_operations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ops_empty_history_is_ok() {
+        assert_eq!(check_operations(&Reg, &[]), CheckResult::Ok);
+    }
+
+    #[test]
+    fn ops_single_write_is_ok() {
+        assert_eq!(check_operations(&Reg, &[op(0, write(42), 0, 0, 10)]), CheckResult::Ok);
+    }
+
+    #[test]
+    fn ops_single_read_returning_init_value_is_ok() {
+        assert_eq!(check_operations(&Reg, &[op(0, read(), 0, 0, 10)]), CheckResult::Ok);
+    }
+
+    #[test]
+    fn ops_single_read_returning_wrong_value_is_illegal() {
+        // Init state = 0; no write has occurred; read returning 42 is illegal.
+        assert_eq!(check_operations(&Reg, &[op(0, read(), 42, 0, 10)]), CheckResult::Illegal);
+    }
+
+    #[test]
+    fn ops_sequential_write_then_correct_read_is_ok() {
+        let history = [op(0, write(5), 0, 0, 10), op(1, read(), 5, 11, 20)];
+        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+    }
+
+    #[test]
+    fn ops_sequential_read_after_write_returning_stale_value_is_illegal() {
+        // write(5) finishes at t=10; read starts at t=11 (no overlap) but returns 0.
+        let history = [op(0, write(5), 0, 0, 10), op(1, read(), 0, 11, 20)];
+        assert_eq!(check_operations(&Reg, &history), CheckResult::Illegal);
+    }
+
+    #[test]
+    fn ops_concurrent_write_and_read_returning_written_value_is_ok() {
+        // write(1)[0,20] overlaps read→1[5,15]; linearization: write then read. ✓
+        let history = [op(0, write(1), 0, 0, 20), op(1, read(), 1, 5, 15)];
+        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+    }
+
+    #[test]
+    fn ops_concurrent_write_and_read_returning_init_value_is_ok() {
+        // write(1)[0,20] overlaps read→0[5,15]; linearization: read then write. ✓
+        let history = [op(0, write(1), 0, 0, 20), op(1, read(), 0, 5, 15)];
+        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+    }
+
+    #[test]
+    fn ops_read_starts_after_write_completes_returning_stale_is_illegal() {
+        // write(1) completes at t=10; read starts at t=12 — strictly after write.
+        // Returning 0 violates real-time order (INV-LIN-02).
+        let history = [op(0, write(1), 0, 0, 10), op(1, read(), 0, 12, 20)];
+        assert_eq!(check_operations(&Reg, &history), CheckResult::Illegal);
+    }
+
+    #[test]
+    fn ops_instantaneous_op_is_ok() {
+        // call == return_time: well-formedness guard allows call ≤ return_time.
+        assert_eq!(check_operations(&Reg, &[op(0, write(7), 0, 5, 5)]), CheckResult::Ok);
+    }
+
+    #[test]
+    fn ops_multiple_reads_all_return_init_before_any_write_is_ok() {
+        let history = [
+            op(0, read(), 0, 0, 10),
+            op(1, read(), 0, 2,  8),
+            op(2, read(), 0, 4,  6),
+        ];
+        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+    }
+
+    #[test]
+    fn ops_two_sequential_writes_then_wrong_read_is_illegal() {
+        // write(1), write(2), read→1: last write was 2 so read must return 2.
+        let history = [
+            op(0, write(1), 0,  0, 10),
+            op(1, write(2), 0, 11, 20),
+            op(2, read(),   1, 21, 30),
+        ];
+        assert_eq!(check_operations(&Reg, &history), CheckResult::Illegal);
+    }
+
+    #[test]
+    fn ops_cache_pruning_does_not_cause_false_illegal() {
+        // Two identical writes reach the same (bitset, state) from two DFS paths.
+        // The cache must not prune a valid unexplored path (INV-LIN-04).
+        let history = [
+            op(0, write(1), 0,  0, 20),
+            op(1, write(1), 0,  5, 15),
+            op(2, read(),   1, 25, 35),
+        ];
+        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+    }
+
+    #[test]
+    fn ops_backtracking_finds_valid_ordering_after_failed_attempts() {
+        // write(1)[0,30], write(2)[5,20], read→1[25,35].
+        // DFS first tries linearize A(write 1)→B(write 2)→C(read→1 fails, state=2).
+        // Backtracks; tries B(write 2)→A(write 1)→C(read→1, state=1 ✓).
+        // Exercises full backtrack and unlift symmetry for two operations.
+        let history = [
+            op(0, write(1), 0,  0, 30),
+            op(1, write(2), 0,  5, 20),
+            op(2, read(),   1, 25, 35),
+        ];
+        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // check_events
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn events_empty_history_is_ok() {
+        let events: Vec<Event<RegInput, i32>> = vec![];
+        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+    }
+
+    #[test]
+    fn events_single_write_is_ok() {
+        let events = [call_ev(0, write(42)), ret_ev(0, 0)];
+        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+    }
+
+    #[test]
+    fn events_single_read_returning_init_value_is_ok() {
+        let events = [call_ev(0, read()), ret_ev(0, 0)];
+        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+    }
+
+    #[test]
+    fn events_single_read_returning_wrong_value_is_illegal() {
+        let events = [call_ev(0, read()), ret_ev(0, 99)];
+        assert_eq!(check_events(&Reg, &events), CheckResult::Illegal);
+    }
+
+    #[test]
+    fn events_sequential_write_then_correct_read_is_ok() {
+        // Slice order = time: t=0 call_write, t=1 ret_write, t=2 call_read, t=3 ret_read→5.
+        let events = [
+            call_ev(0, write(5)), ret_ev(0, 0),
+            call_ev(1, read()),   ret_ev(1, 5),
+        ];
+        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+    }
+
+    #[test]
+    fn events_sequential_read_after_write_returning_stale_value_is_illegal() {
+        let events = [
+            call_ev(0, write(5)), ret_ev(0, 0),
+            call_ev(1, read()),   ret_ev(1, 0), // should be 5
+        ];
+        assert_eq!(check_events(&Reg, &events), CheckResult::Illegal);
+    }
+
+    #[test]
+    fn events_concurrent_write_and_read_returning_written_value_is_ok() {
+        // Interleaved: call_w, call_r, ret_r→1, ret_w.
+        // Valid linearization: write(1) then read→1. ✓
+        let events = [
+            call_ev(0, write(1)), call_ev(1, read()),
+            ret_ev(1, 1),         ret_ev(0, 0),
+        ];
+        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+    }
+
+    #[test]
+    fn events_concurrent_write_and_read_returning_init_value_is_ok() {
+        // Interleaved: call_w, call_r, ret_r→0, ret_w.
+        // Valid linearization: read→0 then write(1). ✓
+        let events = [
+            call_ev(0, write(1)), call_ev(1, read()),
+            ret_ev(1, 0),         ret_ev(0, 0),
+        ];
+        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+    }
+
+    #[test]
+    fn events_sequential_read_after_completed_write_returning_stale_is_illegal() {
+        // write(1) fully completes before read starts.
+        // read returning 0 after write(1) has no valid linearization.
+        let events = [
+            call_ev(0, write(1)), ret_ev(0, 0),
+            call_ev(1, read()),   ret_ev(1, 0),
+        ];
+        assert_eq!(check_events(&Reg, &events), CheckResult::Illegal);
+    }
+
+    #[test]
+    fn events_noncontiguous_ids_produce_same_result_as_contiguous_ids() {
+        // IDs 100 and 999 represent the same logical sequential history as 0 and 1.
+        // renumber() must normalize both to the same DFS problem.
+        let contiguous = [
+            call_ev(0, write(5)), ret_ev(0, 0),
+            call_ev(1, read()),   ret_ev(1, 5),
+        ];
+        let noncontiguous = [
+            Event { client_id: 0, kind: EventKind::Call,   input: Some(write(5)), output: None,    id: 100 },
+            Event { client_id: 0, kind: EventKind::Return, input: None,           output: Some(0), id: 100 },
+            Event { client_id: 1, kind: EventKind::Call,   input: Some(read()),   output: None,    id: 999 },
+            Event { client_id: 1, kind: EventKind::Return, input: None,           output: Some(5), id: 999 },
+        ];
+        assert_eq!(check_events(&Reg, &contiguous),    CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &noncontiguous), CheckResult::Ok);
+    }
+
+    #[test]
+    fn events_agree_with_operations_on_linearizable_history() {
+        // write(1)[0,10] overlaps read→1[5,15]. Both APIs must return Ok.
+        // Equivalent event slice (time-sorted): call_w(t=0), call_r(t=5),
+        //   ret_w(t=10), ret_r(t=15) → encoded as indices 0,1,2,3.
+        let ops = [op(0, write(1), 0, 0, 10), op(1, read(), 1, 5, 15)];
+        let events = [
+            call_ev(0, write(1)), call_ev(1, read()),
+            ret_ev(0, 0),         ret_ev(1, 1),
+        ];
+        assert_eq!(check_operations(&Reg, &ops),    CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &events),     CheckResult::Ok);
+    }
+
+    #[test]
+    fn events_agree_with_operations_on_illegal_history() {
+        // write(1)[0,10], read→0[12,20]: non-overlapping, stale read.
+        let ops = [op(0, write(1), 0, 0, 10), op(1, read(), 0, 12, 20)];
+        let events = [
+            call_ev(0, write(1)), ret_ev(0, 0),
+            call_ev(1, read()),   ret_ev(1, 0),
+        ];
+        assert_eq!(check_operations(&Reg, &ops),    CheckResult::Illegal);
+        assert_eq!(check_events(&Reg, &events),     CheckResult::Illegal);
+    }
+
+    #[test]
+    fn events_backtracking_finds_valid_ordering_after_failed_attempts() {
+        // Three overlapping ops: call_w1, call_w2, call_r, ret_r→1, ret_w2, ret_w1.
+        // DFS first tries w1(state=1) then w2(state=2) then r→1 (1≠2, fails).
+        // Backtracks to try w2(state=2) then w1(state=1) then r→1 (1==1, ✓).
+        let events = [
+            call_ev(0, write(1)), call_ev(1, write(2)), call_ev(2, read()),
+            ret_ev(2, 1),
+            ret_ev(1, 0),
+            ret_ev(0, 0),
+        ];
+        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+    }
 }

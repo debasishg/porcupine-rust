@@ -16,9 +16,12 @@
 ```
 
 Every operation has non-negative timestamps, and return time is never earlier than call
-time. In event-based histories every call event has exactly one corresponding return event.
+time. In event-based histories every call event has exactly one corresponding return event,
+and every call event precedes its matching return event in the slice (position = time).
 
-- **Enforced by**: `debug_assert!` in `invariants::assert_well_formed`
+- **Enforced by**:
+  - `debug_assert!` in `invariants::assert_well_formed` (operation-based histories)
+  - `debug_assert!` in `invariants::assert_well_formed_events` (event-based histories)
 - **Checked by**: `tests/property_tests.rs` — `prop_well_formed_history`
 - **Formal**:  Quint `histWellFormed`
 
@@ -127,7 +130,7 @@ always yield the same sub-tree result. The cache may safely prune any node whose
 
 | ID | spec.md | invariants.rs | property_tests.rs | Porcupine.qnt |
 |----|---------|---------------|-------------------|---------------|
-| INV-HIST-01 | §1 | `assert_well_formed` | `prop_well_formed_history` | `histWellFormed` |
+| INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` | `histWellFormed` |
 | INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order` | `realTimeOrder` |
 | INV-HIST-03 | §1 | `assert_minimal_call` | `prop_soundness` | `minimalCallFrontier` |
 | INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness` | `soundness` |
