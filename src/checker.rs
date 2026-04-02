@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "parallel")]
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -341,56 +341,94 @@ fn check_single<M: Model>(
 // check_parallel — run one check_single per partition
 // ---------------------------------------------------------------------------
 
+/// Returns `true` if all partitions are linearizable, `false` if any failed or
+/// the kill flag was set externally (e.g. by a timeout timer).
 fn check_parallel<M: Model>(
     model:      &M,
     partitions: Vec<Vec<Entry<M::Input, M::Output>>>,
-) -> CheckResult {
-    if partitions.is_empty() {
-        return CheckResult::Ok;
-    }
-
-    let kill = AtomicBool::new(false);
-
+    kill:       &AtomicBool,
+) -> bool {
     for partition in partitions {
-        if !check_single(model, partition, &kill) {
+        if kill.load(Ordering::Relaxed) {
+            return false;
+        }
+        if !check_single(model, partition, kill) {
+            // Set the flag so sibling partitions (if any) abort early.
             kill.store(true, Ordering::Relaxed);
-            return CheckResult::Illegal;
+            return false;
         }
     }
-
-    CheckResult::Ok
+    true
 }
 
 // ---------------------------------------------------------------------------
 // check_parallel_rayon — run check_single partitions in parallel via rayon
 // ---------------------------------------------------------------------------
 
+/// Returns `true` if all partitions are linearizable, `false` if any failed or
+/// the kill flag was set externally (e.g. by a timeout timer).
 #[cfg(feature = "parallel")]
 fn check_parallel_rayon<M>(
     model:      &M,
     partitions: Vec<Vec<Entry<M::Input, M::Output>>>,
-) -> CheckResult
+    kill:       Arc<AtomicBool>,
+) -> bool
 where
     M: Model + Sync,
     M::Input:  Send,
     M::Output: Send,
 {
     if partitions.is_empty() {
-        return CheckResult::Ok;
+        return true;
     }
 
-    let kill = Arc::new(AtomicBool::new(false));
-
-    let any_illegal = partitions.into_par_iter().any(|partition| {
-        let k = Arc::clone(&kill);
-        let ok = check_single(model, partition, &k);
+    let found_illegal = partitions.into_par_iter().any(|partition| {
+        // If kill was set externally (timeout or sibling Illegal), abort without
+        // claiming Illegal — the caller will inspect the timed_out flag.
+        if kill.load(Ordering::Relaxed) {
+            return false;
+        }
+        let ok = check_single(model, partition, &kill);
         if !ok {
-            k.store(true, Ordering::Relaxed);
+            kill.store(true, Ordering::Relaxed);
         }
         !ok
     });
 
-    if any_illegal { CheckResult::Illegal } else { CheckResult::Ok }
+    !found_illegal
+}
+
+// ---------------------------------------------------------------------------
+// Timeout infrastructure
+// ---------------------------------------------------------------------------
+
+/// Spawns a background timer thread that sets `kill` (and `timed_out`) after
+/// `duration`.  The JoinHandle is intentionally dropped — the thread detaches
+/// and exits naturally after sleeping, whether or not the check finishes first.
+fn spawn_timer(kill: &Arc<AtomicBool>, duration: Duration) -> Arc<AtomicBool> {
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let kill_clone     = Arc::clone(kill);
+    let timed_out_clone = Arc::clone(&timed_out);
+    std::thread::spawn(move || {
+        std::thread::sleep(duration);
+        timed_out_clone.store(true, Ordering::Relaxed);
+        kill_clone.store(true, Ordering::Relaxed);
+    });
+    timed_out
+}
+
+/// Translate `(ok, timed_out)` into a [`CheckResult`].
+///
+/// - If the timer fired (`timed_out`), the search was cut short: `Unknown`.
+/// - Otherwise the DFS ran to completion: `Ok` or `Illegal`.
+fn to_check_result(ok: bool, timed_out: &AtomicBool) -> CheckResult {
+    if timed_out.load(Ordering::Relaxed) {
+        CheckResult::Unknown
+    } else if ok {
+        CheckResult::Ok
+    } else {
+        CheckResult::Illegal
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +436,16 @@ where
 // ---------------------------------------------------------------------------
 
 /// Check an operation-based history for linearizability.
-pub fn check_operations<M: Model>(model: &M, history: &[Operation<M::Input, M::Output>]) -> CheckResult {
+///
+/// `timeout` bounds the search: if the DFS has not finished within the given
+/// [`Duration`], the function returns [`CheckResult::Unknown`] rather than
+/// blocking indefinitely.  Pass `None` for an unbounded check (equivalent to
+/// `timeout = 0` in the Go original).
+pub fn check_operations<M: Model>(
+    model:   &M,
+    history: &[Operation<M::Input, M::Output>],
+    timeout: Option<Duration>,
+) -> CheckResult {
     // INV-HIST-01
     assert_well_formed!(history);
 
@@ -413,11 +460,23 @@ pub fn check_operations<M: Model>(model: &M, history: &[Operation<M::Input, M::O
             vec![make_entries(history)]
         };
 
-    check_parallel(model, partitions)
+    let kill = Arc::new(AtomicBool::new(false));
+    let timed_out = timeout
+        .map(|d| spawn_timer(&kill, d))
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
+    let ok = check_parallel(model, partitions, &kill);
+    to_check_result(ok, &timed_out)
 }
 
 /// Check an event-based history for linearizability.
-pub fn check_events<M: Model>(model: &M, history: &[Event<M::Input, M::Output>]) -> CheckResult {
+///
+/// `timeout` works identically to [`check_operations`]: `None` means unbounded.
+pub fn check_events<M: Model>(
+    model:   &M,
+    history: &[Event<M::Input, M::Output>],
+    timeout: Option<Duration>,
+) -> CheckResult {
     // INV-HIST-01 (event form): every id has exactly one Call and one Return,
     // Call has input=Some, Return has output=Some, and Call precedes its Return.
     assert_well_formed_events!(history);
@@ -435,7 +494,13 @@ pub fn check_events<M: Model>(model: &M, history: &[Event<M::Input, M::Output>])
             vec![convert_entries(&renumber(history))]
         };
 
-    check_parallel(model, partitions)
+    let kill = Arc::new(AtomicBool::new(false));
+    let timed_out = timeout
+        .map(|d| spawn_timer(&kill, d))
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
+    let ok = check_parallel(model, partitions, &kill);
+    to_check_result(ok, &timed_out)
 }
 
 /// Check an operation-based history for linearizability using rayon parallelism.
@@ -444,11 +509,14 @@ pub fn check_events<M: Model>(model: &M, history: &[Event<M::Input, M::Output>])
 /// concurrently on the rayon thread pool.  If the model does not implement
 /// `partition`, the whole history is checked as a single partition (no speedup).
 ///
+/// `timeout` works identically to [`check_operations`]: `None` means unbounded.
+///
 /// Requires the `parallel` feature.
 #[cfg(feature = "parallel")]
 pub fn check_operations_parallel<M>(
     model:   &M,
     history: &[Operation<M::Input, M::Output>],
+    timeout: Option<Duration>,
 ) -> CheckResult
 where
     M: Model + Sync,
@@ -467,16 +535,25 @@ where
             vec![make_entries(history)]
         };
 
-    check_parallel_rayon(model, partitions)
+    let kill = Arc::new(AtomicBool::new(false));
+    let timed_out = timeout
+        .map(|d| spawn_timer(&kill, d))
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
+    let ok = check_parallel_rayon(model, partitions, kill);
+    to_check_result(ok, &timed_out)
 }
 
 /// Check an event-based history for linearizability using rayon parallelism.
+///
+/// `timeout` works identically to [`check_operations`]: `None` means unbounded.
 ///
 /// Requires the `parallel` feature.
 #[cfg(feature = "parallel")]
 pub fn check_events_parallel<M>(
     model:   &M,
     history: &[Event<M::Input, M::Output>],
+    timeout: Option<Duration>,
 ) -> CheckResult
 where
     M: Model + Sync,
@@ -498,7 +575,13 @@ where
             vec![convert_entries(&renumber(history))]
         };
 
-    check_parallel_rayon(model, partitions)
+    let kill = Arc::new(AtomicBool::new(false));
+    let timed_out = timeout
+        .map(|d| spawn_timer(&kill, d))
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
+    let ok = check_parallel_rayon(model, partitions, kill);
+    to_check_result(ok, &timed_out)
 }
 
 // ===========================================================================
@@ -767,50 +850,50 @@ mod tests {
 
     #[test]
     fn ops_empty_history_is_ok() {
-        assert_eq!(check_operations(&Reg, &[]), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &[], None), CheckResult::Ok);
     }
 
     #[test]
     fn ops_single_write_is_ok() {
-        assert_eq!(check_operations(&Reg, &[op(0, write(42), 0, 0, 10)]), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &[op(0, write(42), 0, 0, 10)], None), CheckResult::Ok);
     }
 
     #[test]
     fn ops_single_read_returning_init_value_is_ok() {
-        assert_eq!(check_operations(&Reg, &[op(0, read(), 0, 0, 10)]), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &[op(0, read(), 0, 0, 10)], None), CheckResult::Ok);
     }
 
     #[test]
     fn ops_single_read_returning_wrong_value_is_illegal() {
         // Init state = 0; no write has occurred; read returning 42 is illegal.
-        assert_eq!(check_operations(&Reg, &[op(0, read(), 42, 0, 10)]), CheckResult::Illegal);
+        assert_eq!(check_operations(&Reg, &[op(0, read(), 42, 0, 10)], None), CheckResult::Illegal);
     }
 
     #[test]
     fn ops_sequential_write_then_correct_read_is_ok() {
         let history = [op(0, write(5), 0, 0, 10), op(1, read(), 5, 11, 20)];
-        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &history, None), CheckResult::Ok);
     }
 
     #[test]
     fn ops_sequential_read_after_write_returning_stale_value_is_illegal() {
         // write(5) finishes at t=10; read starts at t=11 (no overlap) but returns 0.
         let history = [op(0, write(5), 0, 0, 10), op(1, read(), 0, 11, 20)];
-        assert_eq!(check_operations(&Reg, &history), CheckResult::Illegal);
+        assert_eq!(check_operations(&Reg, &history, None), CheckResult::Illegal);
     }
 
     #[test]
     fn ops_concurrent_write_and_read_returning_written_value_is_ok() {
         // write(1)[0,20] overlaps read→1[5,15]; linearization: write then read. ✓
         let history = [op(0, write(1), 0, 0, 20), op(1, read(), 1, 5, 15)];
-        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &history, None), CheckResult::Ok);
     }
 
     #[test]
     fn ops_concurrent_write_and_read_returning_init_value_is_ok() {
         // write(1)[0,20] overlaps read→0[5,15]; linearization: read then write. ✓
         let history = [op(0, write(1), 0, 0, 20), op(1, read(), 0, 5, 15)];
-        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &history, None), CheckResult::Ok);
     }
 
     #[test]
@@ -818,13 +901,13 @@ mod tests {
         // write(1) completes at t=10; read starts at t=12 — strictly after write.
         // Returning 0 violates real-time order (INV-LIN-02).
         let history = [op(0, write(1), 0, 0, 10), op(1, read(), 0, 12, 20)];
-        assert_eq!(check_operations(&Reg, &history), CheckResult::Illegal);
+        assert_eq!(check_operations(&Reg, &history, None), CheckResult::Illegal);
     }
 
     #[test]
     fn ops_instantaneous_op_is_ok() {
         // call == return_time: well-formedness guard allows call ≤ return_time.
-        assert_eq!(check_operations(&Reg, &[op(0, write(7), 0, 5, 5)]), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &[op(0, write(7), 0, 5, 5)], None), CheckResult::Ok);
     }
 
     #[test]
@@ -834,7 +917,7 @@ mod tests {
             op(1, read(), 0, 2,  8),
             op(2, read(), 0, 4,  6),
         ];
-        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &history, None), CheckResult::Ok);
     }
 
     #[test]
@@ -845,7 +928,7 @@ mod tests {
             op(1, write(2), 0, 11, 20),
             op(2, read(),   1, 21, 30),
         ];
-        assert_eq!(check_operations(&Reg, &history), CheckResult::Illegal);
+        assert_eq!(check_operations(&Reg, &history, None), CheckResult::Illegal);
     }
 
     #[test]
@@ -857,7 +940,7 @@ mod tests {
             op(1, write(1), 0,  5, 15),
             op(2, read(),   1, 25, 35),
         ];
-        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &history, None), CheckResult::Ok);
     }
 
     #[test]
@@ -871,7 +954,7 @@ mod tests {
             op(1, write(2), 0,  5, 20),
             op(2, read(),   1, 25, 35),
         ];
-        assert_eq!(check_operations(&Reg, &history), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &history, None), CheckResult::Ok);
     }
 
     // -----------------------------------------------------------------------
@@ -881,25 +964,25 @@ mod tests {
     #[test]
     fn events_empty_history_is_ok() {
         let events: Vec<Event<RegInput, i32>> = vec![];
-        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
     }
 
     #[test]
     fn events_single_write_is_ok() {
         let events = [call_ev(0, write(42)), ret_ev(0, 0)];
-        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
     }
 
     #[test]
     fn events_single_read_returning_init_value_is_ok() {
         let events = [call_ev(0, read()), ret_ev(0, 0)];
-        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
     }
 
     #[test]
     fn events_single_read_returning_wrong_value_is_illegal() {
         let events = [call_ev(0, read()), ret_ev(0, 99)];
-        assert_eq!(check_events(&Reg, &events), CheckResult::Illegal);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Illegal);
     }
 
     #[test]
@@ -909,7 +992,7 @@ mod tests {
             call_ev(0, write(5)), ret_ev(0, 0),
             call_ev(1, read()),   ret_ev(1, 5),
         ];
-        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
     }
 
     #[test]
@@ -918,7 +1001,7 @@ mod tests {
             call_ev(0, write(5)), ret_ev(0, 0),
             call_ev(1, read()),   ret_ev(1, 0), // should be 5
         ];
-        assert_eq!(check_events(&Reg, &events), CheckResult::Illegal);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Illegal);
     }
 
     #[test]
@@ -929,7 +1012,7 @@ mod tests {
             call_ev(0, write(1)), call_ev(1, read()),
             ret_ev(1, 1),         ret_ev(0, 0),
         ];
-        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
     }
 
     #[test]
@@ -940,7 +1023,7 @@ mod tests {
             call_ev(0, write(1)), call_ev(1, read()),
             ret_ev(1, 0),         ret_ev(0, 0),
         ];
-        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
     }
 
     #[test]
@@ -951,7 +1034,7 @@ mod tests {
             call_ev(0, write(1)), ret_ev(0, 0),
             call_ev(1, read()),   ret_ev(1, 0),
         ];
-        assert_eq!(check_events(&Reg, &events), CheckResult::Illegal);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Illegal);
     }
 
     #[test]
@@ -968,8 +1051,8 @@ mod tests {
             Event { client_id: 1, kind: EventKind::Call,   input: Some(read()),   output: None,    id: 999 },
             Event { client_id: 1, kind: EventKind::Return, input: None,           output: Some(5), id: 999 },
         ];
-        assert_eq!(check_events(&Reg, &contiguous),    CheckResult::Ok);
-        assert_eq!(check_events(&Reg, &noncontiguous), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &contiguous,    None), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &noncontiguous, None), CheckResult::Ok);
     }
 
     #[test]
@@ -982,8 +1065,8 @@ mod tests {
             call_ev(0, write(1)), call_ev(1, read()),
             ret_ev(0, 0),         ret_ev(1, 1),
         ];
-        assert_eq!(check_operations(&Reg, &ops),    CheckResult::Ok);
-        assert_eq!(check_events(&Reg, &events),     CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &ops,    None), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &events,     None), CheckResult::Ok);
     }
 
     #[test]
@@ -994,8 +1077,8 @@ mod tests {
             call_ev(0, write(1)), ret_ev(0, 0),
             call_ev(1, read()),   ret_ev(1, 0),
         ];
-        assert_eq!(check_operations(&Reg, &ops),    CheckResult::Illegal);
-        assert_eq!(check_events(&Reg, &events),     CheckResult::Illegal);
+        assert_eq!(check_operations(&Reg, &ops,    None), CheckResult::Illegal);
+        assert_eq!(check_events(&Reg, &events,     None), CheckResult::Illegal);
     }
 
     #[test]
@@ -1009,6 +1092,68 @@ mod tests {
             ret_ev(1, 0),
             ret_ev(0, 0),
         ];
-        assert_eq!(check_events(&Reg, &events), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // Timeout behaviour
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn timeout_zero_duration_returns_unknown_or_definitive() {
+        // A zero-length timeout may fire before the DFS even starts.
+        // The result must be one of the three valid variants — never a panic.
+        let history = [op(0, write(1), 0, 0, 10), op(1, read(), 1, 5, 15)];
+        let result = check_operations(&Reg, &history, Some(Duration::ZERO));
+        assert!(
+            matches!(result, CheckResult::Ok | CheckResult::Unknown),
+            "expected Ok or Unknown for a zero-duration timeout, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn timeout_very_long_does_not_affect_result() {
+        // A timeout far in the future must not influence the result at all:
+        // the DFS finishes before the timer fires.
+        let history = [
+            op(0, write(1), 0, 0, 10),
+            op(1, read(),   1, 5, 15),
+        ];
+        assert_eq!(
+            check_operations(&Reg, &history, Some(Duration::from_secs(60))),
+            CheckResult::Ok
+        );
+    }
+
+    #[test]
+    fn timeout_very_long_does_not_affect_illegal_result() {
+        // Same guarantee for an illegal history.
+        let history = [op(0, write(1), 0, 0, 10), op(1, read(), 0, 12, 20)];
+        assert_eq!(
+            check_operations(&Reg, &history, Some(Duration::from_secs(60))),
+            CheckResult::Illegal
+        );
+    }
+
+    #[test]
+    fn timeout_none_matches_none_no_timeout() {
+        // timeout=None and a very long timeout must agree on a known-Ok history.
+        let history = [op(0, write(5), 0, 0, 10), op(1, read(), 5, 11, 20)];
+        assert_eq!(
+            check_operations(&Reg, &history, None),
+            check_operations(&Reg, &history, Some(Duration::from_secs(60)))
+        );
+    }
+
+    #[test]
+    fn timeout_events_very_long_does_not_affect_result() {
+        let events = [
+            call_ev(0, write(1)), call_ev(1, read()),
+            ret_ev(1, 1),         ret_ev(0, 0),
+        ];
+        assert_eq!(
+            check_events(&Reg, &events, Some(Duration::from_secs(60))),
+            CheckResult::Ok
+        );
     }
 }

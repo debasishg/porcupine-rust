@@ -18,13 +18,18 @@ Linearizability is a correctness condition for concurrent systems. A history of 
 
 ```rust
 use porcupine::{CheckResult, Model, Operation};
+use std::time::Duration;
 
 // Define a sequential model (e.g., a register)
 // ...
 
-// Check a history
-let result = porcupine::check_operations(&model, &history);
+// Unbounded check
+let result = porcupine::checker::check_operations(&model, &history, None);
 assert_eq!(result, CheckResult::Ok);
+
+// Bounded check — returns Unknown if the DFS does not finish in time
+let result = porcupine::checker::check_operations(&model, &history, Some(Duration::from_secs(5)));
+assert!(matches!(result, CheckResult::Ok | CheckResult::Unknown));
 ```
 
 ## Status

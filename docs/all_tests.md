@@ -44,7 +44,82 @@ These tests cover the `Bitset` primitive used by the DFS cache.
 
 ---
 
+## 1b. Rust Checker Unit Tests (`cargo test --lib -- checker`)
+
+**Location**: `src/checker.rs` (inline `#[cfg(test)]` module)
+
+**Run**:
+
+```bash
+cargo test --lib
+```
+
+These tests cover internal helpers (`make_entries`, `renumber`, `convert_entries`, `NodeArena`), the public `check_operations` and `check_events` entry points, and the timeout API.
+
+### Internal helper tests (13)
+
+| Test | What it checks |
+|------|----------------|
+| `make_entries_empty_produces_no_entries` | Empty input → empty output |
+| `make_entries_single_op_produces_two_entries` | One op → one Call + one Return entry |
+| `make_entries_call_before_return_at_equal_timestamps` | INV-HIST-02 tie-breaking: Call sorts before Return at equal timestamps |
+| `make_entries_time_sorted_across_two_ops` | Two ops produce four entries in ascending time order |
+| `make_entries_large_timestamps_do_not_overflow` | Timestamps near `u64::MAX` sort correctly without overflow |
+| `renumber_empty_produces_empty` | Empty event list → empty output |
+| `renumber_contiguous_ids_are_unchanged` | IDs already in 0..n pass through unchanged |
+| `renumber_noncontiguous_ids_become_0_based` | Sparse IDs (e.g. 100, 999) are remapped to 0..n |
+| `renumber_preserves_event_kind_and_payload` | Kind and input/output fields are not modified |
+| `convert_entries_uses_slice_index_as_time` | Position in event slice becomes the logical timestamp |
+| `convert_entries_maps_kinds_and_ids_correctly` | Call/Return kind and shared op id are mapped correctly |
+| `arena_lift_and_unlift_restores_two_op_list` | lift+unlift is an identity on a two-op arena |
+| `arena_nested_lift_unlift_restores_three_op_list` | Nested lift+unlift sequences restore full three-op arena |
+
+### `check_operations` tests (15)
+
+| Test | What it checks |
+|------|----------------|
+| `ops_empty_history_is_ok` | Empty history → Ok |
+| `ops_single_write_is_ok` | Single write → Ok |
+| `ops_single_read_returning_init_value_is_ok` | Single read returning init state → Ok |
+| `ops_single_read_returning_wrong_value_is_illegal` | Single read with wrong value → Illegal |
+| `ops_sequential_write_then_correct_read_is_ok` | Non-overlapping write→read with correct value → Ok |
+| `ops_sequential_read_after_write_returning_stale_value_is_illegal` | Non-overlapping write→stale read → Illegal |
+| `ops_concurrent_write_and_read_returning_written_value_is_ok` | Overlapping write+read (return written value) → Ok |
+| `ops_concurrent_write_and_read_returning_init_value_is_ok` | Overlapping write+read (return init value) → Ok |
+| `ops_read_starts_after_write_completes_returning_stale_is_illegal` | Strictly ordered write then stale read → Illegal |
+| `ops_instantaneous_op_is_ok` | call == return_time → Ok |
+| `ops_multiple_reads_all_return_init_before_any_write_is_ok` | Concurrent reads all returning 0 before any write → Ok |
+| `ops_two_sequential_writes_then_wrong_read_is_illegal` | Two writes then stale read → Illegal |
+| `ops_cache_pruning_does_not_cause_false_illegal` | Two identical writes hit cache; valid unexplored path not pruned → Ok |
+| `ops_backtracking_finds_valid_ordering_after_failed_attempts` | DFS backtracks and finds valid ordering on second attempt → Ok |
+
+### `check_events` tests (13)
+
+Mirrors the `check_operations` suite for the event-based entry point. Plus:
+
+| Test | What it checks |
+|------|----------------|
+| `events_noncontiguous_ids_produce_same_result_as_contiguous_ids` | IDs 100 and 999 produce same result as 0 and 1 |
+| `events_agree_with_operations_on_linearizable_history` | Both APIs return Ok on the same history |
+| `events_agree_with_operations_on_illegal_history` | Both APIs return Illegal on the same illegal history |
+| `events_backtracking_finds_valid_ordering_after_failed_attempts` | DFS backtracks on event history |
+
+### Timeout tests (5)
+
+| Test | What it checks |
+|------|----------------|
+| `timeout_zero_duration_returns_unknown_or_definitive` | `Duration::ZERO` never panics; result is Ok or Unknown |
+| `timeout_very_long_does_not_affect_result` | A 60-second timeout on a fast history returns Ok |
+| `timeout_very_long_does_not_affect_illegal_result` | A 60-second timeout on an illegal history returns Illegal |
+| `timeout_none_matches_none_no_timeout` | `None` and a very long timeout agree on the same history |
+| `timeout_events_very_long_does_not_affect_result` | Same guarantee for `check_events` with a long timeout |
+
+**Expected output**: 48 tests, all passing.
+
+---
+
 ## 2. Property-Based Tests (`cargo test --test property_tests`)
+
 
 **Location**: `tests/property_tests.rs`
 
@@ -82,7 +157,7 @@ All property tests use a simple integer-register model:
 | `prop_events_cache_sound_deterministic` | INV-LIN-04 | Two calls to `check_events` with identical input return the same result |
 | `prop_events_empty_history_is_ok` | INV-LIN-01 | Empty event history returns `CheckResult::Ok` |
 
-**Expected output (default)**: 13 tests, all passing.
+**Expected output (default)**: 13 property tests, all passing.
 
 ### 2.3 Test inventory — parallel paths (`--features parallel`)
 
@@ -101,7 +176,7 @@ cargo test --features parallel --test property_tests
 | `parallel_tests::prop_parallel_events_agrees_with_sequential` | INV-LIN-01, INV-LIN-02 | `check_events_parallel` returns the same result as `check_events` for any register event history |
 | `parallel_tests::prop_parallel_kv_agrees_with_sequential` | INV-LIN-03 | For a multi-key KV history with partitioning, `check_operations_parallel` and `check_operations` agree — exercises real partition-level parallelism |
 
-**Expected output (with `--features parallel`)**: 17 tests total (13 existing + 4 parallel), all passing.
+**Expected output (with `--features parallel`)**: 17 property tests total (13 existing + 4 parallel), all passing.
 
 ### 2.4 The illegal history used in `prop_illegal_history_is_detected`
 
@@ -246,7 +321,7 @@ quint run tla/Porcupine.qnt --out-itf /tmp/porcupine_trace.itf.json --max-steps 
 cargo test
 ```
 
-Runs all lib unit tests and all integration tests (excluding `quint-mbt` and `parallel`).
+Runs all lib unit tests (48) and all integration tests (13 property tests). Excludes `quint-mbt` and `parallel` feature gates.
 
 ### Run with parallel feature enabled
 
@@ -254,7 +329,7 @@ Runs all lib unit tests and all integration tests (excluding `quint-mbt` and `pa
 cargo test --features parallel
 ```
 
-Adds 4 parallel property tests (17 total instead of 13). No Quint required.
+Adds 4 parallel property tests (17 property tests total). No Quint required.
 
 ### Run everything including MBT (Quint required)
 
@@ -291,10 +366,10 @@ Tests marked `[par]` require `--features parallel`.
 | INV-HIST-01 | Well-Formed History | — | `prop_well_formed_history` | `histWellFormedInv` | — |
 | INV-HIST-02 | Real-Time Order | structural | `prop_sequential_history_is_linearizable` | `realTimeOrder` (pure def) | — |
 | INV-HIST-03 | Minimal-Call Frontier | structural | covered by soundness tests | `minimalCallFrontier` | — |
-| INV-LIN-01 | Soundness | — | `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable`, `prop_parallel_ops_agrees_with_sequential` [par], `prop_parallel_events_agrees_with_sequential` [par] | `resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_parallel_ops_matches_quint_trace` [par], `mbt_parallel_events_matches_quint_trace` [par] |
-| INV-LIN-02 | Completeness | — | `prop_illegal_history_is_detected`, `parallel_detects_illegal_ops_history` [par] | `resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_parallel_ops_matches_quint_trace` [par] |
+| INV-LIN-01 | Soundness | `timeout_very_long_does_not_affect_result` | `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable`, `prop_parallel_ops_agrees_with_sequential` [par], `prop_parallel_events_agrees_with_sequential` [par] | `resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_parallel_ops_matches_quint_trace` [par], `mbt_parallel_events_matches_quint_trace` [par] |
+| INV-LIN-02 | Completeness | `timeout_very_long_does_not_affect_illegal_result` | `prop_illegal_history_is_detected`, `parallel_detects_illegal_ops_history` [par] | `resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_parallel_ops_matches_quint_trace` [par] |
 | INV-LIN-03 | P-Compositionality | — | `prop_compositionality_partitions_disjoint`, `prop_compositionality_end_to_end`, `prop_parallel_kv_agrees_with_sequential` [par] | `pCompositionality` | — |
-| INV-LIN-04 | Cache Soundness | — | `prop_cache_sound_deterministic`, `prop_events_cache_sound_deterministic` | `cacheSound` | — |
-| INV-PAR-01 | Kill-Flag Monotonicity | structural (`AtomicBool`, stutter guard) | — | `parallelKillFlagInvariant` | — |
+| INV-LIN-04 | Cache Soundness | `timeout_none_matches_none_no_timeout` | `prop_cache_sound_deterministic`, `prop_events_cache_sound_deterministic` | `cacheSound` | — |
+| INV-PAR-01 | Kill-Flag Monotonicity | `timeout_zero_duration_returns_unknown_or_definitive` | — | `parallelKillFlagInvariant` | — |
 
 Full invariant definitions: `docs/spec.md`.

@@ -10,11 +10,11 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
 ┌─────────────────────────────────────────────────────────────────────┐
 │                          Public API (lib.rs)                         │
 │                                                                      │
-│   check_operations(model, history)    check_events(model, history)  │
+│   check_operations(model, history, timeout: Option<Duration>)       │
+│   check_events    (model, history, timeout: Option<Duration>)       │
 │                                                                      │
-│   check_operations_parallel(…)  ┐    check_events_parallel(…)  ┐   │
-│   [feature = "parallel"]        │    [feature = "parallel"]     │   │
-│   M: Sync, M::Input/Output:Send ┘    M: Sync, M::Input/Output:Send┘ │
+│   check_operations_parallel(…, timeout)  ┐  [feature = "parallel"] │
+│   check_events_parallel    (…, timeout)  ┘  M: Sync, I/O: Send     │
 └───────────────────────────┬──────────────────────┬──────────────────┘
                             │                      │
                             ▼                      ▼
@@ -79,18 +79,39 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
 │  ┌─────────────────────────────────────────────────────────────┐  │
 │  │  check_parallel  (sequential, default)                      │  │
 │  │                                                             │  │
+│  │  kill: &AtomicBool  (externally owned — shared with timer)  │  │
 │  │  for each partition:                                        │  │
-│  │    check_single(model, partition_entries, &kill_flag)       │  │
-│  │    if Illegal → set kill flag, return early                 │  │
+│  │    check_single(model, partition_entries, kill)             │  │
+│  │    if Illegal → set kill flag, return false                 │  │
+│  │  returns bool (true = Ok)                                   │  │
 │  └─────────────────────────────────────────────────────────────┘  │
 │                                                                    │
 │  ┌─────────────────────────────────────────────────────────────┐  │
 │  │  check_parallel_rayon  (feature = "parallel")               │  │
 │  │                                                             │  │
-│  │  Arc<AtomicBool> kill shared across rayon thread pool       │  │
+│  │  kill: Arc<AtomicBool>  (shared with timer + rayon pool)    │  │
 │  │  partitions.into_par_iter().any(|p| !check_single(…, &k))  │  │
 │  │  first Illegal → sets kill, par_iter short-circuits         │  │
 │  │  in-flight DFS loops abort via kill.load(Relaxed) check     │  │
+│  │  returns bool (true = Ok)                                   │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                    │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Timeout infrastructure                                      │  │
+│  │                                                             │  │
+│  │  kill:      Arc<AtomicBool>  — polled by DFS every step     │  │
+│  │  timed_out: Arc<AtomicBool>  — set ONLY by timer thread     │  │
+│  │                                                             │  │
+│  │  spawn_timer(kill, duration):                               │  │
+│  │    std::thread::spawn → sleep(d) → timed_out=true,         │  │
+│  │                                    kill=true               │  │
+│  │                                                             │  │
+│  │  to_check_result(ok, timed_out):                            │  │
+│  │    timed_out=true  → Unknown                                │  │
+│  │    ok=true         → Ok                                     │  │
+│  │    ok=false        → Illegal                                │  │
+│  │                                                             │  │
+│  │  timeout=None skips spawn_timer entirely (zero overhead)    │  │
 │  └─────────────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────────────┘
            │                        │
@@ -243,10 +264,6 @@ The DFS walks the linked list node-by-node via `cursor = arena.nodes[idx].next`.
 
 The DFS cache (`HashMap<u64, Vec<CacheEntry<S>>>`) grows unbounded for the duration of a single `check_single` call. For very long histories this could consume significant memory. A bounded LRU cache (e.g. evicting least-recently-used entries) would cap memory use at the cost of potentially re-exploring some subtrees. Not yet implemented; the Go original also uses an unbounded cache.
 
-#### `check_operations_timeout`
-
-A timeout variant of the public API (`check_operations_timeout(model, history, duration) -> CheckResult`) is not yet implemented. The `kill` flag infrastructure is in place: a background thread would set it after the deadline, causing `check_single` to return `false` (which surfaces as `CheckResult::Unknown`). This is needed for production use against adversarial or very large histories.
-
 ---
 
 ## (d) Concurrency
@@ -258,34 +275,48 @@ The library provides two partition-checking paths selected at compile time via t
 **Sequential path (default, zero additional dependencies)**
 
 ```rust
-// check_parallel — sequential loop with local AtomicBool
-let kill = AtomicBool::new(false);
+// check_parallel — sequential loop, kill flag passed in externally
+// (set by the timeout timer if one was started, or by illegal detection)
 for partition in partitions {
-    if !check_single(model, partition, &kill) {
-        kill.store(true, Ordering::Relaxed);
-        return CheckResult::Illegal;
+    if kill.load(Ordering::Relaxed) { return false; } // timeout fired
+    if !check_single(model, partition, kill) {
+        kill.store(true, Ordering::Relaxed); // abort siblings
+        return false;
     }
 }
+true
 ```
 
-Entry points: `check_operations`, `check_events`. No bounds beyond `M: Model`.
+```rust
+// check_operations / check_events — timeout wiring
+let kill      = Arc::new(AtomicBool::new(false));
+let timed_out = timeout.map(|d| spawn_timer(&kill, d))
+                       .unwrap_or_default(); // no timer if None
+let ok = check_parallel(model, partitions, &kill);
+to_check_result(ok, &timed_out) // Unknown / Ok / Illegal
+```
+
+Entry points: `check_operations(model, history, timeout)`, `check_events(model, history, timeout)`.  
+`timeout = None` → no timer spawned, pure sequential DFS.  
+No bounds beyond `M: Model`.
 
 **Parallel path (`--features parallel`, requires `rayon`)**
 
 ```rust
-// check_parallel_rayon — rayon parallel iterator with shared Arc<AtomicBool>
-let kill = Arc::new(AtomicBool::new(false));
-let any_illegal = partitions.into_par_iter().any(|partition| {
-    let k = Arc::clone(&kill);
-    let ok = check_single(model, partition, &k);
-    if !ok { k.store(true, Ordering::Relaxed); }
+// check_parallel_rayon — rayon parallel iterator, same kill flag shared with timer
+let found_illegal = partitions.into_par_iter().any(|partition| {
+    if kill.load(Ordering::Relaxed) { return false; } // timeout or sibling Illegal
+    let ok = check_single(model, partition, &kill);
+    if !ok { kill.store(true, Ordering::Relaxed); }
     !ok
 });
+!found_illegal
 ```
 
-Entry points: `check_operations_parallel`, `check_events_parallel`. Additional bounds: `M: Sync`, `M::Input: Send`, `M::Output: Send`.
+Entry points: `check_operations_parallel(model, history, timeout)`, `check_events_parallel(model, history, timeout)`.  
+Additional bounds: `M: Sync`, `M::Input: Send`, `M::Output: Send`.
 
-`par_iter().any()` short-circuits after the first `true` (first illegal partition). In-flight DFS loops on other rayon threads abort within microseconds via the `kill.load(Relaxed)` check at the top of each DFS iteration.
+`par_iter().any()` short-circuits after the first `true` (first illegal partition). In-flight DFS loops on other rayon threads abort within microseconds via the `kill.load(Relaxed)` check at the top of each DFS iteration. The same `kill` flag is shared with the timeout timer — if the timer fires, all in-flight DFS loops also abort.
 
 ### Minimal Send/Sync bounds
 
@@ -307,7 +338,7 @@ P-compositionality means partition sub-histories are completely independent — 
 ### Thread safety of the design
 
 - `NodeArena` and `Bitset` are owned exclusively per DFS call. Each partition check creates its own arena from its own entry slice — no sharing.
-- `AtomicBool` kill flag: in the sequential path, a local `AtomicBool` is passed by `&` reference. In the parallel path, an `Arc<AtomicBool>` is cloned into each closure — the only cross-thread communication.
+- `AtomicBool` kill flag: always `Arc<AtomicBool>` so it can be shared with the optional timeout timer thread. In the sequential path it is dereferenced to `&AtomicBool` for `check_parallel`. In the parallel path it is cloned into each rayon closure — the only cross-thread communication. A second `Arc<AtomicBool>` (`timed_out`) is set exclusively by the timer thread, allowing the caller to distinguish `Unknown` (timer fired) from `Illegal` (DFS exhausted) after the check completes.
 - `Model` is accessed read-only (`&M`) in `check_single`. `M: Sync` makes `&M: Send` so the reference can cross rayon's thread-pool boundaries safely.
 
 ---

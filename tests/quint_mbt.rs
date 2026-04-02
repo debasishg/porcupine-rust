@@ -127,7 +127,7 @@ fn mbt_trace_matches_rust_checker() {
 
     let history = example_history();
     let model = RegisterModel;
-    let rust_result = porcupine::checker::check_operations(&model, &history);
+    let rust_result = porcupine::checker::check_operations(&model, &history, None);
 
     assert_eq!(
         rust_result, quint_result,
@@ -188,8 +188,8 @@ fn mbt_check_events_agrees_with_check_operations() {
     let events  = example_history_as_events();
     let model   = RegisterModel;
 
-    let ops_result    = porcupine::checker::check_operations(&model, &history);
-    let events_result = porcupine::checker::check_events(&model, &events);
+    let ops_result    = porcupine::checker::check_operations(&model, &history, None);
+    let events_result = porcupine::checker::check_events(&model, &events, None);
 
     assert_eq!(
         events_result, ops_result,
@@ -239,7 +239,7 @@ fn mbt_parallel_ops_matches_quint_trace() {
     let quint_result  = quint_result_to_check_result(&final_state.result);
     let history       = example_history();
     let model         = RegisterModel;
-    let par_result    = porcupine::checker::check_operations_parallel(&model, &history);
+    let par_result    = porcupine::checker::check_operations_parallel(&model, &history, None);
 
     assert_eq!(
         par_result, quint_result,
@@ -280,7 +280,7 @@ fn mbt_parallel_events_matches_quint_trace() {
     let quint_result  = quint_result_to_check_result(&final_state.result);
     let events        = example_history_as_events();
     let model         = RegisterModel;
-    let par_result    = porcupine::checker::check_events_parallel(&model, &events);
+    let par_result    = porcupine::checker::check_events_parallel(&model, &events, None);
 
     assert_eq!(
         par_result, quint_result,
@@ -324,7 +324,7 @@ fn mbt_check_events_matches_quint_trace() {
     let quint_result  = quint_result_to_check_result(&final_state.result);
     let events        = example_history_as_events();
     let model         = RegisterModel;
-    let events_result = porcupine::checker::check_events(&model, &events);
+    let events_result = porcupine::checker::check_events(&model, &events, None);
 
     assert_eq!(
         events_result, quint_result,

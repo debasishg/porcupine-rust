@@ -123,7 +123,7 @@ proptest! {
     fn prop_sequential_history_is_linearizable(len in 1usize..8) {
         let history = sequential_history(len);
         let model = RegisterModel;
-        let result = porcupine::checker::check_operations(&model, &history);
+        let result = porcupine::checker::check_operations(&model, &history, None);
         prop_assert_eq!(result, CheckResult::Ok,
             "Sequential history must be linearizable");
     }
@@ -135,7 +135,7 @@ proptest! {
     fn prop_single_op_linearizable(value in -100i64..100) {
         let history = single_op_history(value);
         let model = RegisterModel;
-        let result = porcupine::checker::check_operations(&model, &history);
+        let result = porcupine::checker::check_operations(&model, &history, None);
         prop_assert_eq!(result, CheckResult::Ok,
             "Single-op history must be linearizable");
     }
@@ -231,8 +231,8 @@ proptest! {
     fn prop_cache_sound_deterministic(len in 1usize..6) {
         let history = sequential_history(len);
         let model = RegisterModel;
-        let r1 = porcupine::checker::check_operations(&model, &history);
-        let r2 = porcupine::checker::check_operations(&model, &history);
+        let r1 = porcupine::checker::check_operations(&model, &history, None);
+        let r2 = porcupine::checker::check_operations(&model, &history, None);
         prop_assert_eq!(r1, r2, "INV-LIN-04: identical inputs must yield identical results");
     }
 }
@@ -273,7 +273,7 @@ fn illegal_register_history() -> Vec<Operation<RegisterInput, i64>> {
 fn prop_illegal_history_is_detected() {
     let history = illegal_register_history();
     let model = RegisterModel;
-    let result = porcupine::checker::check_operations(&model, &history);
+    let result = porcupine::checker::check_operations(&model, &history, None);
     assert_eq!(result, CheckResult::Illegal,
         "INV-LIN-02: a non-linearizable history must be detected as Illegal");
 }
@@ -309,7 +309,7 @@ proptest! {
         let model = KvModel;
 
         // Check without partition (whole history).
-        let whole = porcupine::checker::check_operations(&model, &history);
+        let whole = porcupine::checker::check_operations(&model, &history, None);
 
         // Check with partition (per-key sub-histories).
         // KvModel::partition is used internally by check_operations.
@@ -373,7 +373,7 @@ proptest! {
     fn prop_events_sequential_history_is_linearizable(len in 1usize..8) {
         let history = sequential_history(len);
         let events  = sequential_ops_to_events(&history);
-        let result  = porcupine::checker::check_events(&RegisterModel, &events);
+        let result  = porcupine::checker::check_events(&RegisterModel, &events, None);
         prop_assert_eq!(result, CheckResult::Ok,
             "Sequential history expressed as events must be linearizable (INV-LIN-01)");
     }
@@ -386,7 +386,7 @@ proptest! {
     fn prop_events_single_op_is_linearizable(value in -100i64..100) {
         let history = single_op_history(value);
         let events  = sequential_ops_to_events(&history);
-        let result  = porcupine::checker::check_events(&RegisterModel, &events);
+        let result  = porcupine::checker::check_events(&RegisterModel, &events, None);
         prop_assert_eq!(result, CheckResult::Ok,
             "Single-op event history must be linearizable (INV-LIN-01)");
     }
@@ -408,8 +408,8 @@ proptest! {
     fn prop_events_agree_with_operations_on_sequential_history(len in 1usize..8) {
         let history = sequential_history(len);
         let events  = sequential_ops_to_events(&history);
-        let ops_result    = porcupine::checker::check_operations(&RegisterModel, &history);
-        let events_result = porcupine::checker::check_events(&RegisterModel, &events);
+        let ops_result    = porcupine::checker::check_operations(&RegisterModel, &history, None);
+        let events_result = porcupine::checker::check_events(&RegisterModel, &events, None);
         prop_assert_eq!(ops_result, events_result,
             "check_operations and check_events must agree on the same sequential history");
     }
@@ -441,7 +441,7 @@ fn illegal_register_history_as_events() -> Vec<Event<RegisterInput, i64>> {
 #[test]
 fn prop_events_illegal_history_is_detected() {
     let events = illegal_register_history_as_events();
-    let result = porcupine::checker::check_events(&RegisterModel, &events);
+    let result = porcupine::checker::check_events(&RegisterModel, &events, None);
     assert_eq!(result, CheckResult::Illegal,
         "INV-LIN-02: a non-linearizable event history must be detected as Illegal");
 }
@@ -457,8 +457,8 @@ proptest! {
     fn prop_events_cache_sound_deterministic(len in 1usize..6) {
         let history = sequential_history(len);
         let events  = sequential_ops_to_events(&history);
-        let r1 = porcupine::checker::check_events(&RegisterModel, &events);
-        let r2 = porcupine::checker::check_events(&RegisterModel, &events);
+        let r1 = porcupine::checker::check_events(&RegisterModel, &events, None);
+        let r2 = porcupine::checker::check_events(&RegisterModel, &events, None);
         prop_assert_eq!(r1, r2,
             "INV-LIN-04: identical event inputs must yield identical results");
     }
@@ -471,7 +471,7 @@ proptest! {
 #[test]
 fn prop_events_empty_history_is_ok() {
     let events: Vec<Event<RegisterInput, i64>> = vec![];
-    let result = porcupine::checker::check_events(&RegisterModel, &events);
+    let result = porcupine::checker::check_events(&RegisterModel, &events, None);
     assert_eq!(result, CheckResult::Ok,
         "INV-LIN-01: empty event history must be linearizable");
 }
@@ -490,8 +490,8 @@ mod parallel_tests {
         #[test]
         fn prop_parallel_ops_agrees_with_sequential(len in 1usize..8) {
             let history = sequential_history(len);
-            let seq = porcupine::checker::check_operations(&RegisterModel, &history);
-            let par = porcupine::checker::check_operations_parallel(&RegisterModel, &history);
+            let seq = porcupine::checker::check_operations(&RegisterModel, &history, None);
+            let par = porcupine::checker::check_operations_parallel(&RegisterModel, &history, None);
             prop_assert_eq!(seq, par, "parallel and sequential must agree");
         }
     }
@@ -500,7 +500,7 @@ mod parallel_tests {
     #[test]
     fn parallel_detects_illegal_ops_history() {
         let history = illegal_register_history();
-        let result = porcupine::checker::check_operations_parallel(&RegisterModel, &history);
+        let result = porcupine::checker::check_operations_parallel(&RegisterModel, &history, None);
         assert_eq!(result, CheckResult::Illegal);
     }
 
@@ -511,8 +511,8 @@ mod parallel_tests {
         fn prop_parallel_events_agrees_with_sequential(len in 1usize..8) {
             let history = sequential_history(len);
             let events  = sequential_ops_to_events(&history);
-            let seq = porcupine::checker::check_events(&RegisterModel, &events);
-            let par = porcupine::checker::check_events_parallel(&RegisterModel, &events);
+            let seq = porcupine::checker::check_events(&RegisterModel, &events, None);
+            let par = porcupine::checker::check_events_parallel(&RegisterModel, &events, None);
             prop_assert_eq!(seq, par, "parallel events must agree with sequential");
         }
     }
@@ -539,8 +539,8 @@ mod parallel_tests {
                     return_time: (i as u64) * 2 + 1,
                 })
                 .collect();
-            let seq = porcupine::checker::check_operations(&KvModel, &history);
-            let par = porcupine::checker::check_operations_parallel(&KvModel, &history);
+            let seq = porcupine::checker::check_operations(&KvModel, &history, None);
+            let par = porcupine::checker::check_operations_parallel(&KvModel, &history, None);
             prop_assert_eq!(seq, par, "KV parallel must agree with sequential");
         }
     }
