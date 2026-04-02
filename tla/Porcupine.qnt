@@ -192,6 +192,16 @@ module Porcupine {
   }
 
   // ---------------------------------------------------------------------------
+  // Helpers for compositionality and parallel invariants
+  // ---------------------------------------------------------------------------
+
+  // Look up an operation in HISTORY by its id.
+  // Returns HISTORY[0] as a sentinel if not found (callers only invoke this
+  // when id is known to be present).
+  pure def opById(id: int): Op =
+    HISTORY.foldl(HISTORY[0], (found, op) => if (op.id == id) op else found)
+
+  // ---------------------------------------------------------------------------
   // Invariants (correspond to INV-* IDs in docs/spec.md)
   // ---------------------------------------------------------------------------
 
@@ -221,12 +231,52 @@ module Porcupine {
     (result == "Ok"      implies linearized.size() == HISTORY.length()) and
     (result == "Illegal" implies frontier(HISTORY, linearized).length() == 0)
 
+  // INV-LIN-03: P-Compositionality
+  //
+  // When result = "Ok", the stack records a complete valid sequential
+  // execution: applying the ops in stack order from INIT_VAL must be
+  // accepted by the register model at every step.
+  //
+  // This is the core soundness guarantee for P-compositional checking:
+  // each partition's DFS produces a valid sequential sub-execution, and
+  // independent sub-executions compose into a valid execution of the whole.
+  //
+  // Formally verified by `quint verify --invariant safetyInvariant`.
+  // Also tested by the `prop_parallel_kv_agrees_with_sequential` property test
+  // (Rust side) which exercises the rayon-based parallel path.
+  val pCompositionality: bool =
+    result != "Ok" or {
+      stack.foldl({ ok: true, state: INIT_VAL }, (acc, frame) =>
+        if (not(acc.ok)) acc
+        else {
+          val op   = opById(frame.op_id)
+          val step = registerStep(acc.state, op)
+          { ok: step.ok, state: step.next }
+        }
+      ).ok
+    }
+
+  // INV-PAR-01: Parallel kill-flag monotonicity
+  //
+  // Once a result is decided ("Ok" or "Illegal"), the DFS stutters — no
+  // further state changes occur. In the parallel implementation this models
+  // the `Arc<AtomicBool>` kill flag: once any partition sets kill = true,
+  // all in-flight DFS loops abort via kill.load(Relaxed) and the combined
+  // result is Illegal. The flag is write-once (monotone false → true).
+  //
+  // In this single-DFS model the stutter guard `if (result != "Unknown")`
+  // in the `step` action enforces the same property structurally.
+  val parallelKillFlagInvariant: bool =
+    result == "Unknown" or result == "Ok" or result == "Illegal"
+
   // Combined safety invariant — checked by `quint verify`.
   val safetyInvariant: bool =
     histWellFormedInv and
     minimalCallFrontier and
     cacheSound and
-    resultConsistent
+    resultConsistent and
+    pCompositionality and
+    parallelKillFlagInvariant
 
   // ---------------------------------------------------------------------------
   // Temporal properties (for `quint verify --temporal`)

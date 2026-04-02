@@ -11,6 +11,10 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
 │                          Public API (lib.rs)                         │
 │                                                                      │
 │   check_operations(model, history)    check_events(model, history)  │
+│                                                                      │
+│   check_operations_parallel(…)  ┐    check_events_parallel(…)  ┐   │
+│   [feature = "parallel"]        │    [feature = "parallel"]     │   │
+│   M: Sync, M::Input/Output:Send ┘    M: Sync, M::Input/Output:Send┘ │
 └───────────────────────────┬──────────────────────┬──────────────────┘
                             │                      │
                             ▼                      ▼
@@ -73,11 +77,20 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
 │             └───────────────────────────────────────┘              │
 │                                                                    │
 │  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  check_parallel                                              │  │
+│  │  check_parallel  (sequential, default)                      │  │
 │  │                                                             │  │
 │  │  for each partition:                                        │  │
 │  │    check_single(model, partition_entries, &kill_flag)       │  │
 │  │    if Illegal → set kill flag, return early                 │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                    │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  check_parallel_rayon  (feature = "parallel")               │  │
+│  │                                                             │  │
+│  │  Arc<AtomicBool> kill shared across rayon thread pool       │  │
+│  │  partitions.into_par_iter().any(|p| !check_single(…, &k))  │  │
+│  │  first Illegal → sets kill, par_iter short-circuits         │  │
+│  │  in-flight DFS loops abort via kill.load(Relaxed) check     │  │
 │  └─────────────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────────────┘
            │                        │
@@ -169,7 +182,7 @@ This mirrors the `checkParallel` function in the Go original and enables dramati
 
 ### Stability vs. the Go original
 
-The Go implementation uses `goroutines` to run partition checks in parallel. In this Rust port, `check_parallel` is currently **sequential**. The `AtomicBool` kill flag is already in place as infrastructure; enabling true parallelism requires only wrapping each `check_single` call in a Rayon parallel iterator (see §d).
+The Go implementation uses `goroutines` to run partition checks in parallel. This Rust port mirrors that design via the optional `parallel` Cargo feature: `check_parallel_rayon` uses `rayon::par_iter` with a shared `Arc<AtomicBool>` kill flag. The default (`check_parallel`) remains sequential so the library stays zero-dependency. The parallel path requires `M: Sync` and `M::Input/Output: Send` — weaker than the original goal of `M::State: Send`; state values are created inside the rayon closure and never cross a thread boundary.
 
 ---
 
@@ -214,10 +227,6 @@ In `make_entries`, the sort comparator places a call event before a return event
 
 ### Not yet implemented — future opportunities
 
-#### Parallel partition checking (Rayon)
-
-`check_parallel` is currently sequential despite having an `AtomicBool` kill flag ready for concurrent use. Adding `rayon::iter::ParallelIterator` on the partition loop would enable true multi-core execution. The blocker is the `M::State: Send` bound that Rayon requires — this is not currently imposed by the `Model` trait. Plan: add an optional `parallel` feature that requires `M::State: Send + Sync` and uses `rayon::scope` instead of a `for` loop.
-
 #### Cache locality for DFS frame stack
 
 The `calls: Vec<CallFrame<S>>` stack stores a clone of `M::State` on every forward step. For large or heap-allocated state types (e.g. a `HashMap`), each push allocates. A possible optimization is to use a persistent/functional state representation (e.g. a persistent trie or a copy-on-write structure) so that state snapshots share structure. This is model-specific and cannot be done generically without changing the `Model` trait contract.
@@ -242,12 +251,15 @@ A timeout variant of the public API (`check_operations_timeout(model, history, d
 
 ## (d) Concurrency
 
-### Current state — sequential with kill-flag infrastructure
+### Two dispatch paths
 
-All partition checks run sequentially in `check_parallel`. The `AtomicBool` kill flag (`std::sync::atomic::AtomicBool`) is threadsafe and shared by reference, but currently no actual threads are spawned.
+The library provides two partition-checking paths selected at compile time via the `parallel` Cargo feature.
+
+**Sequential path (default, zero additional dependencies)**
 
 ```rust
-// Current: sequential loop
+// check_parallel — sequential loop with local AtomicBool
+let kill = AtomicBool::new(false);
 for partition in partitions {
     if !check_single(model, partition, &kill) {
         kill.store(true, Ordering::Relaxed);
@@ -256,39 +268,47 @@ for partition in partitions {
 }
 ```
 
-### Planned — parallel partition checking via Rayon
+Entry points: `check_operations`, `check_events`. No bounds beyond `M: Model`.
 
-The idiomatic Rust approach is to replace the sequential loop with a Rayon parallel iterator:
+**Parallel path (`--features parallel`, requires `rayon`)**
 
 ```rust
-// Planned (requires M::State: Send)
-partitions
-    .into_par_iter()
-    .find_any(|partition| !check_single(model, partition, &kill))
-    .map_or(CheckResult::Ok, |_| {
-        kill.store(true, Ordering::Relaxed);
-        CheckResult::Illegal
-    })
+// check_parallel_rayon — rayon parallel iterator with shared Arc<AtomicBool>
+let kill = Arc::new(AtomicBool::new(false));
+let any_illegal = partitions.into_par_iter().any(|partition| {
+    let k = Arc::clone(&kill);
+    let ok = check_single(model, partition, &k);
+    if !ok { k.store(true, Ordering::Relaxed); }
+    !ok
+});
 ```
 
-This would be gated behind an optional `parallel` Cargo feature to avoid imposing `Send` on all users:
+Entry points: `check_operations_parallel`, `check_events_parallel`. Additional bounds: `M: Sync`, `M::Input: Send`, `M::Output: Send`.
 
-```toml
-[features]
-parallel = ["rayon"]
-```
+`par_iter().any()` short-circuits after the first `true` (first illegal partition). In-flight DFS loops on other rayon threads abort within microseconds via the `kill.load(Relaxed)` check at the top of each DFS iteration.
 
-The `Model` trait would gain a blanket impl or a separate `ParallelModel` marker trait requiring `State: Send + Sync`.
+### Minimal Send/Sync bounds
+
+The parallel bounds are deliberately minimal:
+
+| Bound | Reason |
+|-------|--------|
+| `M: Sync` | Rayon closures share `&M` across threads — references to `M` cross thread boundaries |
+| `M::Input: Send` | `Vec<Entry<I, O>>` is moved into each closure — requires `I: Send` |
+| `M::Output: Send` | Same reason |
+| `M::State: Send` | **Not required** — state is created inside the closure via `model.init()` and lives entirely within one rayon task |
+
+This is weaker than `M::State: Send + Sync`, which was the original estimate. Users whose `State` type is not `Send` (e.g. wraps `Rc<T>`) can still use the parallel API as long as their `Input` and `Output` types are `Send`.
 
 ### Why parallelism matters
 
-P-compositionality means partition sub-histories are completely independent — there is no shared mutable state between partition checks other than the kill flag. This is an embarrassingly parallel workload. For a key-value store with `k` independent keys, parallel checking scales linearly with `k` up to the number of available cores.
+P-compositionality means partition sub-histories are completely independent — no shared mutable state between checks other than the kill flag. This is an embarrassingly parallel workload. For a key-value store with `k` independent keys, parallel checking scales linearly with `k` up to the number of available cores.
 
-### Thread safety of the current design
+### Thread safety of the design
 
-- `NodeArena` and `Bitset` are not `Send` — each DFS instance owns its arena exclusively. No sharing is needed because each partition check creates its own arena from its own entry slice.
-- `AtomicBool` kill flag: the flag is passed by shared reference (`&AtomicBool`) and is the only cross-thread communication.
-- `Model` itself is accessed read-only (`&M` reference in `check_single`). As long as `M: Sync`, this is safe with multiple threads.
+- `NodeArena` and `Bitset` are owned exclusively per DFS call. Each partition check creates its own arena from its own entry slice — no sharing.
+- `AtomicBool` kill flag: in the sequential path, a local `AtomicBool` is passed by `&` reference. In the parallel path, an `Arc<AtomicBool>` is cloned into each closure — the only cross-thread communication.
+- `Model` is accessed read-only (`&M`) in `check_single`. `M: Sync` makes `&M: Send` so the reference can cross rayon's thread-pool boundaries safely.
 
 ---
 
@@ -320,7 +340,7 @@ The entire codebase contains zero `unsafe` blocks. The index-based arena design 
 | `src/lib.rs` | public | Crate root; re-exports public API |
 | `src/types.rs` | public | `Operation`, `Event`, `CheckResult`, `LinearizationInfo` |
 | `src/model.rs` | public | `Model` trait |
-| `src/checker.rs` | public | Entry points + full DFS implementation |
+| `src/checker.rs` | public | Entry points + full DFS implementation; `check_operations_parallel` / `check_events_parallel` gated behind `feature = "parallel"` |
 | `src/bitset.rs` | crate-private | Compact bitset for linearized set and cache key |
 | `src/invariants.rs` | crate-private | `debug_assert!` macros keyed to `INV-*` IDs |
 

@@ -17,6 +17,10 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "parallel")]
+use std::sync::Arc;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::bitset::Bitset;
 use crate::invariants::{assert_partition_independent, assert_well_formed, assert_well_formed_events};
@@ -142,20 +146,20 @@ impl<I, O> NodeArena<I, O> {
         }
 
         // Fill match_idx for call nodes.
-        for i in 1..=n {
-            if matches!(arena_nodes[i].value, Some(EntryValue::Call(_))) {
-                let op_id = arena_nodes[i].id;
+        for node in arena_nodes.iter_mut().skip(1) {
+            if matches!(node.value, Some(EntryValue::Call(_))) {
+                let op_id = node.id;
                 if let Some(&ret_i) = return_idx.get(&op_id) {
-                    arena_nodes[i].match_idx = Some(ret_i);
+                    node.match_idx = Some(ret_i);
                 }
             }
         }
 
         // Link nodes in order: sentinel → 1 → 2 → … → n
-        for i in 1..=n {
-            arena_nodes[i].prev = i - 1;
+        for (i, node) in arena_nodes.iter_mut().enumerate().skip(1) {
+            node.prev = i - 1;
             if i < n {
-                arena_nodes[i].next = Some(i + 1);
+                node.next = Some(i + 1);
             }
         }
         arena_nodes[0].next = if n > 0 { Some(1) } else { None };
@@ -358,6 +362,38 @@ fn check_parallel<M: Model>(
 }
 
 // ---------------------------------------------------------------------------
+// check_parallel_rayon — run check_single partitions in parallel via rayon
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "parallel")]
+fn check_parallel_rayon<M>(
+    model:      &M,
+    partitions: Vec<Vec<Entry<M::Input, M::Output>>>,
+) -> CheckResult
+where
+    M: Model + Sync,
+    M::Input:  Send,
+    M::Output: Send,
+{
+    if partitions.is_empty() {
+        return CheckResult::Ok;
+    }
+
+    let kill = Arc::new(AtomicBool::new(false));
+
+    let any_illegal = partitions.into_par_iter().any(|partition| {
+        let k = Arc::clone(&kill);
+        let ok = check_single(model, partition, &k);
+        if !ok {
+            k.store(true, Ordering::Relaxed);
+        }
+        !ok
+    });
+
+    if any_illegal { CheckResult::Illegal } else { CheckResult::Ok }
+}
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
@@ -400,6 +436,69 @@ pub fn check_events<M: Model>(model: &M, history: &[Event<M::Input, M::Output>])
         };
 
     check_parallel(model, partitions)
+}
+
+/// Check an operation-based history for linearizability using rayon parallelism.
+///
+/// Each independent partition (returned by [`Model::partition`]) is checked
+/// concurrently on the rayon thread pool.  If the model does not implement
+/// `partition`, the whole history is checked as a single partition (no speedup).
+///
+/// Requires the `parallel` feature.
+#[cfg(feature = "parallel")]
+pub fn check_operations_parallel<M>(
+    model:   &M,
+    history: &[Operation<M::Input, M::Output>],
+) -> CheckResult
+where
+    M: Model + Sync,
+    M::Input:  Send,
+    M::Output: Send,
+{
+    assert_well_formed!(history);
+
+    let partitions: Vec<Vec<Entry<M::Input, M::Output>>> =
+        if let Some(parts) = model.partition(history) {
+            assert_partition_independent!(parts);
+            parts.iter()
+                .map(|indices| make_entries(&indices.iter().map(|&i| history[i].clone()).collect::<Vec<_>>()))
+                .collect()
+        } else {
+            vec![make_entries(history)]
+        };
+
+    check_parallel_rayon(model, partitions)
+}
+
+/// Check an event-based history for linearizability using rayon parallelism.
+///
+/// Requires the `parallel` feature.
+#[cfg(feature = "parallel")]
+pub fn check_events_parallel<M>(
+    model:   &M,
+    history: &[Event<M::Input, M::Output>],
+) -> CheckResult
+where
+    M: Model + Sync,
+    M::Input:  Send,
+    M::Output: Send,
+{
+    assert_well_formed_events!(history);
+
+    let partitions: Vec<Vec<Entry<M::Input, M::Output>>> =
+        if let Some(parts) = model.partition_events(history) {
+            assert_partition_independent!(parts);
+            parts.iter()
+                .map(|indices| {
+                    let sub: Vec<Event<M::Input, M::Output>> = indices.iter().map(|&i| history[i].clone()).collect();
+                    convert_entries(&renumber(&sub))
+                })
+                .collect()
+        } else {
+            vec![convert_entries(&renumber(history))]
+        };
+
+    check_parallel_rayon(model, partitions)
 }
 
 // ===========================================================================

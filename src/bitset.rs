@@ -8,7 +8,7 @@ pub struct Bitset(Vec<u64>);
 impl Bitset {
     /// Allocate a bitset large enough to hold `n` bits, all initially zero.
     pub fn new(n: usize) -> Self {
-        let chunks = n / 64 + if n % 64 != 0 { 1 } else { 0 };
+        let chunks = n.div_ceil(64);
         Bitset(vec![0u64; chunks])
     }
 
