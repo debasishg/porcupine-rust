@@ -12,9 +12,8 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
 │                                                                      │
 │   check_operations(model, history, timeout: Option<Duration>)       │
 │   check_events    (model, history, timeout: Option<Duration>)       │
-│                                                                      │
-│   check_operations_parallel(…, timeout)  ┐  [feature = "parallel"] │
-│   check_events_parallel    (…, timeout)  ┘  M: Sync, I/O: Send     │
+│                                                        M: Sync      │
+│                                                   I/O: Send         │
 └───────────────────────────┬──────────────────────┬──────────────────┘
                             │                      │
                             ▼                      ▼
@@ -77,17 +76,7 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
 │             └───────────────────────────────────────┘              │
 │                                                                    │
 │  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  check_parallel  (sequential, default)                      │  │
-│  │                                                             │  │
-│  │  kill: &AtomicBool  (externally owned — shared with timer)  │  │
-│  │  for each partition:                                        │  │
-│  │    check_single(model, partition_entries, kill)             │  │
-│  │    if Illegal → set kill flag, return false                 │  │
-│  │  returns bool (true = Ok)                                   │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                                                                    │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  check_parallel_rayon  (feature = "parallel")               │  │
+│  │  check_parallel  (rayon, always-on)                         │  │
 │  │                                                             │  │
 │  │  kill: Arc<AtomicBool>  (shared with timer + rayon pool)    │  │
 │  │  partitions.into_par_iter().any(|p| !check_single(…, &k))  │  │
@@ -268,42 +257,12 @@ The DFS cache (`HashMap<u64, Vec<CacheEntry<S>>>`) grows unbounded for the durat
 
 ## (d) Concurrency
 
-### Two dispatch paths
+### Single parallel dispatch path
 
-The library provides two partition-checking paths selected at compile time via the `parallel` Cargo feature.
-
-**Sequential path (default, zero additional dependencies)**
+All partition checking runs through rayon. This mirrors Go's `checkParallel`, which launches one goroutine per partition immediately. There is no sequential fallback.
 
 ```rust
-// check_parallel — sequential loop, kill flag passed in externally
-// (set by the timeout timer if one was started, or by illegal detection)
-for partition in partitions {
-    if kill.load(Ordering::Relaxed) { return false; } // timeout fired
-    if !check_single(model, partition, kill) {
-        kill.store(true, Ordering::Relaxed); // abort siblings
-        return false;
-    }
-}
-true
-```
-
-```rust
-// check_operations / check_events — timeout wiring
-let kill      = Arc::new(AtomicBool::new(false));
-let timed_out = timeout.map(|d| spawn_timer(&kill, d))
-                       .unwrap_or_default(); // no timer if None
-let ok = check_parallel(model, partitions, &kill);
-to_check_result(ok, &timed_out) // Unknown / Ok / Illegal
-```
-
-Entry points: `check_operations(model, history, timeout)`, `check_events(model, history, timeout)`.  
-`timeout = None` → no timer spawned, pure sequential DFS.  
-No bounds beyond `M: Model`.
-
-**Parallel path (`--features parallel`, requires `rayon`)**
-
-```rust
-// check_parallel_rayon — rayon parallel iterator, same kill flag shared with timer
+// check_parallel — rayon parallel iterator, kill flag shared with timer
 let found_illegal = partitions.into_par_iter().any(|partition| {
     if kill.load(Ordering::Relaxed) { return false; } // timeout or sibling Illegal
     let ok = check_single(model, partition, &kill);
@@ -313,14 +272,18 @@ let found_illegal = partitions.into_par_iter().any(|partition| {
 !found_illegal
 ```
 
-Entry points: `check_operations_parallel(model, history, timeout)`, `check_events_parallel(model, history, timeout)`.  
-Additional bounds: `M: Sync`, `M::Input: Send`, `M::Output: Send`.
+```rust
+// check_operations / check_events — timeout wiring
+let kill      = Arc::new(AtomicBool::new(false));
+let timed_out = timeout.map(|d| spawn_timer(&kill, d))
+                       .unwrap_or_default(); // no timer if None
+let ok = check_parallel(model, partitions, kill);
+to_check_result(ok, &timed_out) // Unknown / Ok / Illegal
+```
 
-`par_iter().any()` short-circuits after the first `true` (first illegal partition). In-flight DFS loops on other rayon threads abort within microseconds via the `kill.load(Relaxed)` check at the top of each DFS iteration. The same `kill` flag is shared with the timeout timer — if the timer fires, all in-flight DFS loops also abort.
+`par_iter().any()` short-circuits after the first illegal partition is found. In-flight DFS loops on other rayon threads abort within microseconds via the `kill.load(Relaxed)` check at the top of each DFS iteration. The same `kill` flag is shared with the timeout timer — if the timer fires, all DFS loops also abort.
 
-### Minimal Send/Sync bounds
-
-The parallel bounds are deliberately minimal:
+### Required Send/Sync bounds
 
 | Bound | Reason |
 |-------|--------|
@@ -329,7 +292,7 @@ The parallel bounds are deliberately minimal:
 | `M::Output: Send` | Same reason |
 | `M::State: Send` | **Not required** — state is created inside the closure via `model.init()` and lives entirely within one rayon task |
 
-This is weaker than `M::State: Send + Sync`, which was the original estimate. Users whose `State` type is not `Send` (e.g. wraps `Rc<T>`) can still use the parallel API as long as their `Input` and `Output` types are `Send`.
+`M::State` need not be `Send`. Users whose `State` wraps `Rc<T>` can still use the library as long as their `Input` and `Output` types are `Send`.
 
 ### Why parallelism matters
 
@@ -338,7 +301,7 @@ P-compositionality means partition sub-histories are completely independent — 
 ### Thread safety of the design
 
 - `NodeArena` and `Bitset` are owned exclusively per DFS call. Each partition check creates its own arena from its own entry slice — no sharing.
-- `AtomicBool` kill flag: always `Arc<AtomicBool>` so it can be shared with the optional timeout timer thread. In the sequential path it is dereferenced to `&AtomicBool` for `check_parallel`. In the parallel path it is cloned into each rayon closure — the only cross-thread communication. A second `Arc<AtomicBool>` (`timed_out`) is set exclusively by the timer thread, allowing the caller to distinguish `Unknown` (timer fired) from `Illegal` (DFS exhausted) after the check completes.
+- `AtomicBool` kill flag: `Arc<AtomicBool>` shared with the optional timeout timer thread and moved into `check_parallel` (the rayon closures capture it by clone). A second `Arc<AtomicBool>` (`timed_out`) is set exclusively by the timer thread, allowing the caller to distinguish `Unknown` (timer fired) from `Illegal` (DFS exhausted) after the check completes.
 - `Model` is accessed read-only (`&M`) in `check_single`. `M: Sync` makes `&M: Send` so the reference can cross rayon's thread-pool boundaries safely.
 
 ---
@@ -371,7 +334,7 @@ The entire codebase contains zero `unsafe` blocks. The index-based arena design 
 | `src/lib.rs` | public | Crate root; re-exports public API |
 | `src/types.rs` | public | `Operation`, `Event`, `CheckResult`, `LinearizationInfo` |
 | `src/model.rs` | public | `Model` trait |
-| `src/checker.rs` | public | Entry points + full DFS implementation; `check_operations_parallel` / `check_events_parallel` gated behind `feature = "parallel"` |
+| `src/checker.rs` | public | Entry points + full DFS implementation; partition checking always runs via rayon |
 | `src/bitset.rs` | crate-private | Compact bitset for linearized set and cache key |
 | `src/invariants.rs` | crate-private | `debug_assert!` macros keyed to `INV-*` IDs |
 

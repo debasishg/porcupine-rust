@@ -133,9 +133,9 @@ always yield the same sub-tree result. The cache may safely prune any node whose
 | INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` | `histWellFormed` |
 | INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order` | `realTimeOrder` |
 | INV-HIST-03 | §1 | `assert_minimal_call` | `prop_soundness` | `minimalCallFrontier` |
-| INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_parallel_ops_agrees_with_sequential`, `prop_parallel_events_agrees_with_sequential` | `resultConsistent` |
-| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `parallel_detects_illegal_ops_history` | `resultConsistent` |
-| INV-LIN-03 | §2 | `assert_partition_independent` | `prop_compositionality`, `prop_parallel_kv_agrees_with_sequential` | `pCompositionality` |
+| INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `resultConsistent` |
+| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` | `resultConsistent` |
+| INV-LIN-03 | §2 | `assert_partition_independent` | `prop_compositionality_*` | `pCompositionality` |
 | INV-LIN-04 | §2 | `assert_cache_sound` | `prop_cache_sound` | `cacheSound` |
 
-> **Parallel entry points**: `check_operations_parallel` and `check_events_parallel` (feature `parallel`) exercise the same invariants as their sequential counterparts. The `parallel_tests` module in `property_tests.rs` provides cross-API agreement tests confirming correctness is preserved under rayon parallelism.
+> **Parallel execution**: `check_operations` and `check_events` always use rayon to check partitions concurrently (unconditional dependency, no feature flag), matching Go's goroutine-per-partition behaviour.

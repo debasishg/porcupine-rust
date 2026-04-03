@@ -12,12 +12,9 @@ categories = ["development-tools::testing"]
 # Enable model-based testing via quint-connect trace replay.
 # Requires the `quint-connect` CLI to be installed.
 quint-mbt = []
-# Enable parallel partition checking via rayon.
-# Requires M: Sync and M::Input, M::Output: Send on the parallel entry points.
-parallel = ["dep:rayon"]
 
 [dependencies]
-rayon = { version = "1", optional = true }
+rayon = "1"
 
 [dev-dependencies]
 proptest = "1"

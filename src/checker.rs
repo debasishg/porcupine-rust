@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use crate::bitset::Bitset;
@@ -338,37 +337,15 @@ fn check_single<M: Model>(
 }
 
 // ---------------------------------------------------------------------------
-// check_parallel — run one check_single per partition
+// check_parallel — run check_single per partition in parallel via rayon
+//
+// Mirrors Go's checkParallel: all partitions start concurrently; the first
+// Illegal result sets the kill flag so siblings abort within microseconds.
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if all partitions are linearizable, `false` if any failed or
 /// the kill flag was set externally (e.g. by a timeout timer).
-fn check_parallel<M: Model>(
-    model:      &M,
-    partitions: Vec<Vec<Entry<M::Input, M::Output>>>,
-    kill:       &AtomicBool,
-) -> bool {
-    for partition in partitions {
-        if kill.load(Ordering::Relaxed) {
-            return false;
-        }
-        if !check_single(model, partition, kill) {
-            // Set the flag so sibling partitions (if any) abort early.
-            kill.store(true, Ordering::Relaxed);
-            return false;
-        }
-    }
-    true
-}
-
-// ---------------------------------------------------------------------------
-// check_parallel_rayon — run check_single partitions in parallel via rayon
-// ---------------------------------------------------------------------------
-
-/// Returns `true` if all partitions are linearizable, `false` if any failed or
-/// the kill flag was set externally (e.g. by a timeout timer).
-#[cfg(feature = "parallel")]
-fn check_parallel_rayon<M>(
+fn check_parallel<M>(
     model:      &M,
     partitions: Vec<Vec<Entry<M::Input, M::Output>>>,
     kill:       Arc<AtomicBool>,
@@ -441,11 +418,19 @@ fn to_check_result(ok: bool, timed_out: &AtomicBool) -> CheckResult {
 /// [`Duration`], the function returns [`CheckResult::Unknown`] rather than
 /// blocking indefinitely.  Pass `None` for an unbounded check (equivalent to
 /// `timeout = 0` in the Go original).
-pub fn check_operations<M: Model>(
+///
+/// Partitions returned by [`Model::partition`] are checked concurrently on the
+/// rayon thread pool, matching Go's goroutine-per-partition behaviour.
+pub fn check_operations<M>(
     model:   &M,
     history: &[Operation<M::Input, M::Output>],
     timeout: Option<Duration>,
-) -> CheckResult {
+) -> CheckResult
+where
+    M: Model + Sync,
+    M::Input:  Send,
+    M::Output: Send,
+{
     // INV-HIST-01
     assert_well_formed!(history);
 
@@ -465,18 +450,26 @@ pub fn check_operations<M: Model>(
         .map(|d| spawn_timer(&kill, d))
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
-    let ok = check_parallel(model, partitions, &kill);
+    let ok = check_parallel(model, partitions, kill);
     to_check_result(ok, &timed_out)
 }
 
 /// Check an event-based history for linearizability.
 ///
 /// `timeout` works identically to [`check_operations`]: `None` means unbounded.
-pub fn check_events<M: Model>(
+///
+/// Partitions returned by [`Model::partition_events`] are checked concurrently
+/// on the rayon thread pool.
+pub fn check_events<M>(
     model:   &M,
     history: &[Event<M::Input, M::Output>],
     timeout: Option<Duration>,
-) -> CheckResult {
+) -> CheckResult
+where
+    M: Model + Sync,
+    M::Input:  Send,
+    M::Output: Send,
+{
     // INV-HIST-01 (event form): every id has exactly one Call and one Return,
     // Call has input=Some, Return has output=Some, and Call precedes its Return.
     assert_well_formed_events!(history);
@@ -499,88 +492,7 @@ pub fn check_events<M: Model>(
         .map(|d| spawn_timer(&kill, d))
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
-    let ok = check_parallel(model, partitions, &kill);
-    to_check_result(ok, &timed_out)
-}
-
-/// Check an operation-based history for linearizability using rayon parallelism.
-///
-/// Each independent partition (returned by [`Model::partition`]) is checked
-/// concurrently on the rayon thread pool.  If the model does not implement
-/// `partition`, the whole history is checked as a single partition (no speedup).
-///
-/// `timeout` works identically to [`check_operations`]: `None` means unbounded.
-///
-/// Requires the `parallel` feature.
-#[cfg(feature = "parallel")]
-pub fn check_operations_parallel<M>(
-    model:   &M,
-    history: &[Operation<M::Input, M::Output>],
-    timeout: Option<Duration>,
-) -> CheckResult
-where
-    M: Model + Sync,
-    M::Input:  Send,
-    M::Output: Send,
-{
-    assert_well_formed!(history);
-
-    let partitions: Vec<Vec<Entry<M::Input, M::Output>>> =
-        if let Some(parts) = model.partition(history) {
-            assert_partition_independent!(parts);
-            parts.iter()
-                .map(|indices| make_entries(&indices.iter().map(|&i| history[i].clone()).collect::<Vec<_>>()))
-                .collect()
-        } else {
-            vec![make_entries(history)]
-        };
-
-    let kill = Arc::new(AtomicBool::new(false));
-    let timed_out = timeout
-        .map(|d| spawn_timer(&kill, d))
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-
-    let ok = check_parallel_rayon(model, partitions, kill);
-    to_check_result(ok, &timed_out)
-}
-
-/// Check an event-based history for linearizability using rayon parallelism.
-///
-/// `timeout` works identically to [`check_operations`]: `None` means unbounded.
-///
-/// Requires the `parallel` feature.
-#[cfg(feature = "parallel")]
-pub fn check_events_parallel<M>(
-    model:   &M,
-    history: &[Event<M::Input, M::Output>],
-    timeout: Option<Duration>,
-) -> CheckResult
-where
-    M: Model + Sync,
-    M::Input:  Send,
-    M::Output: Send,
-{
-    assert_well_formed_events!(history);
-
-    let partitions: Vec<Vec<Entry<M::Input, M::Output>>> =
-        if let Some(parts) = model.partition_events(history) {
-            assert_partition_independent!(parts);
-            parts.iter()
-                .map(|indices| {
-                    let sub: Vec<Event<M::Input, M::Output>> = indices.iter().map(|&i| history[i].clone()).collect();
-                    convert_entries(&renumber(&sub))
-                })
-                .collect()
-        } else {
-            vec![convert_entries(&renumber(history))]
-        };
-
-    let kill = Arc::new(AtomicBool::new(false));
-    let timed_out = timeout
-        .map(|d| spawn_timer(&kill, d))
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-
-    let ok = check_parallel_rayon(model, partitions, kill);
+    let ok = check_parallel(model, partitions, kill);
     to_check_result(ok, &timed_out)
 }
 
@@ -1174,8 +1086,7 @@ mod tests {
     //   partition: groups operation indices by key → each key is independent
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "parallel")]
-    mod parallel_unit_tests {
+    mod partition_tests {
         use super::*;
         use std::collections::HashMap;
 
@@ -1226,20 +1137,20 @@ mod tests {
         }
 
         #[test]
-        fn parallel_rayon_two_partition_ok_history() {
+        fn two_partition_ok_history() {
             // Two independent keys, each with a sequential write-then-read.
-            // partition() splits into 2 groups; rayon checks both concurrently.
+            // partition() splits into 2 groups checked concurrently by rayon.
             let history = [
                 kv_op(0, kv_write(0, 1), 0,  0, 10),
                 kv_op(1, kv_read(0),     1, 11, 20),
                 kv_op(2, kv_write(1, 5), 0,  0, 10),
                 kv_op(3, kv_read(1),     5, 11, 20),
             ];
-            assert_eq!(check_operations_parallel(&KvModel, &history, None), CheckResult::Ok);
+            assert_eq!(check_operations(&KvModel, &history, None), CheckResult::Ok);
         }
 
         #[test]
-        fn parallel_rayon_two_partition_illegal_history() {
+        fn two_partition_illegal_history() {
             // Key 0: write(1) then read→0 (stale read, illegal).
             // Key 1: write(5) then read→5 (ok).
             // One illegal partition must propagate Illegal for the whole check.
@@ -1249,39 +1160,11 @@ mod tests {
                 kv_op(2, kv_write(1, 5), 0,  0, 10),
                 kv_op(3, kv_read(1),     5, 11, 20),
             ];
-            assert_eq!(check_operations_parallel(&KvModel, &history, None), CheckResult::Illegal);
+            assert_eq!(check_operations(&KvModel, &history, None), CheckResult::Illegal);
         }
 
         #[test]
-        fn parallel_rayon_agrees_with_sequential_on_ok_history() {
-            let history = [
-                kv_op(0, kv_write(0, 7), 0,  0, 10),
-                kv_op(1, kv_read(0),     7, 11, 20),
-                kv_op(2, kv_write(1, 3), 0,  0, 10),
-                kv_op(3, kv_read(1),     3, 11, 20),
-            ];
-            assert_eq!(
-                check_operations(&KvModel, &history, None),
-                check_operations_parallel(&KvModel, &history, None)
-            );
-        }
-
-        #[test]
-        fn parallel_rayon_agrees_with_sequential_on_illegal_history() {
-            let history = [
-                kv_op(0, kv_write(0, 1), 0,  0, 10),
-                kv_op(1, kv_read(0),     0, 11, 20), // stale
-                kv_op(2, kv_write(1, 5), 0,  0, 10),
-                kv_op(3, kv_read(1),     5, 11, 20),
-            ];
-            assert_eq!(
-                check_operations(&KvModel, &history, None),
-                check_operations_parallel(&KvModel, &history, None)
-            );
-        }
-
-        #[test]
-        fn parallel_rayon_three_partitions_all_ok() {
+        fn three_partitions_all_ok() {
             // Three independent keys; exercises rayon dispatch across 3 partitions.
             let history = [
                 kv_op(0, kv_write(0, 1), 0,  0, 10),
@@ -1291,7 +1174,7 @@ mod tests {
                 kv_op(4, kv_write(2, 3), 0,  0, 10),
                 kv_op(5, kv_read(2),     3, 11, 20),
             ];
-            assert_eq!(check_operations_parallel(&KvModel, &history, None), CheckResult::Ok);
+            assert_eq!(check_operations(&KvModel, &history, None), CheckResult::Ok);
         }
     }
 
