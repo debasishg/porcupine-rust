@@ -104,7 +104,17 @@ Mirrors the `check_operations` suite for the event-based entry point. Plus:
 | `events_agree_with_operations_on_illegal_history` | Both APIs return Illegal on the same illegal history |
 | `events_backtracking_finds_valid_ordering_after_failed_attempts` | DFS backtracks on event history |
 
-### Timeout tests (5)
+### `check_events` with `partition_events` tests (3)
+
+These live in `mod events_partition_tests` and are the first unit tests to exercise the `partition_events` path inside `check_events`, closing the coverage gap identified after commit 8.
+
+| Test | What it checks |
+|------|----------------|
+| `check_events_partition_two_keys_ok` | Two-key KV history via `partition_events` → each partition is independently linearizable → `Ok` |
+| `check_events_partition_detects_illegal_in_one_key` | Stale read on key 0 propagates `Illegal` even though key 1 is ok |
+| `check_events_partition_concurrent_writes_ok` | Interleaved Call/Return events on two different keys each resolve correctly → `Ok` |
+
+### Timeout tests (7)
 
 | Test | What it checks |
 |------|----------------|
@@ -113,8 +123,26 @@ Mirrors the `check_operations` suite for the event-based entry point. Plus:
 | `timeout_very_long_does_not_affect_illegal_result` | A 60-second timeout on an illegal history returns Illegal |
 | `timeout_none_matches_none_no_timeout` | `None` and a very long timeout agree on the same history |
 | `timeout_events_very_long_does_not_affect_result` | Same guarantee for `check_events` with a long timeout |
+| `timeout_unknown_tests::timeout_short_duration_returns_unknown` | `SlowModel.step` sleeps 50 ms; 2 ms timer fires first → `check_operations` returns `Unknown` definitively |
+| `timeout_unknown_tests::timeout_short_duration_events_returns_unknown` | Same guarantee via `check_events` |
 
-**Expected output**: 48 tests, all passing.
+The two `timeout_unknown_tests` use `SlowModel` — a register whose `step()` unconditionally sleeps 50 ms — paired with a 2 ms timer, making `Unknown` deterministic: the timer always fires during the first `step()` call, and `to_check_result` checks `timed_out` before `ok`, so `Unknown` is returned regardless of whether the DFS reached completion.
+
+### `check_operations_parallel` / `check_parallel_rayon` tests (5) — `--features parallel`
+
+These live in `mod parallel_unit_tests` (compiled only with `--features parallel`) and provide the first targeted unit-level coverage of `check_parallel_rayon`, which is otherwise exercised only via property tests.
+
+| Test | What it checks |
+|------|----------------|
+| `parallel_rayon_two_partition_ok_history` | Two-key KV history → `check_operations_parallel` returns `Ok`; verifies partition split + rayon dispatch |
+| `parallel_rayon_two_partition_illegal_history` | One stale-read partition propagates `Illegal` for the whole parallel check |
+| `parallel_rayon_agrees_with_sequential_on_ok_history` | `check_operations` == `check_operations_parallel` on a known-Ok history |
+| `parallel_rayon_agrees_with_sequential_on_illegal_history` | Same agreement on a known-Illegal history |
+| `parallel_rayon_three_partitions_all_ok` | Three-key history exercises rayon dispatch across 3 independent partitions |
+
+**Expected output**:
+- `cargo test --lib`: **53 tests**, all passing
+- `cargo test --features parallel --lib`: **58 tests**, all passing
 
 ---
 
@@ -321,7 +349,7 @@ quint run tla/Porcupine.qnt --out-itf /tmp/porcupine_trace.itf.json --max-steps 
 cargo test
 ```
 
-Runs all lib unit tests (48) and all integration tests (13 property tests). Excludes `quint-mbt` and `parallel` feature gates.
+Runs all lib unit tests (53) and all integration tests (13 property tests). Excludes `quint-mbt` and `parallel` feature gates.
 
 ### Run with parallel feature enabled
 
@@ -329,7 +357,7 @@ Runs all lib unit tests (48) and all integration tests (13 property tests). Excl
 cargo test --features parallel
 ```
 
-Adds 4 parallel property tests (17 property tests total). No Quint required.
+Adds 5 parallel unit tests and 4 parallel property tests (58 unit tests, 17 property tests total). No Quint required.
 
 ### Run everything including MBT (Quint required)
 
@@ -366,10 +394,10 @@ Tests marked `[par]` require `--features parallel`.
 | INV-HIST-01 | Well-Formed History | — | `prop_well_formed_history` | `histWellFormedInv` | — |
 | INV-HIST-02 | Real-Time Order | structural | `prop_sequential_history_is_linearizable` | `realTimeOrder` (pure def) | — |
 | INV-HIST-03 | Minimal-Call Frontier | structural | covered by soundness tests | `minimalCallFrontier` | — |
-| INV-LIN-01 | Soundness | `timeout_very_long_does_not_affect_result` | `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable`, `prop_parallel_ops_agrees_with_sequential` [par], `prop_parallel_events_agrees_with_sequential` [par] | `resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_parallel_ops_matches_quint_trace` [par], `mbt_parallel_events_matches_quint_trace` [par] |
-| INV-LIN-02 | Completeness | `timeout_very_long_does_not_affect_illegal_result` | `prop_illegal_history_is_detected`, `parallel_detects_illegal_ops_history` [par] | `resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_parallel_ops_matches_quint_trace` [par] |
-| INV-LIN-03 | P-Compositionality | — | `prop_compositionality_partitions_disjoint`, `prop_compositionality_end_to_end`, `prop_parallel_kv_agrees_with_sequential` [par] | `pCompositionality` | — |
+| INV-LIN-01 | Soundness | `timeout_very_long_does_not_affect_result`, `parallel_rayon_agrees_with_sequential_on_ok_history` [par] | `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable`, `prop_parallel_ops_agrees_with_sequential` [par], `prop_parallel_events_agrees_with_sequential` [par] | `resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_parallel_ops_matches_quint_trace` [par], `mbt_parallel_events_matches_quint_trace` [par] |
+| INV-LIN-02 | Completeness | `timeout_very_long_does_not_affect_illegal_result`, `parallel_rayon_agrees_with_sequential_on_illegal_history` [par] | `prop_illegal_history_is_detected`, `parallel_detects_illegal_ops_history` [par] | `resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_parallel_ops_matches_quint_trace` [par] |
+| INV-LIN-03 | P-Compositionality | `check_events_partition_*` (events path), `parallel_rayon_*` [par] (ops parallel path) | `prop_compositionality_partitions_disjoint`, `prop_compositionality_end_to_end`, `prop_parallel_kv_agrees_with_sequential` [par] | `pCompositionality` | — |
 | INV-LIN-04 | Cache Soundness | `timeout_none_matches_none_no_timeout` | `prop_cache_sound_deterministic`, `prop_events_cache_sound_deterministic` | `cacheSound` | — |
-| INV-PAR-01 | Kill-Flag Monotonicity | `timeout_zero_duration_returns_unknown_or_definitive` | — | `parallelKillFlagInvariant` | — |
+| INV-PAR-01 | Kill-Flag Monotonicity | `timeout_zero_duration_returns_unknown_or_definitive`, `timeout_short_duration_returns_unknown`, `timeout_short_duration_events_returns_unknown` | — | `parallelKillFlagInvariant` | — |
 
 Full invariant definitions: `docs/spec.md`.

@@ -1156,4 +1156,322 @@ mod tests {
             CheckResult::Ok
         );
     }
+
+    // -----------------------------------------------------------------------
+    // check_operations_parallel / check_parallel_rayon (unit tests)
+    //
+    // These tests directly exercise `check_operations_parallel`, which
+    // dispatches to `check_parallel_rayon` internally.  They complement the
+    // property tests in tests/property_tests.rs by using a concrete
+    // multi-partition history so that the partition splitting and rayon
+    // dispatch path can be inspected deterministically.
+    //
+    // Model: KvModel — a two-type key/value store that partitions by key.
+    //   State:  HashMap<u8, i32>  (key → value; missing key reads as 0)
+    //   Input:  KvInput { key, is_write, value }
+    //   Output: i32
+    //   step:   write always succeeds; read succeeds iff output == stored value
+    //   partition: groups operation indices by key → each key is independent
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "parallel")]
+    mod parallel_unit_tests {
+        use super::*;
+        use std::collections::HashMap;
+
+        #[derive(Clone)]
+        struct KvModel;
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct KvInput {
+            key:      u8,
+            is_write: bool,
+            value:    i32,
+        }
+
+        impl Model for KvModel {
+            type State  = HashMap<u8, i32>;
+            type Input  = KvInput;
+            type Output = i32;
+
+            fn init(&self) -> Self::State { HashMap::new() }
+
+            fn step(&self, state: &Self::State, input: &KvInput, output: &i32) -> Option<Self::State> {
+                let mut next = state.clone();
+                if input.is_write {
+                    next.insert(input.key, input.value);
+                    Some(next)
+                } else {
+                    let stored = *state.get(&input.key).unwrap_or(&0);
+                    if *output == stored { Some(next) } else { None }
+                }
+            }
+
+            fn partition(&self, history: &[Operation<KvInput, i32>]) -> Option<Vec<Vec<usize>>> {
+                let mut by_key: HashMap<u8, Vec<usize>> = HashMap::new();
+                for (i, op) in history.iter().enumerate() {
+                    by_key.entry(op.input.key).or_default().push(i);
+                }
+                Some(by_key.into_values().collect())
+            }
+        }
+
+        fn kv_write(key: u8, value: i32) -> KvInput { KvInput { key, is_write: true,  value } }
+        fn kv_read(key: u8)              -> KvInput { KvInput { key, is_write: false, value: 0 } }
+
+        fn kv_op(id: u64, input: KvInput, output: i32, call: u64, ret: u64)
+            -> Operation<KvInput, i32>
+        {
+            Operation { client_id: id, input, output, call, return_time: ret }
+        }
+
+        #[test]
+        fn parallel_rayon_two_partition_ok_history() {
+            // Two independent keys, each with a sequential write-then-read.
+            // partition() splits into 2 groups; rayon checks both concurrently.
+            let history = [
+                kv_op(0, kv_write(0, 1), 0,  0, 10),
+                kv_op(1, kv_read(0),     1, 11, 20),
+                kv_op(2, kv_write(1, 5), 0,  0, 10),
+                kv_op(3, kv_read(1),     5, 11, 20),
+            ];
+            assert_eq!(check_operations_parallel(&KvModel, &history, None), CheckResult::Ok);
+        }
+
+        #[test]
+        fn parallel_rayon_two_partition_illegal_history() {
+            // Key 0: write(1) then read→0 (stale read, illegal).
+            // Key 1: write(5) then read→5 (ok).
+            // One illegal partition must propagate Illegal for the whole check.
+            let history = [
+                kv_op(0, kv_write(0, 1), 0,  0, 10),
+                kv_op(1, kv_read(0),     0, 11, 20), // stale; should be 1
+                kv_op(2, kv_write(1, 5), 0,  0, 10),
+                kv_op(3, kv_read(1),     5, 11, 20),
+            ];
+            assert_eq!(check_operations_parallel(&KvModel, &history, None), CheckResult::Illegal);
+        }
+
+        #[test]
+        fn parallel_rayon_agrees_with_sequential_on_ok_history() {
+            let history = [
+                kv_op(0, kv_write(0, 7), 0,  0, 10),
+                kv_op(1, kv_read(0),     7, 11, 20),
+                kv_op(2, kv_write(1, 3), 0,  0, 10),
+                kv_op(3, kv_read(1),     3, 11, 20),
+            ];
+            assert_eq!(
+                check_operations(&KvModel, &history, None),
+                check_operations_parallel(&KvModel, &history, None)
+            );
+        }
+
+        #[test]
+        fn parallel_rayon_agrees_with_sequential_on_illegal_history() {
+            let history = [
+                kv_op(0, kv_write(0, 1), 0,  0, 10),
+                kv_op(1, kv_read(0),     0, 11, 20), // stale
+                kv_op(2, kv_write(1, 5), 0,  0, 10),
+                kv_op(3, kv_read(1),     5, 11, 20),
+            ];
+            assert_eq!(
+                check_operations(&KvModel, &history, None),
+                check_operations_parallel(&KvModel, &history, None)
+            );
+        }
+
+        #[test]
+        fn parallel_rayon_three_partitions_all_ok() {
+            // Three independent keys; exercises rayon dispatch across 3 partitions.
+            let history = [
+                kv_op(0, kv_write(0, 1), 0,  0, 10),
+                kv_op(1, kv_read(0),     1, 11, 20),
+                kv_op(2, kv_write(1, 2), 0,  0, 10),
+                kv_op(3, kv_read(1),     2, 11, 20),
+                kv_op(4, kv_write(2, 3), 0,  0, 10),
+                kv_op(5, kv_read(2),     3, 11, 20),
+            ];
+            assert_eq!(check_operations_parallel(&KvModel, &history, None), CheckResult::Ok);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // check_events with partition_events (gap 5)
+    //
+    // KvModel below is the first model in this file that implements
+    // partition_events, closing the coverage gap on the event-based
+    // partition path in check_events.
+    //
+    // partition_events strategy:
+    //   Call events carry the key in their input field.
+    //   Return events share the same `id` as their matching Call.
+    //   First pass: build id → key from Call events.
+    //   Second pass: assign every event index to its key's partition.
+    // -----------------------------------------------------------------------
+
+    mod events_partition_tests {
+        use super::*;
+        use std::collections::HashMap;
+
+        #[derive(Clone)]
+        struct KvModel;
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct KvInput {
+            key:      u8,
+            is_write: bool,
+            value:    i32,
+        }
+
+        impl Model for KvModel {
+            type State  = HashMap<u8, i32>;
+            type Input  = KvInput;
+            type Output = i32;
+
+            fn init(&self) -> Self::State { HashMap::new() }
+
+            fn step(&self, state: &Self::State, input: &KvInput, output: &i32) -> Option<Self::State> {
+                let mut next = state.clone();
+                if input.is_write {
+                    next.insert(input.key, input.value);
+                    Some(next)
+                } else {
+                    let stored = *state.get(&input.key).unwrap_or(&0);
+                    if *output == stored { Some(next) } else { None }
+                }
+            }
+
+            fn partition_events(&self, history: &[Event<KvInput, i32>]) -> Option<Vec<Vec<usize>>> {
+                // First pass: map event id → key from Call events.
+                let mut id_to_key: HashMap<u64, u8> = HashMap::new();
+                for ev in history {
+                    if let (EventKind::Call, Some(input)) = (&ev.kind, &ev.input) {
+                        id_to_key.insert(ev.id, input.key);
+                    }
+                }
+                // Second pass: group each event index into its key's partition.
+                let mut by_key: HashMap<u8, Vec<usize>> = HashMap::new();
+                for (i, ev) in history.iter().enumerate() {
+                    if let Some(&key) = id_to_key.get(&ev.id) {
+                        by_key.entry(key).or_default().push(i);
+                    }
+                }
+                Some(by_key.into_values().collect())
+            }
+        }
+
+        fn kv_call(id: u64, key: u8, is_write: bool, value: i32) -> Event<KvInput, i32> {
+            Event { client_id: id, kind: EventKind::Call,
+                    input: Some(KvInput { key, is_write, value }), output: None, id }
+        }
+        fn kv_ret(id: u64, output: i32) -> Event<KvInput, i32> {
+            Event { client_id: id, kind: EventKind::Return, input: None, output: Some(output), id }
+        }
+
+        #[test]
+        fn check_events_partition_two_keys_ok() {
+            // Two independent sequential sub-histories, one per key.
+            // partition_events must split them into 2 groups; both are Ok.
+            let history = [
+                kv_call(0, 0, true,  1), kv_ret(0, 0), // key 0: write(1)
+                kv_call(1, 0, false, 0), kv_ret(1, 1), // key 0: read→1
+                kv_call(2, 1, true,  5), kv_ret(2, 0), // key 1: write(5)
+                kv_call(3, 1, false, 0), kv_ret(3, 5), // key 1: read→5
+            ];
+            assert_eq!(check_events(&KvModel, &history, None), CheckResult::Ok);
+        }
+
+        #[test]
+        fn check_events_partition_detects_illegal_in_one_key() {
+            // key 0: write(1) then read→0 (stale — illegal)
+            // key 1: write(5) then read→5 (ok)
+            // The illegal partition must propagate Illegal for the whole check.
+            let history = [
+                kv_call(0, 0, true,  1), kv_ret(0, 0),
+                kv_call(1, 0, false, 0), kv_ret(1, 0), // stale read; should be 1
+                kv_call(2, 1, true,  5), kv_ret(2, 0),
+                kv_call(3, 1, false, 0), kv_ret(3, 5),
+            ];
+            assert_eq!(check_events(&KvModel, &history, None), CheckResult::Illegal);
+        }
+
+        #[test]
+        fn check_events_partition_concurrent_writes_ok() {
+            // Two writes on different keys overlap in time (interleaved events).
+            // Each key's sub-history is independently linearizable.
+            let history = [
+                kv_call(0, 0, true, 1),  // key 0 call
+                kv_call(1, 1, true, 5),  // key 1 call (concurrent)
+                kv_ret(0, 0),            // key 0 return
+                kv_ret(1, 0),            // key 1 return
+            ];
+            assert_eq!(check_events(&KvModel, &history, None), CheckResult::Ok);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Definitive Unknown result via artificially slow model (gap 7)
+    //
+    // SlowModel.step() sleeps STEP_MS milliseconds, ensuring the timer
+    // (set to TIMER_MS << STEP_MS) fires before the DFS iteration that
+    // called step() can loop back and observe cursor=None.
+    //
+    // Why this is reliable:
+    //   - The timer fires at TIMER_MS (~2 ms).
+    //   - step() returns at STEP_MS (~50 ms) → kill is already true.
+    //   - Even if cursor happens to be None at that point,
+    //     to_check_result() checks timed_out BEFORE ok, so Unknown is
+    //     returned regardless of the DFS's final boolean.
+    // -----------------------------------------------------------------------
+
+    mod timeout_unknown_tests {
+        use super::*;
+
+        const STEP_MS:  u64 = 50;
+        const TIMER_MS: u64 = 2;
+
+        #[derive(Clone)]
+        struct SlowModel;
+
+        impl Model for SlowModel {
+            type State  = ();
+            type Input  = ();
+            type Output = ();
+
+            fn init(&self) -> () { () }
+
+            fn step(&self, _state: &(), _input: &(), _output: &()) -> Option<()> {
+                std::thread::sleep(Duration::from_millis(STEP_MS));
+                Some(())
+            }
+        }
+
+        fn slow_op(id: u64) -> Operation<(), ()> {
+            Operation { client_id: id, input: (), output: (), call: id, return_time: id + 1 }
+        }
+
+        #[test]
+        fn timeout_short_duration_returns_unknown() {
+            // Timer fires at 2 ms; step sleeps 50 ms.
+            // The kill + timed_out flags are set long before DFS can finish.
+            let history = [slow_op(0)];
+            assert_eq!(
+                check_operations(&SlowModel, &history, Some(Duration::from_millis(TIMER_MS))),
+                CheckResult::Unknown
+            );
+        }
+
+        #[test]
+        fn timeout_short_duration_events_returns_unknown() {
+            // Same guarantee via check_events.
+            let history = [
+                Event { client_id: 0, kind: EventKind::Call,   input: Some(()), output: None,    id: 0 },
+                Event { client_id: 0, kind: EventKind::Return, input: None,     output: Some(()), id: 0 },
+            ];
+            assert_eq!(
+                check_events(&SlowModel, &history, Some(Duration::from_millis(TIMER_MS))),
+                CheckResult::Unknown
+            );
+        }
+    }
 }
