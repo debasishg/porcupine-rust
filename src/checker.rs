@@ -226,7 +226,7 @@ struct CacheEntry<S> {
 fn cache_contains<S: PartialEq>(cache: &HashMap<u64, Vec<CacheEntry<S>>>, hash: u64, bitset: &Bitset, state: &S) -> bool {
     if let Some(entries) = cache.get(&hash) {
         for e in entries {
-            if e.linearized.equals(bitset) && &e.state == state {
+            if e.linearized == *bitset && &e.state == state {
                 return true;
             }
         }
@@ -345,10 +345,16 @@ fn check_single<M: Model>(
 
 /// Returns `true` if all partitions are linearizable, `false` if any failed or
 /// the kill flag was set externally (e.g. by a timeout timer).
+///
+/// `definitive_illegal` is set to `true` when a partition completes its full DFS
+/// and proves non-linearizability (as opposed to being killed mid-search by a
+/// timeout).  This lets `to_check_result` give `Illegal` priority over `Unknown`,
+/// matching Go's `checkParallel` semantics.
 fn check_parallel<M>(
-    model:      &M,
-    partitions: Vec<Vec<Entry<M::Input, M::Output>>>,
-    kill:       Arc<AtomicBool>,
+    model:               &M,
+    partitions:          Vec<Vec<Entry<M::Input, M::Output>>>,
+    kill:                Arc<AtomicBool>,
+    definitive_illegal:  &AtomicBool,
 ) -> bool
 where
     M: Model + Sync,
@@ -367,6 +373,14 @@ where
         }
         let ok = check_single(model, partition, &kill);
         if !ok {
+            // Record whether this was a definitive finding (kill was not yet set
+            // when check_single began — it completed its full search).  There is
+            // a benign race: kill may be set between check_single returning and
+            // the load below, but a false-negative here only means we report
+            // Unknown instead of Illegal, which is the safe direction.
+            if !kill.load(Ordering::Relaxed) {
+                definitive_illegal.store(true, Ordering::Relaxed);
+            }
             kill.store(true, Ordering::Relaxed);
         }
         !ok
@@ -394,12 +408,16 @@ fn spawn_timer(kill: &Arc<AtomicBool>, duration: Duration) -> Arc<AtomicBool> {
     timed_out
 }
 
-/// Translate `(ok, timed_out)` into a [`CheckResult`].
+/// Translate `(ok, timed_out, definitive_illegal)` into a [`CheckResult`].
 ///
-/// - If the timer fired (`timed_out`), the search was cut short: `Unknown`.
-/// - Otherwise the DFS ran to completion: `Ok` or `Illegal`.
-fn to_check_result(ok: bool, timed_out: &AtomicBool) -> CheckResult {
-    if timed_out.load(Ordering::Relaxed) {
+/// Priority (matches Go's `checkParallel`):
+///  1. If any partition definitively proved non-linearizability → `Illegal`.
+///  2. If the timer fired and no definitive answer was found   → `Unknown`.
+///  3. Otherwise the DFS completed and all partitions were ok  → `Ok`.
+fn to_check_result(ok: bool, timed_out: &AtomicBool, definitive_illegal: &AtomicBool) -> CheckResult {
+    if !ok && definitive_illegal.load(Ordering::Relaxed) {
+        CheckResult::Illegal
+    } else if timed_out.load(Ordering::Relaxed) {
         CheckResult::Unknown
     } else if ok {
         CheckResult::Ok
@@ -449,9 +467,10 @@ where
     let timed_out = timeout
         .map(|d| spawn_timer(&kill, d))
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let definitive_illegal = AtomicBool::new(false);
 
-    let ok = check_parallel(model, partitions, kill);
-    to_check_result(ok, &timed_out)
+    let ok = check_parallel(model, partitions, kill, &definitive_illegal);
+    to_check_result(ok, &timed_out, &definitive_illegal)
 }
 
 /// Check an event-based history for linearizability.
@@ -491,9 +510,10 @@ where
     let timed_out = timeout
         .map(|d| spawn_timer(&kill, d))
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let definitive_illegal = AtomicBool::new(false);
 
-    let ok = check_parallel(model, partitions, kill);
-    to_check_result(ok, &timed_out)
+    let ok = check_parallel(model, partitions, kill, &definitive_illegal);
+    to_check_result(ok, &timed_out, &definitive_illegal)
 }
 
 // ===========================================================================

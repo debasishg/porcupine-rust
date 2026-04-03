@@ -1,5 +1,6 @@
 /// The outcome of a linearizability check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
 pub enum CheckResult {
     /// The history is linearizable.
     Ok,
@@ -47,6 +48,9 @@ pub struct Event<I, O> {
 }
 
 /// Diagnostic information about a (partial) linearization, used for visualization.
+///
+/// **Not yet populated.** The Go original populates this via `CheckOperationsVerbose` /
+/// `CheckEventsVerbose`; a Rust equivalent is planned but not yet implemented.
 #[derive(Debug, Clone, Default)]
 pub struct LinearizationInfo {
     /// For each partition, the sequence of operation indices in linearization order.

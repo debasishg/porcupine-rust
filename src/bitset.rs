@@ -2,7 +2,7 @@
 ///
 /// Bit layout: bits 0–63 in `data[0]`, bits 64–127 in `data[1]`, etc.
 /// Mirrors `bitset.go` from the original porcupine implementation.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bitset(Vec<u64>);
 
 impl Bitset {
@@ -42,11 +42,6 @@ impl Bitset {
         }
         h
     }
-
-    /// Bitwise equality.
-    pub fn equals(&self, other: &Bitset) -> bool {
-        self.0 == other.0
-    }
 }
 
 #[cfg(test)]
@@ -74,7 +69,7 @@ mod tests {
         b2.set(3);
         b2.set(7);
         assert_eq!(b1.hash(), b2.hash());
-        assert!(b1.equals(&b2));
+        assert_eq!(b1, b2);
     }
 
     #[test]
