@@ -15,14 +15,16 @@
 //     - Cache prunes duplicate (bitset, state) branches (INV-LIN-04).
 //  6. Return Ok / Illegal.
 
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-use rayon::prelude::*;
 
 use crate::bitset::Bitset;
-use crate::invariants::{assert_partition_independent, assert_well_formed, assert_well_formed_events};
+use crate::invariants::{
+    assert_partition_independent, assert_well_formed, assert_well_formed_events,
+};
 use crate::model::Model;
 use crate::types::{CheckResult, Event, EventKind, Operation};
 
@@ -38,8 +40,8 @@ enum EntryValue<I, O> {
 
 #[derive(Clone)]
 struct Entry<I, O> {
-    id:    usize, // operation id (0-indexed); call and return share the same id
-    time:  u64,   // u64 to avoid silent overflow when timestamps are near u64::MAX
+    id: usize, // operation id (0-indexed); call and return share the same id
+    time: u64, // u64 to avoid silent overflow when timestamps are near u64::MAX
     value: EntryValue<I, O>,
 }
 
@@ -48,8 +50,16 @@ struct Entry<I, O> {
 fn make_entries<I: Clone, O: Clone>(ops: &[Operation<I, O>]) -> Vec<Entry<I, O>> {
     let mut entries = Vec::with_capacity(ops.len() * 2);
     for (id, op) in ops.iter().enumerate() {
-        entries.push(Entry { id, time: op.call,        value: EntryValue::Call(op.input.clone()) });
-        entries.push(Entry { id, time: op.return_time, value: EntryValue::Return(op.output.clone()) });
+        entries.push(Entry {
+            id,
+            time: op.call,
+            value: EntryValue::Call(op.input.clone()),
+        });
+        entries.push(Entry {
+            id,
+            time: op.return_time,
+            value: EntryValue::Return(op.output.clone()),
+        });
     }
     entries.sort_by(|a, b| {
         a.time.cmp(&b.time).then_with(|| {
@@ -75,20 +85,35 @@ fn renumber<I: Clone, O: Clone>(events: &[Event<I, O>]) -> Vec<Event<I, O>> {
             next_id += 1;
             id
         });
-        out.push(Event { id: new_id, ..ev.clone() });
+        out.push(Event {
+            id: new_id,
+            ..ev.clone()
+        });
     }
     out
 }
 
 /// Convert a renumbered slice of `Event`s into `Entry`s (index as time).
 fn convert_entries<I: Clone, O: Clone>(events: &[Event<I, O>]) -> Vec<Entry<I, O>> {
-    events.iter().enumerate().map(|(i, ev)| {
-        let value = match ev.kind {
-            EventKind::Call   => EntryValue::Call(ev.input.clone().expect("Call event must have input")),
-            EventKind::Return => EntryValue::Return(ev.output.clone().expect("Return event must have output")),
-        };
-        Entry { id: ev.id as usize, time: i as u64, value }
-    }).collect()
+    events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| {
+            let value = match ev.kind {
+                EventKind::Call => {
+                    EntryValue::Call(ev.input.clone().expect("Call event must have input"))
+                }
+                EventKind::Return => {
+                    EntryValue::Return(ev.output.clone().expect("Return event must have output"))
+                }
+            };
+            Entry {
+                id: ev.id as usize,
+                time: i as u64,
+                value,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -100,11 +125,11 @@ fn convert_entries<I: Clone, O: Clone>(events: &[Event<I, O>]) -> Vec<Entry<I, O
 //
 // `value` is `None` only for the sentinel; always `Some` for real nodes.
 struct Node<I, O> {
-    value:     Option<EntryValue<I, O>>,
+    value: Option<EntryValue<I, O>>,
     match_idx: Option<usize>, // Some(ret_idx) for call nodes, None for return/sentinel
-    id:        usize,
-    prev:      usize,         // index of previous node (sentinel = 0)
-    next:      Option<usize>, // None at end of list
+    id: usize,
+    prev: usize,         // index of previous node (sentinel = 0)
+    next: Option<usize>, // None at end of list
 }
 
 struct NodeArena<I, O> {
@@ -119,11 +144,11 @@ impl<I, O> NodeArena<I, O> {
 
         // Sentinel at index 0 — value is None (never accessed in DFS).
         arena_nodes.push(Node {
-            value:     None,
+            value: None,
             match_idx: None,
-            id:        usize::MAX,
-            prev:      0,
-            next:      None,
+            id: usize::MAX,
+            prev: 0,
+            next: None,
         });
 
         // Track which node index holds the return for each operation id.
@@ -136,11 +161,11 @@ impl<I, O> NodeArena<I, O> {
                 return_idx.insert(entry.id, node_idx);
             }
             arena_nodes.push(Node {
-                value:     Some(entry.value),
+                value: Some(entry.value),
                 match_idx: None, // filled in next pass
-                id:        entry.id,
-                prev:      0,
-                next:      None,
+                id: entry.id,
+                prev: 0,
+                next: None,
             });
         }
 
@@ -220,10 +245,15 @@ impl<I, O> NodeArena<I, O> {
 
 struct CacheEntry<S> {
     linearized: Bitset,
-    state:      S,
+    state: S,
 }
 
-fn cache_contains<S: PartialEq>(cache: &HashMap<u64, Vec<CacheEntry<S>>>, hash: u64, bitset: &Bitset, state: &S) -> bool {
+fn cache_contains<S: PartialEq>(
+    cache: &HashMap<u64, Vec<CacheEntry<S>>>,
+    hash: u64,
+    bitset: &Bitset,
+    state: &S,
+) -> bool {
     if let Some(entries) = cache.get(&hash) {
         for e in entries {
             if e.linearized == *bitset && &e.state == state {
@@ -240,7 +270,7 @@ fn cache_contains<S: PartialEq>(cache: &HashMap<u64, Vec<CacheEntry<S>>>, hash: 
 
 struct CallFrame<S> {
     node_idx: usize, // index of the call node that was linearized
-    state:    S,     // model state *before* this linearization step
+    state: S,        // model state *before* this linearization step
 }
 
 // ---------------------------------------------------------------------------
@@ -248,9 +278,9 @@ struct CallFrame<S> {
 // ---------------------------------------------------------------------------
 
 fn check_single<M: Model>(
-    model:   &M,
+    model: &M,
     entries: Vec<Entry<M::Input, M::Output>>,
-    kill:    &AtomicBool,
+    kill: &AtomicBool,
 ) -> bool {
     if entries.is_empty() {
         return true;
@@ -300,9 +330,12 @@ fn check_single<M: Model>(
                                 // INV-LIN-04: new (bitset, state) pair — safe to cache.
                                 cache.entry(h).or_default().push(CacheEntry {
                                     linearized: new_linearized,
-                                    state:      next_state.clone(),
+                                    state: next_state.clone(),
                                 });
-                                calls.push(CallFrame { node_idx: idx, state: state.clone() });
+                                calls.push(CallFrame {
+                                    node_idx: idx,
+                                    state: state.clone(),
+                                });
                                 state = next_state;
                                 linearized.set(op_id);
                                 arena.lift(idx);
@@ -351,14 +384,14 @@ fn check_single<M: Model>(
 /// timeout).  This lets `to_check_result` give `Illegal` priority over `Unknown`,
 /// matching Go's `checkParallel` semantics.
 fn check_parallel<M>(
-    model:               &M,
-    partitions:          Vec<Vec<Entry<M::Input, M::Output>>>,
-    kill:                Arc<AtomicBool>,
-    definitive_illegal:  &AtomicBool,
+    model: &M,
+    partitions: Vec<Vec<Entry<M::Input, M::Output>>>,
+    kill: Arc<AtomicBool>,
+    definitive_illegal: &AtomicBool,
 ) -> bool
 where
     M: Model + Sync,
-    M::Input:  Send,
+    M::Input: Send,
     M::Output: Send,
 {
     if partitions.is_empty() {
@@ -393,19 +426,48 @@ where
 // Timeout infrastructure
 // ---------------------------------------------------------------------------
 
+/// Handle returned by [`spawn_timer`].
+///
+/// Holds both the read-side flag (`timed_out`, written by the timer thread and
+/// read by [`to_check_result`]) and the write-side cancel signal (written by
+/// the checker after `check_parallel` returns, read by the timer thread).
+struct TimerHandle {
+    timed_out: Arc<AtomicBool>,
+    cancel: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl TimerHandle {
+    /// Wake the timer thread immediately so it exits without sleeping the full
+    /// duration.  Safe to call more than once (subsequent calls are no-ops).
+    fn cancel(&self) {
+        let (lock, cvar) = &*self.cancel;
+        *lock.lock().unwrap() = true;
+        cvar.notify_one();
+    }
+}
+
 /// Spawns a background timer thread that sets `kill` (and `timed_out`) after
-/// `duration`.  The JoinHandle is intentionally dropped — the thread detaches
-/// and exits naturally after sleeping, whether or not the check finishes first.
-fn spawn_timer(kill: &Arc<AtomicBool>, duration: Duration) -> Arc<AtomicBool> {
+/// `duration`, unless [`TimerHandle::cancel`] is called first.
+///
+/// This lets the timer thread exit as soon as the check finishes, avoiding
+/// thread accumulation in test suites that use short histories with long
+/// timeouts.
+fn spawn_timer(kill: &Arc<AtomicBool>, duration: Duration) -> TimerHandle {
     let timed_out = Arc::new(AtomicBool::new(false));
-    let kill_clone     = Arc::clone(kill);
+    let cancel = Arc::new((Mutex::new(false), Condvar::new()));
+    let kill_clone = Arc::clone(kill);
     let timed_out_clone = Arc::clone(&timed_out);
+    let cancel_clone = Arc::clone(&cancel);
     std::thread::spawn(move || {
-        std::thread::sleep(duration);
-        timed_out_clone.store(true, Ordering::Relaxed);
-        kill_clone.store(true, Ordering::Relaxed);
+        let (lock, cvar) = &*cancel_clone;
+        let guard = lock.lock().unwrap();
+        let (cancelled, _) = cvar.wait_timeout(guard, duration).unwrap();
+        if !*cancelled {
+            timed_out_clone.store(true, Ordering::Relaxed);
+            kill_clone.store(true, Ordering::Relaxed);
+        }
     });
-    timed_out
+    TimerHandle { timed_out, cancel }
 }
 
 /// Translate `(ok, timed_out, definitive_illegal)` into a [`CheckResult`].
@@ -414,7 +476,11 @@ fn spawn_timer(kill: &Arc<AtomicBool>, duration: Duration) -> Arc<AtomicBool> {
 ///  1. If any partition definitively proved non-linearizability → `Illegal`.
 ///  2. If the timer fired and no definitive answer was found   → `Unknown`.
 ///  3. Otherwise the DFS completed and all partitions were ok  → `Ok`.
-fn to_check_result(ok: bool, timed_out: &AtomicBool, definitive_illegal: &AtomicBool) -> CheckResult {
+fn to_check_result(
+    ok: bool,
+    timed_out: &AtomicBool,
+    definitive_illegal: &AtomicBool,
+) -> CheckResult {
     if !ok && definitive_illegal.load(Ordering::Relaxed) {
         CheckResult::Illegal
     } else if timed_out.load(Ordering::Relaxed) {
@@ -440,13 +506,13 @@ fn to_check_result(ok: bool, timed_out: &AtomicBool, definitive_illegal: &Atomic
 /// Partitions returned by [`Model::partition`] are checked concurrently on the
 /// rayon thread pool, matching Go's goroutine-per-partition behaviour.
 pub fn check_operations<M>(
-    model:   &M,
+    model: &M,
     history: &[Operation<M::Input, M::Output>],
     timeout: Option<Duration>,
 ) -> CheckResult
 where
     M: Model + Sync,
-    M::Input:  Send,
+    M::Input: Send,
     M::Output: Send,
 {
     // INV-HIST-01
@@ -456,20 +522,30 @@ where
         if let Some(parts) = model.partition(history) {
             // INV-LIN-03
             assert_partition_independent!(parts);
-            parts.iter()
-                .map(|indices| make_entries(&indices.iter().map(|&i| history[i].clone()).collect::<Vec<_>>()))
+            parts
+                .iter()
+                .map(|indices| {
+                    make_entries(
+                        &indices
+                            .iter()
+                            .map(|&i| history[i].clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
                 .collect()
         } else {
             vec![make_entries(history)]
         };
 
     let kill = Arc::new(AtomicBool::new(false));
-    let timed_out = timeout
-        .map(|d| spawn_timer(&kill, d))
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let timer = timeout.map(|d| spawn_timer(&kill, d));
     let definitive_illegal = AtomicBool::new(false);
 
     let ok = check_parallel(model, partitions, kill, &definitive_illegal);
+    if let Some(t) = &timer {
+        t.cancel();
+    }
+    let timed_out = timer.map_or_else(|| Arc::new(AtomicBool::new(false)), |t| t.timed_out);
     to_check_result(ok, &timed_out, &definitive_illegal)
 }
 
@@ -480,13 +556,13 @@ where
 /// Partitions returned by [`Model::partition_events`] are checked concurrently
 /// on the rayon thread pool.
 pub fn check_events<M>(
-    model:   &M,
+    model: &M,
     history: &[Event<M::Input, M::Output>],
     timeout: Option<Duration>,
 ) -> CheckResult
 where
     M: Model + Sync,
-    M::Input:  Send,
+    M::Input: Send,
     M::Output: Send,
 {
     // INV-HIST-01 (event form): every id has exactly one Call and one Return,
@@ -496,9 +572,11 @@ where
     let partitions: Vec<Vec<Entry<M::Input, M::Output>>> =
         if let Some(parts) = model.partition_events(history) {
             assert_partition_independent!(parts);
-            parts.iter()
+            parts
+                .iter()
                 .map(|indices| {
-                    let sub: Vec<Event<M::Input, M::Output>> = indices.iter().map(|&i| history[i].clone()).collect();
+                    let sub: Vec<Event<M::Input, M::Output>> =
+                        indices.iter().map(|&i| history[i].clone()).collect();
                     convert_entries(&renumber(&sub))
                 })
                 .collect()
@@ -507,12 +585,14 @@ where
         };
 
     let kill = Arc::new(AtomicBool::new(false));
-    let timed_out = timeout
-        .map(|d| spawn_timer(&kill, d))
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let timer = timeout.map(|d| spawn_timer(&kill, d));
     let definitive_illegal = AtomicBool::new(false);
 
     let ok = check_parallel(model, partitions, kill, &definitive_illegal);
+    if let Some(t) = &timer {
+        t.cancel();
+    }
+    let timed_out = timer.map_or_else(|| Arc::new(AtomicBool::new(false)), |t| t.timed_out);
     to_check_result(ok, &timed_out, &definitive_illegal)
 }
 
@@ -544,15 +624,17 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     struct RegInput {
         is_write: bool,
-        value:    i32,
+        value: i32,
     }
 
     impl Model for Reg {
-        type State  = i32;
-        type Input  = RegInput;
+        type State = i32;
+        type Input = RegInput;
         type Output = i32;
 
-        fn init(&self) -> i32 { 0 }
+        fn init(&self) -> i32 {
+            0
+        }
 
         fn step(&self, state: &i32, input: &RegInput, output: &i32) -> Option<i32> {
             if input.is_write {
@@ -569,20 +651,46 @@ mod tests {
     // Helper constructors
     // -----------------------------------------------------------------------
 
-    fn write(v: i32) -> RegInput { RegInput { is_write: true,  value: v } }
-    fn read()        -> RegInput { RegInput { is_write: false, value: 0 } }
+    fn write(v: i32) -> RegInput {
+        RegInput {
+            is_write: true,
+            value: v,
+        }
+    }
+    fn read() -> RegInput {
+        RegInput {
+            is_write: false,
+            value: 0,
+        }
+    }
 
-    fn op(id: u64, input: RegInput, output: i32, call: u64, ret: u64)
-        -> Operation<RegInput, i32>
-    {
-        Operation { client_id: id, input, output, call, return_time: ret }
+    fn op(id: u64, input: RegInput, output: i32, call: u64, ret: u64) -> Operation<RegInput, i32> {
+        Operation {
+            client_id: id,
+            input,
+            output,
+            call,
+            return_time: ret,
+        }
     }
 
     fn call_ev(id: u64, input: RegInput) -> Event<RegInput, i32> {
-        Event { client_id: id, kind: EventKind::Call, input: Some(input), output: None, id }
+        Event {
+            client_id: id,
+            kind: EventKind::Call,
+            input: Some(input),
+            output: None,
+            id,
+        }
     }
     fn ret_ev(id: u64, output: i32) -> Event<RegInput, i32> {
-        Event { client_id: id, kind: EventKind::Return, input: None, output: Some(output), id }
+        Event {
+            client_id: id,
+            kind: EventKind::Return,
+            input: None,
+            output: Some(output),
+            id,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -612,21 +720,27 @@ mod tests {
         // Instantaneous op (call == return_time). INV-HIST-02 tie-breaking:
         // Call must sort before Return at equal timestamps.
         let entries = make_entries(&[op(0, write(1), 0, 10, 10)]);
-        assert!(matches!(entries[0].value, EntryValue::Call(_)),
-            "Call must precede Return when timestamps are equal");
+        assert!(
+            matches!(entries[0].value, EntryValue::Call(_)),
+            "Call must precede Return when timestamps are equal"
+        );
     }
 
     #[test]
     fn make_entries_time_sorted_across_two_ops() {
         // op A: call=5, ret=15   op B: call=0, ret=10
         // Expected order: CallB(0), CallA(5), RetB(10), RetA(15)
-        let entries = make_entries(&[
-            op(0, write(1), 0, 5, 15),
-            op(1, write(2), 0, 0, 10),
-        ]);
+        let entries = make_entries(&[op(0, write(1), 0, 5, 15), op(1, write(2), 0, 0, 10)]);
         assert_eq!(entries.len(), 4);
-        assert_eq!([entries[0].time, entries[1].time, entries[2].time, entries[3].time],
-                   [0, 5, 10, 15]);
+        assert_eq!(
+            [
+                entries[0].time,
+                entries[1].time,
+                entries[2].time,
+                entries[3].time
+            ],
+            [0, 5, 10, 15]
+        );
         assert!(matches!(entries[0].value, EntryValue::Call(_)));
         assert!(matches!(entries[1].value, EntryValue::Call(_)));
         assert!(matches!(entries[2].value, EntryValue::Return(_)));
@@ -639,7 +753,7 @@ mod tests {
         // negative values and inverting the sort order.
         let t = u64::MAX - 10;
         let entries = make_entries(&[
-            op(0, write(1), 0, t,     t + 5),
+            op(0, write(1), 0, t, t + 5),
             op(1, write(2), 0, t + 1, t + 6),
         ]);
         // Expected: CallA(t), CallB(t+1), RetA(t+5), RetB(t+6)
@@ -663,8 +777,10 @@ mod tests {
     #[test]
     fn renumber_contiguous_ids_are_unchanged() {
         let events = vec![
-            call_ev(0, write(1)), ret_ev(0, 0),
-            call_ev(1, read()),   ret_ev(1, 0),
+            call_ev(0, write(1)),
+            ret_ev(0, 0),
+            call_ev(1, read()),
+            ret_ev(1, 0),
         ];
         let out = renumber(&events);
         assert_eq!([out[0].id, out[1].id, out[2].id, out[3].id], [0, 0, 1, 1]);
@@ -673,10 +789,34 @@ mod tests {
     #[test]
     fn renumber_noncontiguous_ids_become_0_based() {
         let events = vec![
-            Event { client_id: 0, kind: EventKind::Call,   input: Some(write(5)), output: None,    id: 100 },
-            Event { client_id: 0, kind: EventKind::Return, input: None,           output: Some(0), id: 100 },
-            Event { client_id: 1, kind: EventKind::Call,   input: Some(read()),   output: None,    id: 999 },
-            Event { client_id: 1, kind: EventKind::Return, input: None,           output: Some(5), id: 999 },
+            Event {
+                client_id: 0,
+                kind: EventKind::Call,
+                input: Some(write(5)),
+                output: None,
+                id: 100,
+            },
+            Event {
+                client_id: 0,
+                kind: EventKind::Return,
+                input: None,
+                output: Some(0),
+                id: 100,
+            },
+            Event {
+                client_id: 1,
+                kind: EventKind::Call,
+                input: Some(read()),
+                output: None,
+                id: 999,
+            },
+            Event {
+                client_id: 1,
+                kind: EventKind::Return,
+                input: None,
+                output: Some(5),
+                id: 999,
+            },
         ];
         let out = renumber(&events);
         // Call and Return for the same op share their new id.
@@ -727,10 +867,7 @@ mod tests {
     fn arena_lift_and_unlift_restores_two_op_list() {
         // op A: [0,15]  op B: [5,10]  (A wraps B)
         // Sorted entries: 1=callA, 2=callB, 3=retB, 4=retA  match: 1↔4, 2↔3
-        let entries = make_entries(&[
-            op(0, write(1), 0, 0, 15),
-            op(1, write(2), 0, 5, 10),
-        ]);
+        let entries = make_entries(&[op(0, write(1), 0, 0, 15), op(1, write(2), 0, 5, 10)]);
         let mut arena = NodeArena::from_entries(entries);
 
         arena.lift(1); // remove nodes 1 and 4 → list: 0 → 2 → 3
@@ -752,9 +889,9 @@ mod tests {
         // Sorted: callA(1), callB(2), retB(3), callC(4), retA(5), retC(6)
         //         match: 1↔5, 2↔3, 4↔6
         let entries = make_entries(&[
-            op(0, write(1), 0,  0, 30),
-            op(1, write(2), 0,  5, 20),
-            op(2, read(),   1, 25, 35),
+            op(0, write(1), 0, 0, 30),
+            op(1, write(2), 0, 5, 20),
+            op(2, read(), 1, 25, 35),
         ]);
         let mut arena = NodeArena::from_entries(entries);
 
@@ -787,18 +924,27 @@ mod tests {
 
     #[test]
     fn ops_single_write_is_ok() {
-        assert_eq!(check_operations(&Reg, &[op(0, write(42), 0, 0, 10)], None), CheckResult::Ok);
+        assert_eq!(
+            check_operations(&Reg, &[op(0, write(42), 0, 0, 10)], None),
+            CheckResult::Ok
+        );
     }
 
     #[test]
     fn ops_single_read_returning_init_value_is_ok() {
-        assert_eq!(check_operations(&Reg, &[op(0, read(), 0, 0, 10)], None), CheckResult::Ok);
+        assert_eq!(
+            check_operations(&Reg, &[op(0, read(), 0, 0, 10)], None),
+            CheckResult::Ok
+        );
     }
 
     #[test]
     fn ops_single_read_returning_wrong_value_is_illegal() {
         // Init state = 0; no write has occurred; read returning 42 is illegal.
-        assert_eq!(check_operations(&Reg, &[op(0, read(), 42, 0, 10)], None), CheckResult::Illegal);
+        assert_eq!(
+            check_operations(&Reg, &[op(0, read(), 42, 0, 10)], None),
+            CheckResult::Illegal
+        );
     }
 
     #[test]
@@ -839,15 +985,18 @@ mod tests {
     #[test]
     fn ops_instantaneous_op_is_ok() {
         // call == return_time: well-formedness guard allows call ≤ return_time.
-        assert_eq!(check_operations(&Reg, &[op(0, write(7), 0, 5, 5)], None), CheckResult::Ok);
+        assert_eq!(
+            check_operations(&Reg, &[op(0, write(7), 0, 5, 5)], None),
+            CheckResult::Ok
+        );
     }
 
     #[test]
     fn ops_multiple_reads_all_return_init_before_any_write_is_ok() {
         let history = [
             op(0, read(), 0, 0, 10),
-            op(1, read(), 0, 2,  8),
-            op(2, read(), 0, 4,  6),
+            op(1, read(), 0, 2, 8),
+            op(2, read(), 0, 4, 6),
         ];
         assert_eq!(check_operations(&Reg, &history, None), CheckResult::Ok);
     }
@@ -856,9 +1005,9 @@ mod tests {
     fn ops_two_sequential_writes_then_wrong_read_is_illegal() {
         // write(1), write(2), read→1: last write was 2 so read must return 2.
         let history = [
-            op(0, write(1), 0,  0, 10),
+            op(0, write(1), 0, 0, 10),
             op(1, write(2), 0, 11, 20),
-            op(2, read(),   1, 21, 30),
+            op(2, read(), 1, 21, 30),
         ];
         assert_eq!(check_operations(&Reg, &history, None), CheckResult::Illegal);
     }
@@ -868,9 +1017,9 @@ mod tests {
         // Two identical writes reach the same (bitset, state) from two DFS paths.
         // The cache must not prune a valid unexplored path (INV-LIN-04).
         let history = [
-            op(0, write(1), 0,  0, 20),
-            op(1, write(1), 0,  5, 15),
-            op(2, read(),   1, 25, 35),
+            op(0, write(1), 0, 0, 20),
+            op(1, write(1), 0, 5, 15),
+            op(2, read(), 1, 25, 35),
         ];
         assert_eq!(check_operations(&Reg, &history, None), CheckResult::Ok);
     }
@@ -882,9 +1031,9 @@ mod tests {
         // Backtracks; tries B(write 2)→A(write 1)→C(read→1, state=1 ✓).
         // Exercises full backtrack and unlift symmetry for two operations.
         let history = [
-            op(0, write(1), 0,  0, 30),
-            op(1, write(2), 0,  5, 20),
-            op(2, read(),   1, 25, 35),
+            op(0, write(1), 0, 0, 30),
+            op(1, write(2), 0, 5, 20),
+            op(2, read(), 1, 25, 35),
         ];
         assert_eq!(check_operations(&Reg, &history, None), CheckResult::Ok);
     }
@@ -921,8 +1070,10 @@ mod tests {
     fn events_sequential_write_then_correct_read_is_ok() {
         // Slice order = time: t=0 call_write, t=1 ret_write, t=2 call_read, t=3 ret_read→5.
         let events = [
-            call_ev(0, write(5)), ret_ev(0, 0),
-            call_ev(1, read()),   ret_ev(1, 5),
+            call_ev(0, write(5)),
+            ret_ev(0, 0),
+            call_ev(1, read()),
+            ret_ev(1, 5),
         ];
         assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
     }
@@ -930,8 +1081,10 @@ mod tests {
     #[test]
     fn events_sequential_read_after_write_returning_stale_value_is_illegal() {
         let events = [
-            call_ev(0, write(5)), ret_ev(0, 0),
-            call_ev(1, read()),   ret_ev(1, 0), // should be 5
+            call_ev(0, write(5)),
+            ret_ev(0, 0),
+            call_ev(1, read()),
+            ret_ev(1, 0), // should be 5
         ];
         assert_eq!(check_events(&Reg, &events, None), CheckResult::Illegal);
     }
@@ -941,8 +1094,10 @@ mod tests {
         // Interleaved: call_w, call_r, ret_r→1, ret_w.
         // Valid linearization: write(1) then read→1. ✓
         let events = [
-            call_ev(0, write(1)), call_ev(1, read()),
-            ret_ev(1, 1),         ret_ev(0, 0),
+            call_ev(0, write(1)),
+            call_ev(1, read()),
+            ret_ev(1, 1),
+            ret_ev(0, 0),
         ];
         assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
     }
@@ -952,8 +1107,10 @@ mod tests {
         // Interleaved: call_w, call_r, ret_r→0, ret_w.
         // Valid linearization: read→0 then write(1). ✓
         let events = [
-            call_ev(0, write(1)), call_ev(1, read()),
-            ret_ev(1, 0),         ret_ev(0, 0),
+            call_ev(0, write(1)),
+            call_ev(1, read()),
+            ret_ev(1, 0),
+            ret_ev(0, 0),
         ];
         assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
     }
@@ -963,8 +1120,10 @@ mod tests {
         // write(1) fully completes before read starts.
         // read returning 0 after write(1) has no valid linearization.
         let events = [
-            call_ev(0, write(1)), ret_ev(0, 0),
-            call_ev(1, read()),   ret_ev(1, 0),
+            call_ev(0, write(1)),
+            ret_ev(0, 0),
+            call_ev(1, read()),
+            ret_ev(1, 0),
         ];
         assert_eq!(check_events(&Reg, &events, None), CheckResult::Illegal);
     }
@@ -974,16 +1133,42 @@ mod tests {
         // IDs 100 and 999 represent the same logical sequential history as 0 and 1.
         // renumber() must normalize both to the same DFS problem.
         let contiguous = [
-            call_ev(0, write(5)), ret_ev(0, 0),
-            call_ev(1, read()),   ret_ev(1, 5),
+            call_ev(0, write(5)),
+            ret_ev(0, 0),
+            call_ev(1, read()),
+            ret_ev(1, 5),
         ];
         let noncontiguous = [
-            Event { client_id: 0, kind: EventKind::Call,   input: Some(write(5)), output: None,    id: 100 },
-            Event { client_id: 0, kind: EventKind::Return, input: None,           output: Some(0), id: 100 },
-            Event { client_id: 1, kind: EventKind::Call,   input: Some(read()),   output: None,    id: 999 },
-            Event { client_id: 1, kind: EventKind::Return, input: None,           output: Some(5), id: 999 },
+            Event {
+                client_id: 0,
+                kind: EventKind::Call,
+                input: Some(write(5)),
+                output: None,
+                id: 100,
+            },
+            Event {
+                client_id: 0,
+                kind: EventKind::Return,
+                input: None,
+                output: Some(0),
+                id: 100,
+            },
+            Event {
+                client_id: 1,
+                kind: EventKind::Call,
+                input: Some(read()),
+                output: None,
+                id: 999,
+            },
+            Event {
+                client_id: 1,
+                kind: EventKind::Return,
+                input: None,
+                output: Some(5),
+                id: 999,
+            },
         ];
-        assert_eq!(check_events(&Reg, &contiguous,    None), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &contiguous, None), CheckResult::Ok);
         assert_eq!(check_events(&Reg, &noncontiguous, None), CheckResult::Ok);
     }
 
@@ -994,11 +1179,13 @@ mod tests {
         //   ret_w(t=10), ret_r(t=15) → encoded as indices 0,1,2,3.
         let ops = [op(0, write(1), 0, 0, 10), op(1, read(), 1, 5, 15)];
         let events = [
-            call_ev(0, write(1)), call_ev(1, read()),
-            ret_ev(0, 0),         ret_ev(1, 1),
+            call_ev(0, write(1)),
+            call_ev(1, read()),
+            ret_ev(0, 0),
+            ret_ev(1, 1),
         ];
-        assert_eq!(check_operations(&Reg, &ops,    None), CheckResult::Ok);
-        assert_eq!(check_events(&Reg, &events,     None), CheckResult::Ok);
+        assert_eq!(check_operations(&Reg, &ops, None), CheckResult::Ok);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Ok);
     }
 
     #[test]
@@ -1006,11 +1193,13 @@ mod tests {
         // write(1)[0,10], read→0[12,20]: non-overlapping, stale read.
         let ops = [op(0, write(1), 0, 0, 10), op(1, read(), 0, 12, 20)];
         let events = [
-            call_ev(0, write(1)), ret_ev(0, 0),
-            call_ev(1, read()),   ret_ev(1, 0),
+            call_ev(0, write(1)),
+            ret_ev(0, 0),
+            call_ev(1, read()),
+            ret_ev(1, 0),
         ];
-        assert_eq!(check_operations(&Reg, &ops,    None), CheckResult::Illegal);
-        assert_eq!(check_events(&Reg, &events,     None), CheckResult::Illegal);
+        assert_eq!(check_operations(&Reg, &ops, None), CheckResult::Illegal);
+        assert_eq!(check_events(&Reg, &events, None), CheckResult::Illegal);
     }
 
     #[test]
@@ -1019,7 +1208,9 @@ mod tests {
         // DFS first tries w1(state=1) then w2(state=2) then r→1 (1≠2, fails).
         // Backtracks to try w2(state=2) then w1(state=1) then r→1 (1==1, ✓).
         let events = [
-            call_ev(0, write(1)), call_ev(1, write(2)), call_ev(2, read()),
+            call_ev(0, write(1)),
+            call_ev(1, write(2)),
+            call_ev(2, read()),
             ret_ev(2, 1),
             ret_ev(1, 0),
             ret_ev(0, 0),
@@ -1039,7 +1230,8 @@ mod tests {
         let result = check_operations(&Reg, &history, Some(Duration::ZERO));
         assert!(
             matches!(result, CheckResult::Ok | CheckResult::Unknown),
-            "expected Ok or Unknown for a zero-duration timeout, got {:?}", result
+            "expected Ok or Unknown for a zero-duration timeout, got {:?}",
+            result
         );
     }
 
@@ -1047,10 +1239,7 @@ mod tests {
     fn timeout_very_long_does_not_affect_result() {
         // A timeout far in the future must not influence the result at all:
         // the DFS finishes before the timer fires.
-        let history = [
-            op(0, write(1), 0, 0, 10),
-            op(1, read(),   1, 5, 15),
-        ];
+        let history = [op(0, write(1), 0, 0, 10), op(1, read(), 1, 5, 15)];
         assert_eq!(
             check_operations(&Reg, &history, Some(Duration::from_secs(60))),
             CheckResult::Ok
@@ -1080,8 +1269,10 @@ mod tests {
     #[test]
     fn timeout_events_very_long_does_not_affect_result() {
         let events = [
-            call_ev(0, write(1)), call_ev(1, read()),
-            ret_ev(1, 1),         ret_ev(0, 0),
+            call_ev(0, write(1)),
+            call_ev(1, read()),
+            ret_ev(1, 1),
+            ret_ev(0, 0),
         ];
         assert_eq!(
             check_events(&Reg, &events, Some(Duration::from_secs(60))),
@@ -1115,19 +1306,26 @@ mod tests {
 
         #[derive(Clone, Debug, PartialEq)]
         struct KvInput {
-            key:      u8,
+            key: u8,
             is_write: bool,
-            value:    i32,
+            value: i32,
         }
 
         impl Model for KvModel {
-            type State  = HashMap<u8, i32>;
-            type Input  = KvInput;
+            type State = HashMap<u8, i32>;
+            type Input = KvInput;
             type Output = i32;
 
-            fn init(&self) -> Self::State { HashMap::new() }
+            fn init(&self) -> Self::State {
+                HashMap::new()
+            }
 
-            fn step(&self, state: &Self::State, input: &KvInput, output: &i32) -> Option<Self::State> {
+            fn step(
+                &self,
+                state: &Self::State,
+                input: &KvInput,
+                output: &i32,
+            ) -> Option<Self::State> {
                 let mut next = state.clone();
                 if input.is_write {
                     next.insert(input.key, input.value);
@@ -1147,13 +1345,35 @@ mod tests {
             }
         }
 
-        fn kv_write(key: u8, value: i32) -> KvInput { KvInput { key, is_write: true,  value } }
-        fn kv_read(key: u8)              -> KvInput { KvInput { key, is_write: false, value: 0 } }
+        fn kv_write(key: u8, value: i32) -> KvInput {
+            KvInput {
+                key,
+                is_write: true,
+                value,
+            }
+        }
+        fn kv_read(key: u8) -> KvInput {
+            KvInput {
+                key,
+                is_write: false,
+                value: 0,
+            }
+        }
 
-        fn kv_op(id: u64, input: KvInput, output: i32, call: u64, ret: u64)
-            -> Operation<KvInput, i32>
-        {
-            Operation { client_id: id, input, output, call, return_time: ret }
+        fn kv_op(
+            id: u64,
+            input: KvInput,
+            output: i32,
+            call: u64,
+            ret: u64,
+        ) -> Operation<KvInput, i32> {
+            Operation {
+                client_id: id,
+                input,
+                output,
+                call,
+                return_time: ret,
+            }
         }
 
         #[test]
@@ -1161,10 +1381,10 @@ mod tests {
             // Two independent keys, each with a sequential write-then-read.
             // partition() splits into 2 groups checked concurrently by rayon.
             let history = [
-                kv_op(0, kv_write(0, 1), 0,  0, 10),
-                kv_op(1, kv_read(0),     1, 11, 20),
-                kv_op(2, kv_write(1, 5), 0,  0, 10),
-                kv_op(3, kv_read(1),     5, 11, 20),
+                kv_op(0, kv_write(0, 1), 0, 0, 10),
+                kv_op(1, kv_read(0), 1, 11, 20),
+                kv_op(2, kv_write(1, 5), 0, 0, 10),
+                kv_op(3, kv_read(1), 5, 11, 20),
             ];
             assert_eq!(check_operations(&KvModel, &history, None), CheckResult::Ok);
         }
@@ -1175,24 +1395,27 @@ mod tests {
             // Key 1: write(5) then read→5 (ok).
             // One illegal partition must propagate Illegal for the whole check.
             let history = [
-                kv_op(0, kv_write(0, 1), 0,  0, 10),
-                kv_op(1, kv_read(0),     0, 11, 20), // stale; should be 1
-                kv_op(2, kv_write(1, 5), 0,  0, 10),
-                kv_op(3, kv_read(1),     5, 11, 20),
+                kv_op(0, kv_write(0, 1), 0, 0, 10),
+                kv_op(1, kv_read(0), 0, 11, 20), // stale; should be 1
+                kv_op(2, kv_write(1, 5), 0, 0, 10),
+                kv_op(3, kv_read(1), 5, 11, 20),
             ];
-            assert_eq!(check_operations(&KvModel, &history, None), CheckResult::Illegal);
+            assert_eq!(
+                check_operations(&KvModel, &history, None),
+                CheckResult::Illegal
+            );
         }
 
         #[test]
         fn three_partitions_all_ok() {
             // Three independent keys; exercises rayon dispatch across 3 partitions.
             let history = [
-                kv_op(0, kv_write(0, 1), 0,  0, 10),
-                kv_op(1, kv_read(0),     1, 11, 20),
-                kv_op(2, kv_write(1, 2), 0,  0, 10),
-                kv_op(3, kv_read(1),     2, 11, 20),
-                kv_op(4, kv_write(2, 3), 0,  0, 10),
-                kv_op(5, kv_read(2),     3, 11, 20),
+                kv_op(0, kv_write(0, 1), 0, 0, 10),
+                kv_op(1, kv_read(0), 1, 11, 20),
+                kv_op(2, kv_write(1, 2), 0, 0, 10),
+                kv_op(3, kv_read(1), 2, 11, 20),
+                kv_op(4, kv_write(2, 3), 0, 0, 10),
+                kv_op(5, kv_read(2), 3, 11, 20),
             ];
             assert_eq!(check_operations(&KvModel, &history, None), CheckResult::Ok);
         }
@@ -1221,19 +1444,26 @@ mod tests {
 
         #[derive(Clone, Debug, PartialEq)]
         struct KvInput {
-            key:      u8,
+            key: u8,
             is_write: bool,
-            value:    i32,
+            value: i32,
         }
 
         impl Model for KvModel {
-            type State  = HashMap<u8, i32>;
-            type Input  = KvInput;
+            type State = HashMap<u8, i32>;
+            type Input = KvInput;
             type Output = i32;
 
-            fn init(&self) -> Self::State { HashMap::new() }
+            fn init(&self) -> Self::State {
+                HashMap::new()
+            }
 
-            fn step(&self, state: &Self::State, input: &KvInput, output: &i32) -> Option<Self::State> {
+            fn step(
+                &self,
+                state: &Self::State,
+                input: &KvInput,
+                output: &i32,
+            ) -> Option<Self::State> {
                 let mut next = state.clone();
                 if input.is_write {
                     next.insert(input.key, input.value);
@@ -1264,11 +1494,26 @@ mod tests {
         }
 
         fn kv_call(id: u64, key: u8, is_write: bool, value: i32) -> Event<KvInput, i32> {
-            Event { client_id: id, kind: EventKind::Call,
-                    input: Some(KvInput { key, is_write, value }), output: None, id }
+            Event {
+                client_id: id,
+                kind: EventKind::Call,
+                input: Some(KvInput {
+                    key,
+                    is_write,
+                    value,
+                }),
+                output: None,
+                id,
+            }
         }
         fn kv_ret(id: u64, output: i32) -> Event<KvInput, i32> {
-            Event { client_id: id, kind: EventKind::Return, input: None, output: Some(output), id }
+            Event {
+                client_id: id,
+                kind: EventKind::Return,
+                input: None,
+                output: Some(output),
+                id,
+            }
         }
 
         #[test]
@@ -1276,10 +1521,14 @@ mod tests {
             // Two independent sequential sub-histories, one per key.
             // partition_events must split them into 2 groups; both are Ok.
             let history = [
-                kv_call(0, 0, true,  1), kv_ret(0, 0), // key 0: write(1)
-                kv_call(1, 0, false, 0), kv_ret(1, 1), // key 0: read→1
-                kv_call(2, 1, true,  5), kv_ret(2, 0), // key 1: write(5)
-                kv_call(3, 1, false, 0), kv_ret(3, 5), // key 1: read→5
+                kv_call(0, 0, true, 1),
+                kv_ret(0, 0), // key 0: write(1)
+                kv_call(1, 0, false, 0),
+                kv_ret(1, 1), // key 0: read→1
+                kv_call(2, 1, true, 5),
+                kv_ret(2, 0), // key 1: write(5)
+                kv_call(3, 1, false, 0),
+                kv_ret(3, 5), // key 1: read→5
             ];
             assert_eq!(check_events(&KvModel, &history, None), CheckResult::Ok);
         }
@@ -1290,10 +1539,14 @@ mod tests {
             // key 1: write(5) then read→5 (ok)
             // The illegal partition must propagate Illegal for the whole check.
             let history = [
-                kv_call(0, 0, true,  1), kv_ret(0, 0),
-                kv_call(1, 0, false, 0), kv_ret(1, 0), // stale read; should be 1
-                kv_call(2, 1, true,  5), kv_ret(2, 0),
-                kv_call(3, 1, false, 0), kv_ret(3, 5),
+                kv_call(0, 0, true, 1),
+                kv_ret(0, 0),
+                kv_call(1, 0, false, 0),
+                kv_ret(1, 0), // stale read; should be 1
+                kv_call(2, 1, true, 5),
+                kv_ret(2, 0),
+                kv_call(3, 1, false, 0),
+                kv_ret(3, 5),
             ];
             assert_eq!(check_events(&KvModel, &history, None), CheckResult::Illegal);
         }
@@ -1303,10 +1556,10 @@ mod tests {
             // Two writes on different keys overlap in time (interleaved events).
             // Each key's sub-history is independently linearizable.
             let history = [
-                kv_call(0, 0, true, 1),  // key 0 call
-                kv_call(1, 1, true, 5),  // key 1 call (concurrent)
-                kv_ret(0, 0),            // key 0 return
-                kv_ret(1, 0),            // key 1 return
+                kv_call(0, 0, true, 1), // key 0 call
+                kv_call(1, 1, true, 5), // key 1 call (concurrent)
+                kv_ret(0, 0),           // key 0 return
+                kv_ret(1, 0),           // key 1 return
             ];
             assert_eq!(check_events(&KvModel, &history, None), CheckResult::Ok);
         }
@@ -1330,18 +1583,20 @@ mod tests {
     mod timeout_unknown_tests {
         use super::*;
 
-        const STEP_MS:  u64 = 50;
+        const STEP_MS: u64 = 50;
         const TIMER_MS: u64 = 2;
 
         #[derive(Clone)]
         struct SlowModel;
 
         impl Model for SlowModel {
-            type State  = ();
-            type Input  = ();
+            type State = ();
+            type Input = ();
             type Output = ();
 
-            fn init(&self) -> () { () }
+            fn init(&self) -> () {
+                ()
+            }
 
             fn step(&self, _state: &(), _input: &(), _output: &()) -> Option<()> {
                 std::thread::sleep(Duration::from_millis(STEP_MS));
@@ -1350,7 +1605,13 @@ mod tests {
         }
 
         fn slow_op(id: u64) -> Operation<(), ()> {
-            Operation { client_id: id, input: (), output: (), call: id, return_time: id + 1 }
+            Operation {
+                client_id: id,
+                input: (),
+                output: (),
+                call: id,
+                return_time: id + 1,
+            }
         }
 
         #[test]
@@ -1368,12 +1629,80 @@ mod tests {
         fn timeout_short_duration_events_returns_unknown() {
             // Same guarantee via check_events.
             let history = [
-                Event { client_id: 0, kind: EventKind::Call,   input: Some(()), output: None,    id: 0 },
-                Event { client_id: 0, kind: EventKind::Return, input: None,     output: Some(()), id: 0 },
+                Event {
+                    client_id: 0,
+                    kind: EventKind::Call,
+                    input: Some(()),
+                    output: None,
+                    id: 0,
+                },
+                Event {
+                    client_id: 0,
+                    kind: EventKind::Return,
+                    input: None,
+                    output: Some(()),
+                    id: 0,
+                },
             ];
             assert_eq!(
                 check_events(&SlowModel, &history, Some(Duration::from_millis(TIMER_MS))),
                 CheckResult::Unknown
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // to_check_result — all four (ok, timed_out, definitive_illegal) cases
+    //
+    // These tests pin the priority contract that was fixed in the CoPilot
+    // review: Illegal must take priority over Unknown when a partition
+    // completed its full DFS and proved non-linearizability, even if the
+    // timer also fired.
+    // -----------------------------------------------------------------------
+
+    mod to_check_result_tests {
+        use super::*;
+
+        #[test]
+        fn illegal_takes_priority_over_unknown() {
+            // Core guarantee of the fix: a definitive Illegal beats a timeout.
+            let timed_out = AtomicBool::new(true);
+            let definitive_illegal = AtomicBool::new(true);
+            assert_eq!(
+                to_check_result(false, &timed_out, &definitive_illegal),
+                CheckResult::Illegal,
+            );
+        }
+
+        #[test]
+        fn unknown_when_only_timer_fired() {
+            // Timer fired but no partition finished its full DFS.
+            let timed_out = AtomicBool::new(true);
+            let definitive_illegal = AtomicBool::new(false);
+            assert_eq!(
+                to_check_result(false, &timed_out, &definitive_illegal),
+                CheckResult::Unknown,
+            );
+        }
+
+        #[test]
+        fn ok_when_dfs_completed_cleanly() {
+            let timed_out = AtomicBool::new(false);
+            let definitive_illegal = AtomicBool::new(false);
+            assert_eq!(
+                to_check_result(true, &timed_out, &definitive_illegal),
+                CheckResult::Ok,
+            );
+        }
+
+        #[test]
+        fn illegal_when_dfs_finished_no_timeout() {
+            // !ok, no timer, no concurrent kill — straightforward Illegal.
+            let timed_out = AtomicBool::new(false);
+            let definitive_illegal = AtomicBool::new(false);
+            assert_eq!(
+                to_check_result(false, &timed_out, &definitive_illegal),
+                CheckResult::Illegal,
             );
         }
     }

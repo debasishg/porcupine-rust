@@ -1,3 +1,4 @@
+use porcupine::{CheckResult, Event, EventKind, Model, Operation};
 /// Property-based tests for porcupine linearizability checker.
 ///
 /// Each test corresponds to one or more INV-* invariants from docs/spec.md.
@@ -5,7 +6,6 @@
 ///
 /// Run:  cargo test --test property_tests
 use proptest::prelude::*;
-use porcupine::{CheckResult, Event, EventKind, Model, Operation};
 
 // ---------------------------------------------------------------------------
 // A concrete sequential model: an integer register.
@@ -74,7 +74,10 @@ fn sequential_history(len: usize) -> Vec<Operation<RegisterInput, i64>> {
             ts = return_time + 1;
             Operation {
                 client_id: i as u64,
-                input: RegisterInput { is_write: true, value: i as i64 },
+                input: RegisterInput {
+                    is_write: true,
+                    value: i as i64,
+                },
                 call,
                 output: 0,
                 return_time,
@@ -87,7 +90,10 @@ fn sequential_history(len: usize) -> Vec<Operation<RegisterInput, i64>> {
 fn single_op_history(value: i64) -> Vec<Operation<RegisterInput, i64>> {
     vec![Operation {
         client_id: 0,
-        input: RegisterInput { is_write: true, value },
+        input: RegisterInput {
+            is_write: true,
+            value,
+        },
         call: 0,
         output: 0,
         return_time: 10,
@@ -179,7 +185,8 @@ impl Model for KvModel {
 
     fn partition(&self, history: &[Operation<KvInput, i64>]) -> Option<Vec<Vec<usize>>> {
         // Group operation indices by key.
-        let mut by_key: std::collections::HashMap<u8, Vec<usize>> = std::collections::HashMap::new();
+        let mut by_key: std::collections::HashMap<u8, Vec<usize>> =
+            std::collections::HashMap::new();
         for (i, op) in history.iter().enumerate() {
             by_key.entry(op.input.key).or_default().push(i);
         }
@@ -261,11 +268,38 @@ proptest! {
 fn illegal_register_history() -> Vec<Operation<RegisterInput, i64>> {
     vec![
         // write(1): completes at t=10
-        Operation { client_id: 0, input: RegisterInput { is_write: true,  value: 1 }, call: 0,  output: 0, return_time: 10 },
+        Operation {
+            client_id: 0,
+            input: RegisterInput {
+                is_write: true,
+                value: 1,
+            },
+            call: 0,
+            output: 0,
+            return_time: 10,
+        },
         // read→0: overlaps with write (ok to return 0 or 1)
-        Operation { client_id: 1, input: RegisterInput { is_write: false, value: 0 }, call: 5,  output: 0, return_time: 15 },
+        Operation {
+            client_id: 1,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: 5,
+            output: 0,
+            return_time: 15,
+        },
         // read→0: STARTS AFTER write finishes (t=12 > t=10) — must return 1, not 0 (illegal)
-        Operation { client_id: 2, input: RegisterInput { is_write: false, value: 0 }, call: 12, output: 0, return_time: 20 },
+        Operation {
+            client_id: 2,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: 12,
+            output: 0,
+            return_time: 20,
+        },
     ]
 }
 
@@ -274,8 +308,11 @@ fn prop_illegal_history_is_detected() {
     let history = illegal_register_history();
     let model = RegisterModel;
     let result = porcupine::checker::check_operations(&model, &history, None);
-    assert_eq!(result, CheckResult::Illegal,
-        "INV-LIN-02: a non-linearizable history must be detected as Illegal");
+    assert_eq!(
+        result,
+        CheckResult::Illegal,
+        "INV-LIN-02: a non-linearizable history must be detected as Illegal"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -431,10 +468,40 @@ fn illegal_register_history_as_events() -> Vec<Event<RegisterInput, i64>> {
     //   t=2: call read       [id=1]  ← starts AFTER write (t=2 > t=1)
     //   t=3: ret  read→0     [id=1]  ← returns 0, must be 1 — illegal
     vec![
-        Event { client_id: 0, kind: EventKind::Call,   input: Some(RegisterInput { is_write: true,  value: 1 }), output: None,    id: 0 },
-        Event { client_id: 0, kind: EventKind::Return, input: None,                                               output: Some(0), id: 0 },
-        Event { client_id: 1, kind: EventKind::Call,   input: Some(RegisterInput { is_write: false, value: 0 }), output: None,    id: 1 },
-        Event { client_id: 1, kind: EventKind::Return, input: None,                                               output: Some(0), id: 1 },
+        Event {
+            client_id: 0,
+            kind: EventKind::Call,
+            input: Some(RegisterInput {
+                is_write: true,
+                value: 1,
+            }),
+            output: None,
+            id: 0,
+        },
+        Event {
+            client_id: 0,
+            kind: EventKind::Return,
+            input: None,
+            output: Some(0),
+            id: 0,
+        },
+        Event {
+            client_id: 1,
+            kind: EventKind::Call,
+            input: Some(RegisterInput {
+                is_write: false,
+                value: 0,
+            }),
+            output: None,
+            id: 1,
+        },
+        Event {
+            client_id: 1,
+            kind: EventKind::Return,
+            input: None,
+            output: Some(0),
+            id: 1,
+        },
     ]
 }
 
@@ -442,8 +509,11 @@ fn illegal_register_history_as_events() -> Vec<Event<RegisterInput, i64>> {
 fn prop_events_illegal_history_is_detected() {
     let events = illegal_register_history_as_events();
     let result = porcupine::checker::check_events(&RegisterModel, &events, None);
-    assert_eq!(result, CheckResult::Illegal,
-        "INV-LIN-02: a non-linearizable event history must be detected as Illegal");
+    assert_eq!(
+        result,
+        CheckResult::Illegal,
+        "INV-LIN-02: a non-linearizable event history must be detected as Illegal"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +542,9 @@ proptest! {
 fn prop_events_empty_history_is_ok() {
     let events: Vec<Event<RegisterInput, i64>> = vec![];
     let result = porcupine::checker::check_events(&RegisterModel, &events, None);
-    assert_eq!(result, CheckResult::Ok,
-        "INV-LIN-01: empty event history must be linearizable");
+    assert_eq!(
+        result,
+        CheckResult::Ok,
+        "INV-LIN-01: empty event history must be linearizable"
+    );
 }
-

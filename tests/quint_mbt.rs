@@ -71,10 +71,46 @@ impl Model for RegisterModel {
 // The example history from Porcupine.qnt (must match HISTORY in the .qnt file).
 fn example_history() -> Vec<Operation<RegisterInput, i64>> {
     vec![
-        Operation { client_id: 0, input: RegisterInput { is_write: true,  value: 1 }, call: 0,  output: 0, return_time: 10 },
-        Operation { client_id: 1, input: RegisterInput { is_write: false, value: 0 }, call: 5,  output: 1, return_time: 15 },
-        Operation { client_id: 2, input: RegisterInput { is_write: true,  value: 2 }, call: 12, output: 0, return_time: 20 },
-        Operation { client_id: 3, input: RegisterInput { is_write: false, value: 0 }, call: 18, output: 2, return_time: 25 },
+        Operation {
+            client_id: 0,
+            input: RegisterInput {
+                is_write: true,
+                value: 1,
+            },
+            call: 0,
+            output: 0,
+            return_time: 10,
+        },
+        Operation {
+            client_id: 1,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: 5,
+            output: 1,
+            return_time: 15,
+        },
+        Operation {
+            client_id: 2,
+            input: RegisterInput {
+                is_write: true,
+                value: 2,
+            },
+            call: 12,
+            output: 0,
+            return_time: 20,
+        },
+        Operation {
+            client_id: 3,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: 18,
+            output: 2,
+            return_time: 25,
+        },
     ]
 }
 
@@ -84,9 +120,9 @@ fn example_history() -> Vec<Operation<RegisterInput, i64>> {
 
 fn quint_result_to_check_result(s: &str) -> CheckResult {
     match s {
-        "Ok"      => CheckResult::Ok,
+        "Ok" => CheckResult::Ok,
         "Illegal" => CheckResult::Illegal,
-        _         => CheckResult::Unknown,
+        _ => CheckResult::Unknown,
     }
 }
 
@@ -115,13 +151,11 @@ fn mbt_trace_matches_rust_checker() {
 
     assert!(status.success(), "`quint run` exited with non-zero status");
 
-    let trace_json = std::fs::read_to_string(&trace_path)
-        .expect("Failed to read ITF trace output");
-    let trace: ItfTrace = serde_json::from_str(&trace_json)
-        .expect("Failed to parse ITF trace JSON");
+    let trace_json = std::fs::read_to_string(&trace_path).expect("Failed to read ITF trace output");
+    let trace: ItfTrace =
+        serde_json::from_str(&trace_json).expect("Failed to parse ITF trace JSON");
 
-    let final_state = trace.states.last()
-        .expect("ITF trace has no states");
+    let final_state = trace.states.last().expect("ITF trace has no states");
 
     let quint_result = quint_result_to_check_result(&final_state.result);
 
@@ -157,21 +191,81 @@ fn mbt_trace_matches_rust_checker() {
 fn example_history_as_events() -> Vec<Event<RegisterInput, i64>> {
     vec![
         // t=0: call op0 write(1)
-        Event { client_id: 0, kind: EventKind::Call,   input: Some(RegisterInput { is_write: true,  value: 1 }), output: None,    id: 0 },
+        Event {
+            client_id: 0,
+            kind: EventKind::Call,
+            input: Some(RegisterInput {
+                is_write: true,
+                value: 1,
+            }),
+            output: None,
+            id: 0,
+        },
         // t=5: call op1 read
-        Event { client_id: 1, kind: EventKind::Call,   input: Some(RegisterInput { is_write: false, value: 0 }), output: None,    id: 1 },
+        Event {
+            client_id: 1,
+            kind: EventKind::Call,
+            input: Some(RegisterInput {
+                is_write: false,
+                value: 0,
+            }),
+            output: None,
+            id: 1,
+        },
         // t=10: ret op0
-        Event { client_id: 0, kind: EventKind::Return, input: None,                                               output: Some(0), id: 0 },
+        Event {
+            client_id: 0,
+            kind: EventKind::Return,
+            input: None,
+            output: Some(0),
+            id: 0,
+        },
         // t=12: call op2 write(2)
-        Event { client_id: 2, kind: EventKind::Call,   input: Some(RegisterInput { is_write: true,  value: 2 }), output: None,    id: 2 },
+        Event {
+            client_id: 2,
+            kind: EventKind::Call,
+            input: Some(RegisterInput {
+                is_write: true,
+                value: 2,
+            }),
+            output: None,
+            id: 2,
+        },
         // t=15: ret op1 → 1
-        Event { client_id: 1, kind: EventKind::Return, input: None,                                               output: Some(1), id: 1 },
+        Event {
+            client_id: 1,
+            kind: EventKind::Return,
+            input: None,
+            output: Some(1),
+            id: 1,
+        },
         // t=18: call op3 read
-        Event { client_id: 3, kind: EventKind::Call,   input: Some(RegisterInput { is_write: false, value: 0 }), output: None,    id: 3 },
+        Event {
+            client_id: 3,
+            kind: EventKind::Call,
+            input: Some(RegisterInput {
+                is_write: false,
+                value: 0,
+            }),
+            output: None,
+            id: 3,
+        },
         // t=20: ret op2
-        Event { client_id: 2, kind: EventKind::Return, input: None,                                               output: Some(0), id: 2 },
+        Event {
+            client_id: 2,
+            kind: EventKind::Return,
+            input: None,
+            output: Some(0),
+            id: 2,
+        },
         // t=25: ret op3 → 2
-        Event { client_id: 3, kind: EventKind::Return, input: None,                                               output: Some(2), id: 3 },
+        Event {
+            client_id: 3,
+            kind: EventKind::Return,
+            input: None,
+            output: Some(2),
+            id: 3,
+        },
     ]
 }
 
@@ -185,10 +279,10 @@ fn example_history_as_events() -> Vec<Event<RegisterInput, i64>> {
 #[test]
 fn mbt_check_events_agrees_with_check_operations() {
     let history = example_history();
-    let events  = example_history_as_events();
-    let model   = RegisterModel;
+    let events = example_history_as_events();
+    let model = RegisterModel;
 
-    let ops_result    = porcupine::checker::check_operations(&model, &history, None);
+    let ops_result = porcupine::checker::check_operations(&model, &history, None);
     let events_result = porcupine::checker::check_events(&model, &events, None);
 
     assert_eq!(
@@ -198,8 +292,11 @@ fn mbt_check_events_agrees_with_check_operations() {
         events_result, ops_result
     );
     // The example history is linearizable: op0, op1, op2, op3 in order.
-    assert_eq!(ops_result, CheckResult::Ok,
-        "The Quint example history must be linearizable");
+    assert_eq!(
+        ops_result,
+        CheckResult::Ok,
+        "The Quint example history must be linearizable"
+    );
 }
 
 /// Run `quint run` to generate an ITF trace, then verify that `check_events`
@@ -226,17 +323,15 @@ fn mbt_check_events_matches_quint_trace() {
 
     assert!(status.success(), "`quint run` exited with non-zero status");
 
-    let trace_json = std::fs::read_to_string(&trace_path)
-        .expect("Failed to read ITF trace output");
-    let trace: ItfTrace = serde_json::from_str(&trace_json)
-        .expect("Failed to parse ITF trace JSON");
+    let trace_json = std::fs::read_to_string(&trace_path).expect("Failed to read ITF trace output");
+    let trace: ItfTrace =
+        serde_json::from_str(&trace_json).expect("Failed to parse ITF trace JSON");
 
-    let final_state = trace.states.last()
-        .expect("ITF trace has no states");
+    let final_state = trace.states.last().expect("ITF trace has no states");
 
-    let quint_result  = quint_result_to_check_result(&final_state.result);
-    let events        = example_history_as_events();
-    let model         = RegisterModel;
+    let quint_result = quint_result_to_check_result(&final_state.result);
+    let events = example_history_as_events();
+    let model = RegisterModel;
     let events_result = porcupine::checker::check_events(&model, &events, None);
 
     assert_eq!(

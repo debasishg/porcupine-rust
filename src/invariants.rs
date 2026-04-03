@@ -137,7 +137,8 @@ macro_rules! assert_well_formed_events {
                         debug_assert!(
                             ev.input.is_some(),
                             "INV-HIST-01: Call event id={} at position {} has input=None",
-                            ev.id, pos
+                            ev.id,
+                            pos
                         );
                         debug_assert!(
                             call_pos.insert(ev.id, pos).is_none(),
@@ -149,7 +150,8 @@ macro_rules! assert_well_formed_events {
                         debug_assert!(
                             ev.output.is_some(),
                             "INV-HIST-01: Return event id={} at position {} has output=None",
-                            ev.id, pos
+                            ev.id,
+                            pos
                         );
                         debug_assert!(
                             return_pos.insert(ev.id, pos).is_none(),
@@ -171,7 +173,9 @@ macro_rules! assert_well_formed_events {
                         c_pos < r_pos,
                         "INV-HIST-01: Call event id={} at position {} must precede \
                          its Return at position {}",
-                        id, c_pos, r_pos
+                        id,
+                        c_pos,
+                        r_pos
                     ),
                 }
             }
@@ -180,7 +184,8 @@ macro_rules! assert_well_formed_events {
                 debug_assert!(
                     call_pos.contains_key(&id),
                     "INV-HIST-01: Return event id={} at position {} has no matching Call",
-                    id, r_pos
+                    id,
+                    r_pos
                 );
             }
         }
