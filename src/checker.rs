@@ -17,6 +17,7 @@
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -36,6 +37,18 @@ use crate::types::{CheckResult, Event, EventKind, Operation};
 enum EntryValue<I, O> {
     Call(I),
     Return(O),
+}
+
+impl<I, O> EntryValue<I, O> {
+    #[inline]
+    fn is_call(&self) -> bool {
+        matches!(self, Self::Call(_))
+    }
+
+    #[inline]
+    fn is_return(&self) -> bool {
+        matches!(self, Self::Return(_))
+    }
 }
 
 #[derive(Clone)]
@@ -126,14 +139,25 @@ fn convert_entries<I: Clone, O: Clone>(events: &[Event<I, O>]) -> Vec<Entry<I, O
 // `value` is `None` only for the sentinel; always `Some` for real nodes.
 struct Node<I, O> {
     value: Option<EntryValue<I, O>>,
-    match_idx: Option<usize>, // Some(ret_idx) for call nodes, None for return/sentinel
+    match_idx: Option<NodeRef>, // Some(ret_ref) for call nodes, None for return/sentinel
     id: usize,
-    prev: usize,         // index of previous node (sentinel = 0)
-    next: Option<usize>, // None at end of list
+    prev: NodeRef,              // NodeRef(0) for sentinel-owned nodes
+    next: Option<NodeRef>,      // None at end of list
 }
 
 struct NodeArena<I, O> {
     nodes: Vec<Node<I, O>>,
+}
+
+/// Typed index into a [`NodeArena`]. The sentinel HEAD is always `NodeRef(0)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NodeRef(usize);
+
+impl NodeRef {
+    #[inline]
+    fn get(self) -> usize {
+        self.0
+    }
 }
 
 impl<I, O> NodeArena<I, O> {
@@ -147,94 +171,97 @@ impl<I, O> NodeArena<I, O> {
             value: None,
             match_idx: None,
             id: usize::MAX,
-            prev: 0,
+            prev: NodeRef(0),
             next: None,
         });
 
-        // Track which node index holds the return for each operation id.
-        let mut return_idx: FxHashMap<usize, usize> = FxHashMap::default();
+        // Track which node ref holds the return for each operation id.
+        let mut return_idx: FxHashMap<usize, NodeRef> = FxHashMap::default();
 
         // Allocate a slot for each entry.
         for (i, entry) in entries.into_iter().enumerate() {
-            let node_idx = i + 1; // 1-indexed
-            if matches!(entry.value, EntryValue::Return(_)) {
-                return_idx.insert(entry.id, node_idx);
+            let node_ref = NodeRef(i + 1); // 1-indexed
+            if entry.value.is_return() {
+                return_idx.insert(entry.id, node_ref);
             }
             arena_nodes.push(Node {
                 value: Some(entry.value),
                 match_idx: None, // filled in next pass
                 id: entry.id,
-                prev: 0,
+                prev: NodeRef(0),
                 next: None,
             });
         }
 
         // Fill match_idx for call nodes.
         for node in arena_nodes.iter_mut().skip(1) {
-            if matches!(node.value, Some(EntryValue::Call(_))) {
+            if node.value.as_ref().is_some_and(|v| v.is_call()) {
                 let op_id = node.id;
-                if let Some(&ret_i) = return_idx.get(&op_id) {
-                    node.match_idx = Some(ret_i);
+                if let Some(&ret_ref) = return_idx.get(&op_id) {
+                    node.match_idx = Some(ret_ref);
                 }
             }
         }
 
         // Link nodes in order: sentinel → 1 → 2 → … → n
         for (i, node) in arena_nodes.iter_mut().enumerate().skip(1) {
-            node.prev = i - 1;
+            node.prev = NodeRef(i - 1);
             if i < n {
-                node.next = Some(i + 1);
+                node.next = Some(NodeRef(i + 1));
             }
         }
-        arena_nodes[0].next = if n > 0 { Some(1) } else { None };
+        arena_nodes[0].next = if n > 0 { Some(NodeRef(1)) } else { None };
 
         NodeArena { nodes: arena_nodes }
     }
 
     /// Index of the first live node after sentinel HEAD.
-    fn head_next(&self) -> Option<usize> {
+    #[inline]
+    fn head_next(&self) -> Option<NodeRef> {
         self.nodes[0].next
     }
 
-    /// Remove `call_idx` and its matched return node from the live list.
-    fn lift(&mut self, call_idx: usize) {
-        let match_idx = self.nodes[call_idx].match_idx.unwrap();
+    /// Remove `call_ref` and its matched return node from the live list.
+    #[inline]
+    fn lift(&mut self, call_ref: NodeRef) {
+        let match_ref = self.nodes[call_ref.get()].match_idx.unwrap();
 
         // Unlink call node.
-        let call_prev = self.nodes[call_idx].prev;
-        let call_next = self.nodes[call_idx].next;
-        self.nodes[call_prev].next = call_next;
+        let call_prev = self.nodes[call_ref.get()].prev;
+        let call_next = self.nodes[call_ref.get()].next;
+        self.nodes[call_prev.get()].next = call_next;
         if let Some(cn) = call_next {
-            self.nodes[cn].prev = call_prev;
+            self.nodes[cn.get()].prev = call_prev;
         }
 
         // Unlink return node.
-        let ret_prev = self.nodes[match_idx].prev;
-        let ret_next = self.nodes[match_idx].next;
-        self.nodes[ret_prev].next = ret_next;
+        let ret_prev = self.nodes[match_ref.get()].prev;
+        let ret_next = self.nodes[match_ref.get()].next;
+        self.nodes[ret_prev.get()].next = ret_next;
         if let Some(rn) = ret_next {
-            self.nodes[rn].prev = ret_prev;
+            self.nodes[rn.get()].prev = ret_prev;
         }
     }
 
-    /// Re-insert `call_idx` and its matched return node back into the live list.
-    fn unlift(&mut self, call_idx: usize) {
-        let match_idx = self.nodes[call_idx].match_idx.unwrap();
+    /// Re-insert `call_ref` and its matched return node back into the live list.
+    #[inline]
+    fn unlift(&mut self, call_ref: NodeRef) {
+        let match_ref = self.nodes[call_ref.get()].match_idx.unwrap();
 
         // Re-link return node.
-        let ret_prev = self.nodes[match_idx].prev;
-        let ret_next = self.nodes[match_idx].next;
-        self.nodes[ret_prev].next = Some(match_idx);
+        let ret_prev = self.nodes[match_ref.get()].prev;
+        let ret_next = self.nodes[match_ref.get()].next;
+        self.nodes[ret_prev.get()].next = Some(match_ref);
         if let Some(rn) = ret_next {
-            self.nodes[rn].prev = match_idx;
+            self.nodes[rn.get()].prev = match_ref;
         }
 
         // Re-link call node.
-        let call_prev = self.nodes[call_idx].prev;
-        let call_next = self.nodes[call_idx].next;
-        self.nodes[call_prev].next = Some(call_idx);
+        let call_prev = self.nodes[call_ref.get()].prev;
+        let call_next = self.nodes[call_ref.get()].next;
+        self.nodes[call_prev.get()].next = Some(call_ref);
         if let Some(cn) = call_next {
-            self.nodes[cn].prev = call_idx;
+            self.nodes[cn.get()].prev = call_ref;
         }
     }
 }
@@ -248,8 +275,9 @@ struct CacheEntry<S> {
     state: S,
 }
 
+#[inline]
 fn cache_contains<S: PartialEq>(
-    cache: &FxHashMap<u64, Vec<CacheEntry<S>>>,
+    cache: &FxHashMap<u64, SmallVec<[CacheEntry<S>; 2]>>,
     hash: u64,
     bitset: &Bitset,
     state: &S,
@@ -269,8 +297,8 @@ fn cache_contains<S: PartialEq>(
 // ---------------------------------------------------------------------------
 
 struct CallFrame<S> {
-    node_idx: usize, // index of the call node that was linearized
-    state: S,        // model state *before* this linearization step
+    node_ref: NodeRef, // typed reference to the call node that was linearized
+    state: S,          // model state *before* this linearization step
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +317,7 @@ fn check_single<M: Model>(
     let n_ops = entries.len() / 2; // number of operations
     let mut arena = NodeArena::from_entries(entries);
     let mut linearized = Bitset::new(n_ops);
-    let mut cache: FxHashMap<u64, Vec<CacheEntry<M::State>>> = FxHashMap::default();
+    let mut cache: FxHashMap<u64, SmallVec<[CacheEntry<M::State>; 2]>> = FxHashMap::default();
     let mut calls: Vec<CallFrame<M::State>> = Vec::new();
     let mut state = model.init();
 
@@ -306,16 +334,16 @@ fn check_single<M: Model>(
                 return true;
             }
             Some(idx) => {
-                match arena.nodes[idx].match_idx {
-                    Some(ret_idx) => {
+                match arena.nodes[idx.get()].match_idx {
+                    Some(ret_ref) => {
                         // This is a call node. Try to linearize it.
                         // INV-HIST-03: the live list is always time-sorted, and we restart
                         // from head_next() after each lift, so the first call node we visit
                         // is always the minimal one (no unlinearized op has an earlier call).
-                        let op_id = arena.nodes[idx].id;
+                        let op_id = arena.nodes[idx.get()].id;
                         let (input, output) = match (
-                            arena.nodes[idx].value.as_ref().unwrap(),
-                            arena.nodes[ret_idx].value.as_ref().unwrap(),
+                            arena.nodes[idx.get()].value.as_ref().unwrap(),
+                            arena.nodes[ret_ref.get()].value.as_ref().unwrap(),
                         ) {
                             (EntryValue::Call(i), EntryValue::Return(o)) => (i, o),
                             _ => unreachable!("match_idx must point to a Return node"),
@@ -332,12 +360,15 @@ fn check_single<M: Model>(
                                 // replace current state with next_state and clone once for
                                 // the cache entry — halves state clone count per step.
                                 let old_state = std::mem::replace(&mut state, next_state);
-                                cache.entry(h).or_default().push(CacheEntry {
-                                    linearized: new_linearized,
-                                    state: state.clone(), // state == next_state
-                                });
+                                cache
+                                    .entry(h)
+                                    .or_insert_with(SmallVec::new)
+                                    .push(CacheEntry {
+                                        linearized: new_linearized,
+                                        state: state.clone(), // state == next_state
+                                    });
                                 calls.push(CallFrame {
-                                    node_idx: idx,
+                                    node_ref: idx,
                                     state: old_state, // moved, no clone
                                 });
                                 linearized.set(op_id);
@@ -345,11 +376,11 @@ fn check_single<M: Model>(
                                 cursor = arena.head_next();
                             } else {
                                 // Already explored this (bitset, state) — skip.
-                                cursor = arena.nodes[idx].next;
+                                cursor = arena.nodes[idx.get()].next;
                             }
                         } else {
                             // Model rejected this linearization point — try next.
-                            cursor = arena.nodes[idx].next;
+                            cursor = arena.nodes[idx.get()].next;
                         }
                     }
                     None => {
@@ -359,12 +390,12 @@ fn check_single<M: Model>(
                             return false;
                         }
                         let frame = calls.pop().unwrap();
-                        let call_op_id = arena.nodes[frame.node_idx].id;
+                        let call_op_id = arena.nodes[frame.node_ref.get()].id;
                         state = frame.state;
                         linearized.clear(call_op_id);
-                        arena.unlift(frame.node_idx);
+                        arena.unlift(frame.node_ref);
                         // Advance past the restored call node.
-                        cursor = arena.nodes[frame.node_idx].next;
+                        cursor = arena.nodes[frame.node_ref.get()].next;
                     }
                 }
             }
@@ -445,6 +476,12 @@ where
         }
         return true;
     }
+
+    // Re-sort largest-first for rayon: the longest-pole partition starts
+    // immediately, maximising thread utilisation when partition sizes are
+    // unbalanced (common in KV models with skewed key distributions).
+    // The ascending sort above already served the sequential path.
+    partitions.sort_unstable_by_key(|p| std::cmp::Reverse(p.len()));
 
     let found_illegal = partitions.into_par_iter().any(|partition| {
         // If kill was set externally (timeout or sibling Illegal), abort without
@@ -918,16 +955,16 @@ mod tests {
         let entries = make_entries(&[op(0, write(1), 0, 0, 15), op(1, write(2), 0, 5, 10)]);
         let mut arena = NodeArena::from_entries(entries);
 
-        arena.lift(1); // remove nodes 1 and 4 → list: 0 → 2 → 3
-        assert_eq!(arena.head_next(), Some(2));
-        assert_eq!(arena.nodes[2].next, Some(3));
+        arena.lift(NodeRef(1)); // remove nodes 1 and 4 → list: 0 → 2 → 3
+        assert_eq!(arena.head_next(), Some(NodeRef(2)));
+        assert_eq!(arena.nodes[2].next, Some(NodeRef(3)));
         assert_eq!(arena.nodes[3].next, None);
 
-        arena.unlift(1); // full list restored: 0 → 1 → 2 → 3 → 4
-        assert_eq!(arena.head_next(), Some(1));
-        assert_eq!(arena.nodes[1].next, Some(2));
-        assert_eq!(arena.nodes[2].next, Some(3));
-        assert_eq!(arena.nodes[3].next, Some(4));
+        arena.unlift(NodeRef(1)); // full list restored: 0 → 1 → 2 → 3 → 4
+        assert_eq!(arena.head_next(), Some(NodeRef(1)));
+        assert_eq!(arena.nodes[1].next, Some(NodeRef(2)));
+        assert_eq!(arena.nodes[2].next, Some(NodeRef(3)));
+        assert_eq!(arena.nodes[3].next, Some(NodeRef(4)));
         assert_eq!(arena.nodes[4].next, None);
     }
 
@@ -943,21 +980,21 @@ mod tests {
         ]);
         let mut arena = NodeArena::from_entries(entries);
 
-        arena.lift(1); // remove 1,5 → list: 0→2→3→4→6
-        arena.lift(2); // remove 2,3 → list: 0→4→6
-        assert_eq!(arena.head_next(), Some(4));
-        assert_eq!(arena.nodes[4].next, Some(6));
+        arena.lift(NodeRef(1)); // remove 1,5 → list: 0→2→3→4→6
+        arena.lift(NodeRef(2)); // remove 2,3 → list: 0→4→6
+        assert_eq!(arena.head_next(), Some(NodeRef(4)));
+        assert_eq!(arena.nodes[4].next, Some(NodeRef(6)));
 
-        arena.unlift(2); // restore 2,3 → list: 0→2→3→4→6
-        assert_eq!(arena.head_next(), Some(2));
-        assert_eq!(arena.nodes[2].next, Some(3));
-        assert_eq!(arena.nodes[3].next, Some(4));
+        arena.unlift(NodeRef(2)); // restore 2,3 → list: 0→2→3→4→6
+        assert_eq!(arena.head_next(), Some(NodeRef(2)));
+        assert_eq!(arena.nodes[2].next, Some(NodeRef(3)));
+        assert_eq!(arena.nodes[3].next, Some(NodeRef(4)));
 
-        arena.unlift(1); // restore 1,5 → full list: 0→1→2→3→4→5→6
-        assert_eq!(arena.head_next(), Some(1));
-        assert_eq!(arena.nodes[1].next, Some(2));
-        assert_eq!(arena.nodes[4].next, Some(5));
-        assert_eq!(arena.nodes[5].next, Some(6));
+        arena.unlift(NodeRef(1)); // restore 1,5 → full list: 0→1→2→3→4→5→6
+        assert_eq!(arena.head_next(), Some(NodeRef(1)));
+        assert_eq!(arena.nodes[1].next, Some(NodeRef(2)));
+        assert_eq!(arena.nodes[4].next, Some(NodeRef(5)));
+        assert_eq!(arena.nodes[5].next, Some(NodeRef(6)));
         assert_eq!(arena.nodes[6].next, None);
     }
 

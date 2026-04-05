@@ -45,16 +45,16 @@ Benchmarks are run with [Criterion.rs](https://github.com/bheisler/criterion.rs)
 
 | Benchmark | Rust | Go | Speedup |
 |-----------|------|----|---------|
-| etcd — single file (sequential) | 51 µs | 114 µs | **2.2×** |
-| etcd — 102 files (sequential) | 161 ms | 290 ms | **1.8×** |
-| etcd — single file (parallel) | 46 µs | 114 µs | **2.5×** |
-| etcd — 102 files (parallel) | 77 ms | 290 ms | **3.8×** |
-| kv `c10-ok` (sequential) | 190 µs | 239 µs | **1.26×** |
-| kv `c10-bad` (sequential) | 90 µs | 168 µs | **1.87×** |
-| kv `c10-ok` (parallel) | 185 µs | 239 µs | **1.29×** |
-| kv `c10-bad` (parallel) | 83 µs | 168 µs | **2.02×** |
+| etcd — single file (sequential) | 47 µs | 114 µs | **2.4×** |
+| etcd — 102 files (sequential) | 172 ms | 290 ms | **1.7×** |
+| etcd — single file (parallel) | 41 µs | 114 µs | **2.8×** |
+| etcd — 102 files (parallel) | 86 ms | 290 ms | **3.4×** |
+| kv `c10-ok` (sequential) | 181 µs | 239 µs | **1.32×** |
+| kv `c10-bad` (sequential) | 88 µs | 168 µs | **1.91×** |
+| kv `c10-ok` (parallel) | 175 µs | 239 µs | **1.37×** |
+| kv `c10-bad` (parallel) | 81 µs | 168 µs | **2.07×** |
 
-Rust leads Go on every benchmark. The key contributors are: `FxHashMap` for the DFS cache (replacing SipHash); `SmallVec<[u64; 4]>` for the bitset (zero heap allocation for ≤ 256 operations); `Arc<str>` for KV model state (atomic refcount bump instead of `String` clone on every DFS step); a single-partition fast path that skips rayon dispatch; and a sequential fallback for small inputs (< 2000 total entries) that avoids rayon overhead entirely for short histories.
+Rust leads Go on every benchmark. The key contributors are: `FxHashMap` for the DFS cache (replacing SipHash); `SmallVec<[u64; 4]>` for the bitset (zero heap allocation for ≤ 256 operations); `SmallVec<[CacheEntry; 2]>` for the DFS cache collision list (eliminates heap allocation for the common 0–1 collision case); `Arc<str>` for KV model state (atomic refcount bump instead of `String` clone on every DFS step); a single-partition fast path that skips rayon dispatch; a sequential fallback for small inputs (< 2000 total entries); and `#[inline]` hints on the hot-path `lift`/`unlift`/`cache_contains` functions called thousands of times per history check.
 
 ## Status
 

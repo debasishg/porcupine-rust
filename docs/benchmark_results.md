@@ -1,6 +1,10 @@
 # porcupine-rust — Benchmarking: Process, Results, and Improvement Suggestions
 
 > **Date**: 2026-04-05 | **Machine**: Apple M1 | **Rust**: 1.x (stable) | **Go**: 1.26.1
+>
+> **Note**: This document records the initial benchmark state and analysis that motivated the
+> optimization work. Current numbers (after three optimization passes) are in
+> [`docs/benchmark_improvements.md`](benchmark_improvements.md).
 
 ---
 
