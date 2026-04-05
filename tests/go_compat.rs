@@ -18,6 +18,7 @@
 use porcupine::checker::{check_events, check_operations};
 use porcupine::{CheckResult, Event, EventKind, Model, Operation};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ============================================================================
 // REGISTER MODEL
@@ -197,25 +198,25 @@ struct KvOutput {
 }
 
 impl Model for KvModel {
-    type State = String;
+    type State = Arc<str>;
     type Input = KvInput;
     type Output = KvOutput;
 
-    fn init(&self) -> String {
-        String::new()
+    fn init(&self) -> Arc<str> {
+        Arc::from("")
     }
 
-    fn step(&self, state: &String, input: &KvInput, output: &KvOutput) -> Option<String> {
+    fn step(&self, state: &Arc<str>, input: &KvInput, output: &KvOutput) -> Option<Arc<str>> {
         match input.op {
             KvOp::Get => {
-                if output.value == *state {
-                    Some(state.clone())
+                if output.value.as_str() == state.as_ref() {
+                    Some(Arc::clone(state)) // atomic refcount bump, no heap alloc
                 } else {
                     None
                 }
             }
-            KvOp::Put => Some(input.value.clone()),
-            KvOp::Append => Some(format!("{}{}", state, input.value)),
+            KvOp::Put => Some(Arc::from(input.value.as_str())),
+            KvOp::Append => Some(Arc::from(format!("{}{}", state, input.value).as_str())),
         }
     }
 

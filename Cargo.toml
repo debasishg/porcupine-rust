@@ -15,8 +15,15 @@ quint-mbt = []
 
 [dependencies]
 rayon = "1"
+rustc-hash = "2"
+smallvec = "1"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[[bench]]
+name = "linearizability"
+harness = false

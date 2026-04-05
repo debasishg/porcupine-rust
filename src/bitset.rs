@@ -1,15 +1,23 @@
-/// Compact bitset backed by `Vec<u64>`.
+use smallvec::SmallVec;
+
+/// Compact bitset backed by a `SmallVec<[u64; 4]>`.
 ///
 /// Bit layout: bits 0–63 in `data[0]`, bits 64–127 in `data[1]`, etc.
 /// Mirrors `bitset.go` from the original porcupine implementation.
+///
+/// Inline capacity of 4 covers up to 256 operations without heap allocation.
+/// Typical histories (etcd ~170 ops → 3 chunks, KV per-partition ≤50 ops → 1 chunk)
+/// fit entirely on the stack, eliminating heap allocation on every `clone()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Bitset(Vec<u64>);
+pub struct Bitset(SmallVec<[u64; 4]>);
 
 impl Bitset {
     /// Allocate a bitset large enough to hold `n` bits, all initially zero.
     pub fn new(n: usize) -> Self {
         let chunks = n.div_ceil(64);
-        Bitset(vec![0u64; chunks])
+        let mut data: SmallVec<[u64; 4]> = SmallVec::new();
+        data.resize(chunks, 0u64);
+        Bitset(data)
     }
 
     fn index(pos: usize) -> (usize, usize) {

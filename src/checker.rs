@@ -16,7 +16,7 @@
 //  6. Return Ok / Illegal.
 
 use rayon::prelude::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -77,7 +77,7 @@ fn make_entries<I: Clone, O: Clone>(ops: &[Operation<I, O>]) -> Vec<Entry<I, O>>
 /// Renumber `Event` IDs to be contiguous starting at 0.
 fn renumber<I: Clone, O: Clone>(events: &[Event<I, O>]) -> Vec<Event<I, O>> {
     let mut out = Vec::with_capacity(events.len());
-    let mut map: HashMap<u64, u64> = HashMap::new();
+    let mut map: FxHashMap<u64, u64> = FxHashMap::default();
     let mut next_id = 0u64;
     for ev in events {
         let new_id = *map.entry(ev.id).or_insert_with(|| {
@@ -152,7 +152,7 @@ impl<I, O> NodeArena<I, O> {
         });
 
         // Track which node index holds the return for each operation id.
-        let mut return_idx: HashMap<usize, usize> = HashMap::new();
+        let mut return_idx: FxHashMap<usize, usize> = FxHashMap::default();
 
         // Allocate a slot for each entry.
         for (i, entry) in entries.into_iter().enumerate() {
@@ -249,7 +249,7 @@ struct CacheEntry<S> {
 }
 
 fn cache_contains<S: PartialEq>(
-    cache: &HashMap<u64, Vec<CacheEntry<S>>>,
+    cache: &FxHashMap<u64, Vec<CacheEntry<S>>>,
     hash: u64,
     bitset: &Bitset,
     state: &S,
@@ -289,7 +289,7 @@ fn check_single<M: Model>(
     let n_ops = entries.len() / 2; // number of operations
     let mut arena = NodeArena::from_entries(entries);
     let mut linearized = Bitset::new(n_ops);
-    let mut cache: HashMap<u64, Vec<CacheEntry<M::State>>> = HashMap::new();
+    let mut cache: FxHashMap<u64, Vec<CacheEntry<M::State>>> = FxHashMap::default();
     let mut calls: Vec<CallFrame<M::State>> = Vec::new();
     let mut state = model.init();
 
@@ -328,15 +328,18 @@ fn check_single<M: Model>(
 
                             if !cache_contains(&cache, h, &new_linearized, &next_state) {
                                 // INV-LIN-04: new (bitset, state) pair — safe to cache.
+                                // Move old state onto the backtrack stack (no clone), then
+                                // replace current state with next_state and clone once for
+                                // the cache entry — halves state clone count per step.
+                                let old_state = std::mem::replace(&mut state, next_state);
                                 cache.entry(h).or_default().push(CacheEntry {
                                     linearized: new_linearized,
-                                    state: next_state.clone(),
+                                    state: state.clone(), // state == next_state
                                 });
                                 calls.push(CallFrame {
                                     node_idx: idx,
-                                    state: state.clone(),
+                                    state: old_state, // moved, no clone
                                 });
-                                state = next_state;
                                 linearized.set(op_id);
                                 arena.lift(idx);
                                 cursor = arena.head_next();
@@ -396,6 +399,21 @@ where
 {
     if partitions.is_empty() {
         return true;
+    }
+
+    // Fast path: single partition avoids all rayon task-submission overhead.
+    // For models without partitioning (e.g. EtcdModel), this is always taken.
+    if partitions.len() == 1 {
+        let ok = check_single(model, partitions.into_iter().next().unwrap(), &kill);
+        if !ok {
+            // Only mark definitive if the kill flag was not already set — mirrors
+            // the same race-free check in the multi-partition rayon path below.
+            if !kill.load(Ordering::Relaxed) {
+                definitive_illegal.store(true, Ordering::Relaxed);
+            }
+            kill.store(true, Ordering::Relaxed);
+        }
+        return ok;
     }
 
     let found_illegal = partitions.into_par_iter().any(|partition| {
