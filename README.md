@@ -32,9 +32,33 @@ let result = porcupine::checker::check_operations(&model, &history, Some(Duratio
 assert!(matches!(result, CheckResult::Ok | CheckResult::Unknown));
 ```
 
+## Benchmarks
+
+Benchmarks are run with [Criterion.rs](https://github.com/bheisler/criterion.rs) on the Rust side and `go test -bench` on the Go side, using identical byte-for-byte input files:
+
+- **102 Jepsen etcd log files** — each a short single-partition history (~10–30 operations); representative of real Jepsen runs against etcd.
+- **6 KV store traces** — multi-key histories that exercise P-compositional checking; `c10-ok` is a correct 10-client trace, `c10-bad` contains a linearizability violation.
+
+**Parallelism control**: the Rust sequential benchmarks use a dedicated `rayon::ThreadPool` with `num_threads(1)`, so sequential Rust and single-threaded Go are genuinely apples-to-apples. The parallel benchmarks use the default rayon thread pool (one thread per logical core).
+
+### Results (Apple M1)
+
+| Benchmark | Rust | Go | Speedup |
+|-----------|------|----|---------|
+| etcd — single file (sequential) | 51 µs | 114 µs | **2.2×** |
+| etcd — 102 files (sequential) | 161 ms | 290 ms | **1.8×** |
+| etcd — single file (parallel) | 46 µs | 114 µs | **2.5×** |
+| etcd — 102 files (parallel) | 77 ms | 290 ms | **3.8×** |
+| kv `c10-ok` (sequential) | 190 µs | 239 µs | **1.26×** |
+| kv `c10-bad` (sequential) | 90 µs | 168 µs | **1.87×** |
+| kv `c10-ok` (parallel) | 185 µs | 239 µs | **1.29×** |
+| kv `c10-bad` (parallel) | 83 µs | 168 µs | **2.02×** |
+
+Rust leads Go on every benchmark. The key contributors are: `FxHashMap` for the DFS cache (replacing SipHash); `SmallVec<[u64; 4]>` for the bitset (zero heap allocation for ≤ 256 operations); `Arc<str>` for KV model state (atomic refcount bump instead of `String` clone on every DFS step); a single-partition fast path that skips rayon dispatch; and a sequential fallback for small inputs (< 2000 total entries) that avoids rayon overhead entirely for short histories.
+
 ## Status
 
-Work in progress — Rust port of the [original Go implementation](https://github.com/anishathalye/porcupine).
+Complete — all core features of the [original Go implementation](https://github.com/anishathalye/porcupine) are ported. See [SKILLS.md](SKILLS.md) for the self-verified pipeline (Quint formal model, property tests, model-based tests).
 
 ## License
 
