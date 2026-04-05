@@ -138,12 +138,148 @@ These live in `mod partition_tests` and exercise partition splitting and rayon d
 | `two_partition_illegal_history` | One stale-read partition propagates `Illegal` for the whole check |
 | `three_partitions_all_ok` | Three-key history exercises rayon dispatch across 3 independent partitions |
 
+### `to_check_result_tests` — priority logic tests (4)
+
+These live in `mod to_check_result_tests` and pin the `(ok, timed_out, definitive_illegal)` priority
+ordering: `Illegal > Unknown > Ok`.
+
+| Test | What it checks |
+|------|----------------|
+| `ok_when_dfs_completed_cleanly` | `(ok=true, timed_out=false, illegal=false)` → `Ok` |
+| `unknown_when_only_timer_fired` | `(ok=false, timed_out=true, illegal=false)` → `Unknown` |
+| `illegal_when_dfs_finished_no_timeout` | `(ok=false, timed_out=false, illegal=true)` → `Illegal` |
+| `illegal_takes_priority_over_unknown` | `(ok=false, timed_out=true, illegal=true)` → `Illegal` |
+
 **Expected output**:
-- `cargo test --lib`: **56 tests**, all passing
+- `cargo test --lib`: **60 tests**, all passing
 
 ---
 
-## 2. Property-Based Tests (`cargo test --test property_tests`)
+## 2. Go Compatibility Tests (`cargo test --test go_compat`)
+
+**Location**: `tests/go_compat.rs`
+
+**Run**:
+
+```bash
+cargo test --test go_compat
+```
+
+These tests port the original Go porcupine test suite to Rust, covering all four models shipped with the Go library. All histories and expected results mirror the Go source exactly.
+
+### 2.1 Register model (5 tests)
+
+A single integer register (`State = i32`, `init = 0`). Operations: `Put(v)` (always ok, state → v) and `Get` (ok iff observed value equals state).
+
+| Test | What it checks |
+|------|----------------|
+| `register_unrelated_ops_ok` | Concurrent reads and writes on separate values → `Ok` |
+| `register_write_read_ok` | Sequential write then correct read → `Ok` |
+| `register_concurrent_writes_ok` | Two concurrent writes, reads consistent with one of them → `Ok` |
+| `register_illegal_history` | Sequential write then stale read → `Illegal` |
+| `register_read_then_write_ok` | Read returns init, overlapping write, subsequent read returns write value → `Ok` |
+
+### 2.2 Etcd / Jepsen traces (1 batch test)
+
+| Test | What it checks |
+|------|----------------|
+| `etcd_all_files` | Loads all 102 Jepsen etcd log files from `test_data/jepsen/`; every file must return `Ok` |
+
+### 2.3 KV model — with partitioning (6 tests)
+
+`KvModel` maps `key → string` with three operations: `Get`, `Put`, `Append`. Partitioned by key; each sub-history is checked independently. Test data lives in `test_data/kv/`.
+
+| Test | File | Expected |
+|------|------|----------|
+| `kv_c01_ok` | `c01-ok.txt` | `Ok` |
+| `kv_c01_bad` | `c01-bad.txt` | `Illegal` |
+| `kv_c10_ok` | `c10-ok.txt` | `Ok` |
+| `kv_c10_bad` | `c10-bad.txt` | `Illegal` |
+| `kv_c50_ok` | `c50-ok.txt` | `Ok` |
+| `kv_c50_bad` | `c50-bad.txt` | `Illegal` |
+
+### 2.4 KV model — without partitioning (2 tests + 2 ignored)
+
+| Test | File | Expected | Status |
+|------|------|----------|--------|
+| `kv_no_partition_1_client_ok` | `c01-ok.txt` | `Ok` | active |
+| `kv_no_partition_1_client_bad` | `c01-bad.txt` | `Illegal` | active |
+| `kv_no_partition_10_clients_ok` | `c10-ok.txt` | `Ok` | `#[ignore]` — takes 60–90 s |
+| `kv_no_partition_10_clients_bad` | `c10-bad.txt` | `Illegal` | `#[ignore]` — takes 60–90 s |
+
+The ignored tests are expected: without key-partitioning, the 10-client history is too large for fast exploration. Partitioning is the intended path.
+
+**Expected output**: **15 passed**, 2 ignored.
+
+---
+
+## 3. TiPocket Model Tests (`cargo test --test tipocket`)
+
+**Location**: `tests/tipocket.rs`
+
+**Run**:
+
+```bash
+cargo test --test tipocket
+```
+
+These tests port the three linearizability models used by [TiPocket](https://github.com/pingcap/tipocket), a chaos-engineering toolkit for TiDB, to verify its use of the porcupine API. TiPocket's models run against live TiDB; we port the model definitions and verify their semantics with hand-crafted `Operation` histories.
+
+### 3.1 NoopModel — `pkg/check/porcupine/porcupine_test.go` (3 tests)
+
+A single integer register initialised to `10`. Unknown responses are pass-throughs (state unchanged).
+
+- **State**: `i32` (init = 10)
+- **Input**: `NoopInput { op: u8, value: i32 }` — `0` = read, `1` = write
+- **Output**: `NoopOutput { value: i32, unknown: bool }`
+
+| Test | History | Expected |
+|------|---------|----------|
+| `noop_read_initial_ok` | Single read returning the initial value (10) | `Ok` |
+| `noop_write_then_read_ok` | Sequential write(99), then read→99 | `Ok` |
+| `noop_illegal_stale_read` | Sequential write(42), then read→10 (stale) | `Illegal` |
+
+### 3.2 RawKvModel — `testcase/rawkv-linearizability/rawkv_linearizability.go` (6 tests)
+
+Multi-key KV store partitioned by key. Missing keys implicitly return `0`. Three operations: Get (0), Put (1), Delete (2).
+
+- **State**: `BTreeMap<i32, u32>` (init = empty)
+- **Input**: `RawKvInput { op: u8, key: i32, val: u32 }`
+- **Output**: `RawKvOutput { val: u32, unknown: bool }`
+- **Partition**: groups operation indices by `input.key`
+
+| Test | History | Expected |
+|------|---------|----------|
+| `rawkv_get_empty_ok` | Get on absent key returns 0 | `Ok` |
+| `rawkv_put_then_get_ok` | Sequential put(key=1, val=42); get(key=1)→42 | `Ok` |
+| `rawkv_delete_ok` | Sequential put, delete, get→0 | `Ok` |
+| `rawkv_unknown_get_ok` | Concurrent put + get with unknown response | `Ok` |
+| `rawkv_illegal_stale_get` | Sequential put(val=100); get→50 (wrong) | `Illegal` |
+| `rawkv_two_key_partition_ok` | Four overlapping ops on two keys; partition splits correctly | `Ok` |
+
+### 3.3 VBankModel — `testcase/vbank/client.go` (7 tests)
+
+Virtual banking system with 10 accounts (IDs 0–9), each initial balance 20.0. Four operations: Read, Transfer, CreateAccount, DeleteAccount. Deleted account balances are consolidated into account 0. Failed (`ok=false`) and aborted operations leave state unchanged.
+
+- **State**: `BTreeMap<i32, f64>` (init: id ∈ [0,9] → 20.0)
+- **Input**: `VBankInput` enum with four variants
+- **Output**: `VBankOutput { ok: bool, read_result: Option<BTreeMap<i32,f64>>, aborted: bool }`
+
+| Test | History | Expected |
+|------|---------|----------|
+| `vbank_read_initial_ok` | Single read observing exact initial state | `Ok` |
+| `vbank_transfer_ok` | Sequential transfer(0→1, 5.0); read showing updated balances | `Ok` |
+| `vbank_create_account_ok` | Sequential create(id=10); read showing new account | `Ok` |
+| `vbank_delete_account_ok` | Sequential delete(id=9); balance consolidated to account 0; read confirms | `Ok` |
+| `vbank_illegal_stale_read` | Sequential transfer; read still showing pre-transfer balances | `Illegal` |
+| `vbank_aborted_transfer_ok` | Concurrent aborted transfer + read of unchanged state | `Ok` |
+| `vbank_failed_op_ok` | Sequential failed transfer (ok=false); read of unchanged state | `Ok` |
+
+**Expected output**: **16 passed**, 0 ignored.
+
+---
+
+## 4. Property-Based Tests (`cargo test --test property_tests`)
 
 
 **Location**: `tests/property_tests.rs`
@@ -156,7 +292,7 @@ cargo test --test property_tests
 
 Uses [`proptest`](https://docs.rs/proptest) to generate random inputs. Each property is linked to one or more `INV-*` identifiers from `docs/spec.md`.
 
-### 2.1 Sequential model
+### 4.1 Sequential model
 
 All property tests use a simple integer-register model:
 
@@ -164,7 +300,7 @@ All property tests use a simple integer-register model:
 - **Write(v)**: always succeeds, transitions state to `v`
 - **Read → v**: succeeds iff `v == current_state`
 
-### 2.2 Test inventory — sequential paths (default)
+### 4.2 Test inventory — sequential paths (default)
 
 | Test | INV-* | Description |
 |------|-------|-------------|
@@ -184,7 +320,7 @@ All property tests use a simple integer-register model:
 
 **Expected output**: 13 property tests, all passing.
 
-### 2.3 The illegal history used in `prop_illegal_history_is_detected`
+### 4.3 The illegal history used in `prop_illegal_history_is_detected`
 
 ```
 Client 0: write(1)  [0, 10]    — completes at t=10
@@ -194,13 +330,13 @@ Client 2: read → 0  [12, 20]   — starts AFTER write (t=12 > t=10); must retu
 
 This history has no valid linearization: `Illegal` is the only correct answer.
 
-### 2.4 The KV model used in compositionality tests
+### 4.4 The KV model used in compositionality tests
 
 `KvModel` maps `key → i64`. Its `partition` function groups operation indices by key, giving independent sub-histories — one per key. `check_operations` uses this partition internally when `Model::partition` returns `Some(_)`, checking all partitions concurrently via rayon.
 
 ---
 
-## 3. Model-Based Tests (`cargo test --features quint-mbt --test quint_mbt`)
+## 5. Model-Based Tests (`cargo test --features quint-mbt --test quint_mbt`)
 
 **Location**: `tests/quint_mbt.rs`
 
@@ -244,7 +380,7 @@ op3: read → 2  [18, 25]
 
 ---
 
-## 4. Quint Model Checking (`quint verify`)
+## 6. Quint Model Checking (`quint verify`)
 
 **Location**: `tla/Porcupine.qnt`
 
@@ -290,7 +426,7 @@ This history is linearizable (`op0 → op1 → op2 → op3`). The model checker 
 
 ---
 
-## 5. Quint Simulation (`quint run`)
+## 7. Quint Simulation (`quint run`)
 
 **Run**:
 
@@ -311,7 +447,7 @@ quint run tla/Porcupine.qnt --out-itf /tmp/porcupine_trace.itf.json --max-steps 
 
 ---
 
-## 6. Full Test Suites at a Glance
+## 8. Full Test Suites at a Glance
 
 ### Run everything (no Quint required)
 
@@ -319,7 +455,16 @@ quint run tla/Porcupine.qnt --out-itf /tmp/porcupine_trace.itf.json --max-steps 
 cargo test
 ```
 
-Runs all lib unit tests (56) and all integration tests (13 property tests + 15 go_compat tests). No feature flags needed; rayon is an unconditional dependency.
+Runs all suites without feature flags: **104 tests** passing across four test targets.
+
+| Target | Command | Count |
+|--------|---------|-------|
+| Lib unit tests | `cargo test --lib` | 60 |
+| Go compatibility | `cargo test --test go_compat` | 15 (+ 2 ignored) |
+| TiPocket models | `cargo test --test tipocket` | 16 |
+| Property tests | `cargo test --test property_tests` | 13 |
+
+rayon is an unconditional dependency; no feature flags are required for any of the above.
 
 ### Run everything including MBT (Quint required)
 
@@ -341,7 +486,7 @@ quint verify tla/Porcupine.qnt --invariant safetyInvariant
 
 ---
 
-## 7. Invariant Coverage Matrix
+## 9. Invariant Coverage Matrix
 
 | INV-* | Name | Unit tests | Property tests | Quint invariant | MBT |
 |-------|------|------------|----------------|-----------------|-----|
