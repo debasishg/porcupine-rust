@@ -388,7 +388,7 @@ fn check_single<M: Model>(
 /// matching Go's `checkParallel` semantics.
 fn check_parallel<M>(
     model: &M,
-    partitions: Vec<Vec<Entry<M::Input, M::Output>>>,
+    mut partitions: Vec<Vec<Entry<M::Input, M::Output>>>,
     kill: Arc<AtomicBool>,
     definitive_illegal: &AtomicBool,
 ) -> bool
@@ -414,6 +414,36 @@ where
             kill.store(true, Ordering::Relaxed);
         }
         return ok;
+    }
+
+    // Sort ascending by partition size: smaller partitions run first.
+    // For bad histories this maximises the chance that a violation-containing
+    // partition finishes early, broadcasting `kill` to abort the others.
+    partitions.sort_unstable_by_key(|p| p.len());
+
+    // Sequential fast path for small total work: rayon task dispatch costs
+    // ~3–5 µs per partition, which dominates when each partition is tiny
+    // (e.g. KV c10: 10 partitions × ~30–80 entries ≈ 700 total entries).
+    // Threshold set well above c10 (~700) and below c50 (~5× larger) so that
+    // small workloads run sequentially while large ones keep rayon parallelism.
+    // Etcd is unaffected: it always takes the single-partition fast path above.
+    const SEQUENTIAL_THRESHOLD: usize = 2000;
+    let total_entries: usize = partitions.iter().map(|p| p.len()).sum();
+    if total_entries < SEQUENTIAL_THRESHOLD {
+        for partition in partitions {
+            if kill.load(Ordering::Relaxed) {
+                return false;
+            }
+            let ok = check_single(model, partition, &kill);
+            if !ok {
+                if !kill.load(Ordering::Relaxed) {
+                    definitive_illegal.store(true, Ordering::Relaxed);
+                }
+                kill.store(true, Ordering::Relaxed);
+                return false;
+            }
+        }
+        return true;
     }
 
     let found_illegal = partitions.into_par_iter().any(|partition| {

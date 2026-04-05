@@ -109,13 +109,13 @@ enum KvOp {
 #[derive(Clone, Debug, PartialEq)]
 struct KvInput {
     op: KvOp,
-    key: String,
-    value: String,
+    key: Arc<str>,
+    value: Arc<str>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct KvOutput {
-    value: String,
+    value: Arc<str>,
 }
 
 impl Model for KvModel {
@@ -130,28 +130,31 @@ impl Model for KvModel {
     fn step(&self, state: &Arc<str>, input: &KvInput, output: &KvOutput) -> Option<Arc<str>> {
         match input.op {
             KvOp::Get => {
-                if output.value.as_str() == state.as_ref() {
+                if &*output.value == &**state {
                     Some(Arc::clone(state)) // atomic refcount bump, no heap alloc
                 } else {
                     None
                 }
             }
-            KvOp::Put => Some(Arc::from(input.value.as_str())),
-            KvOp::Append => Some(Arc::from(format!("{}{}", state, input.value).as_str())),
+            KvOp::Put => Some(Arc::clone(&input.value)), // zero alloc: reuse existing Arc
+            KvOp::Append => {
+                let s = format!("{}{}", &**state, &*input.value);
+                Some(Arc::from(s.as_str()))
+            }
         }
     }
 
     fn partition_events(&self, history: &[Event<KvInput, KvOutput>]) -> Option<Vec<Vec<usize>>> {
-        let mut id_to_key: HashMap<u64, String> = HashMap::new();
+        let mut id_to_key: HashMap<u64, Arc<str>> = HashMap::new();
         for ev in history {
             if let (EventKind::Call, Some(inp)) = (&ev.kind, &ev.input) {
-                id_to_key.insert(ev.id, inp.key.clone());
+                id_to_key.insert(ev.id, Arc::clone(&inp.key));
             }
         }
-        let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_key: HashMap<Arc<str>, Vec<usize>> = HashMap::new();
         for (i, ev) in history.iter().enumerate() {
             if let Some(key) = id_to_key.get(&ev.id) {
-                by_key.entry(key.clone()).or_default().push(i);
+                by_key.entry(Arc::clone(key)).or_default().push(i);
             }
         }
         Some(by_key.into_values().collect())
@@ -317,8 +320,8 @@ fn parse_kv_log(filename: &str) -> Vec<Event<KvInput, KvOutput>> {
         let process = kv_field_int(line, ":process ");
         let typ = kv_field_token(line, ":type ");
         let f = kv_field_token(line, ":f ");
-        let key = kv_field_quoted(line, ":key \"");
-        let value = kv_field_value(line);
+        let key: Arc<str> = Arc::from(kv_field_quoted(line, ":key \"").as_str());
+        let value: Arc<str> = Arc::from(kv_field_value(line).as_str());
 
         match typ.as_str() {
             ":invoke" => {
