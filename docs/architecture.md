@@ -105,18 +105,32 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
 └───────────────────────────────────────────────────────────────────┘
            │                        │
            ▼                        ▼
-┌──────────────────┐     ┌────────────────────────────────────┐
-│   bitset.rs      │     │   model.rs                         │
-│                  │     │                                     │
-│  Bitset(Vec<u64>)│     │  trait Model {                     │
-│                  │     │    type State: Clone + PartialEq;  │
-│  set(pos)        │     │    type Input: Clone;              │
-│  clear(pos)      │     │    type Output: Clone;             │
-│  popcnt()        │     │    fn init() → State               │
-│  hash()          │     │    fn step(s, i, o) → Option<S>   │
-│  equals(other)   │     │    fn partition(…) → Option<…>    │
-│  clone()         │     │  }                                 │
-└──────────────────┘     └────────────────────────────────────┘
+┌──────────────────┐     ┌────────────────────────────────────────────────────────┐
+│   bitset.rs      │     │   model.rs                                             │
+│                  │     │                                                         │
+│  Bitset(Vec<u64>)│     │  trait Model {                                         │
+│                  │     │    type State: Clone + PartialEq;                      │
+│  set(pos)        │     │    type Input: Clone;                                  │
+│  clear(pos)      │     │    type Output: Clone;                                 │
+│  popcnt()        │     │    fn init() → State                                   │
+│  hash()          │     │    fn step(s, i, o) → Option<S>                       │
+│  equals(other)   │     │    fn partition(…) → Option<…>                        │
+│  clone()         │     │  }                                                     │
+└──────────────────┘     │                                                         │
+                         │  trait NondeterministicModel {                          │
+                         │    type State: Clone + PartialEq;                      │
+                         │    type Input: Clone;                                  │
+                         │    type Output: Clone;                                 │
+                         │    fn init() → Vec<State>                              │
+                         │    fn step(s, i, o) → Vec<State>  // empty = reject   │
+                         │    fn partition(…) → Option<…>                        │
+                         │  }                                                     │
+                         │                                                         │
+                         │  struct PowerSetModel<M>(pub M);                       │
+                         │  // implements Model with State = Vec<M::State>        │
+                         │  // fans out step() over the power-state,              │
+                         │  // deduplicates successors, returns None if empty     │
+                         └────────────────────────────────────────────────────────┘
 
 ┌────────────────────────────────────────────────────────────────────┐
 │  types.rs                                                          │
@@ -333,9 +347,9 @@ The entire codebase contains zero `unsafe` blocks. The index-based arena design 
 |--------|-----------|------|
 | `src/lib.rs` | public | Crate root; re-exports public API |
 | `src/types.rs` | public | `Operation`, `Event`, `CheckResult`, `LinearizationInfo` |
-| `src/model.rs` | public | `Model` trait |
+| `src/model.rs` | public | `Model` trait; `NondeterministicModel` trait; `PowerSetModel` adapter |
 | `src/checker.rs` | public | Entry points + full DFS implementation; partition checking always runs via rayon |
 | `src/bitset.rs` | crate-private | Compact bitset for linearized set and cache key |
 | `src/invariants.rs` | crate-private | `debug_assert!` macros keyed to `INV-*` IDs |
 
-`bitset` and `invariants` are intentionally `pub(crate)`: they are implementation details of the checker and not part of the public API. Users interact only with `Model`, `Operation`/`Event`, and `CheckResult`.
+`bitset` and `invariants` are intentionally `pub(crate)`: they are implementation details of the checker and not part of the public API. Users interact with `Model` (or `NondeterministicModel` + `PowerSetModel`), `Operation`/`Event`, and `CheckResult`.

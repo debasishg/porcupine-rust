@@ -1,4 +1,7 @@
-use porcupine::{CheckResult, Event, EventKind, Model, Operation};
+use porcupine::{
+    model::{NondeterministicModel, PowerSetModel},
+    CheckResult, Event, EventKind, Model, Operation,
+};
 /// Property-based tests for porcupine linearizability checker.
 ///
 /// Each test corresponds to one or more INV-* invariants from docs/spec.md.
@@ -547,4 +550,218 @@ fn prop_events_empty_history_is_ok() {
         CheckResult::Ok,
         "INV-LIN-01: empty event history must be linearizable"
     );
+}
+
+// ===========================================================================
+// INV-ND-01: Power-Set Reduction Soundness
+//
+// These tests exercise the NondeterministicModel trait and PowerSetModel adapter
+// defined in src/model.rs.  They verify:
+//   (a) PowerSetModel with a degenerate single-successor ND model agrees with
+//       the equivalent deterministic Model on all histories (INV-ND-01).
+//   (b) A sequential ND history is always linearizable (INV-LIN-01 + INV-LIN-02).
+//   (c) An illegal ND history is always detected (INV-LIN-02).
+//   (d) Repeated calls return the same result (INV-LIN-04).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// DeterministicNdRegister — a NondeterministicModel that wraps RegisterModel.
+//
+// step returns either a singleton (accepted) or an empty vec (rejected),
+// mirroring exactly what RegisterModel::step does.  PowerSetModel of this
+// must agree with RegisterModel on every history.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct DeterministicNdRegister;
+
+impl NondeterministicModel for DeterministicNdRegister {
+    type State = i64;
+    type Input = RegisterInput;
+    type Output = i64;
+
+    fn init(&self) -> Vec<i64> {
+        vec![0]
+    }
+
+    fn step(&self, state: &i64, input: &RegisterInput, output: &i64) -> Vec<i64> {
+        // Mirror RegisterModel exactly, but return Vec<State> instead of Option<State>.
+        if input.is_write {
+            vec![input.value]
+        } else if *output == *state {
+            vec![*state]
+        } else {
+            vec![]
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LossyNdRegister — a NondeterministicModel with genuine branching.
+//
+// A write of value v from state s may succeed (→ v) or be lost (→ s).
+// A read must return the exact current register value.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct LossyNdRegister;
+
+#[derive(Clone, Debug, PartialEq)]
+enum LossyInput {
+    Write(i64),
+    Read,
+}
+
+impl NondeterministicModel for LossyNdRegister {
+    type State = i64;
+    type Input = LossyInput;
+    type Output = Option<i64>; // None for writes, Some(v) for reads
+
+    fn init(&self) -> Vec<i64> {
+        vec![0]
+    }
+
+    fn step(&self, state: &i64, input: &LossyInput, output: &Option<i64>) -> Vec<i64> {
+        match (input, output) {
+            (LossyInput::Write(v), None) => {
+                if *v == *state {
+                    vec![*state]
+                } else {
+                    vec![*v, *state] // write may succeed or be lost
+                }
+            }
+            (LossyInput::Read, Some(o)) if *o == *state => vec![*state],
+            _ => vec![],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INV-ND-01 (a): PowerSetModel with a deterministic ND model agrees with
+// the equivalent deterministic Model on sequential histories.
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// For any sequential register history, PowerSetModel(DeterministicNdRegister)
+    /// and RegisterModel must return the same CheckResult.
+    /// INV-ND-01: power-set reduction is sound for degenerate (single-successor) models.
+    #[test]
+    fn prop_nd_deterministic_agrees_with_model(len in 1usize..8) {
+        let history = sequential_history(len);
+        let deterministic = porcupine::checker::check_operations(&RegisterModel, &history, None);
+
+        // Adapt the same model via PowerSetModel — State becomes Vec<i64>.
+        let nd_model = PowerSetModel(DeterministicNdRegister);
+        let nd_result = porcupine::checker::check_operations(&nd_model, &history, None);
+
+        prop_assert_eq!(deterministic, nd_result,
+            "INV-ND-01: PowerSetModel(deterministic ND) must agree with deterministic Model");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INV-ND-01 (b) + INV-LIN-01 + INV-LIN-02: sequential ND history is always Ok.
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// A purely sequential history of writes through the lossy register is always
+    /// linearizable — writes are unconditionally accepted (just branching on
+    /// which successor is tracked), so every sequential history is Ok.
+    /// INV-ND-01, INV-LIN-01, INV-LIN-02.
+    #[test]
+    fn prop_nd_sequential_writes_linearizable(len in 1usize..8) {
+        let model = PowerSetModel(LossyNdRegister);
+        let history: Vec<Operation<LossyInput, Option<i64>>> = (0..len)
+            .map(|i| Operation {
+                client_id: i as u64,
+                input: LossyInput::Write(i as i64),
+                output: None,
+                call: (i as u64) * 2,
+                return_time: (i as u64) * 2 + 1,
+            })
+            .collect();
+        let result = porcupine::checker::check_operations(&model, &history, None);
+        prop_assert_eq!(result, CheckResult::Ok,
+            "INV-ND-01: sequential write history must be linearizable");
+    }
+}
+
+proptest! {
+    /// A single-operation (write) history through the lossy register is trivially Ok.
+    /// INV-ND-01, INV-LIN-01.
+    #[test]
+    fn prop_nd_single_op_is_linearizable(value in -100i64..100) {
+        let model = PowerSetModel(LossyNdRegister);
+        let history = vec![Operation {
+            client_id: 0,
+            input: LossyInput::Write(value),
+            output: None,
+            call: 0,
+            return_time: 10,
+        }];
+        let result = porcupine::checker::check_operations(&model, &history, None);
+        prop_assert_eq!(result, CheckResult::Ok,
+            "INV-ND-01: single-op ND history must be linearizable");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INV-ND-01 (c) + INV-LIN-02: an impossible read is always Illegal.
+// ---------------------------------------------------------------------------
+
+/// A read that returns a value inconsistent with any reachable state is Illegal
+/// even when the register is nondeterministic.
+///
+///   Write(42) [0, 5]   — power-state after: { 42, 0 }
+///   Read→99   [6, 10]  — 99 ∉ { 42, 0 } → no valid successor → Illegal
+#[test]
+fn prop_nd_impossible_read_is_illegal() {
+    let model = PowerSetModel(LossyNdRegister);
+    let history = vec![
+        Operation {
+            client_id: 0,
+            input: LossyInput::Write(42),
+            output: None,
+            call: 0,
+            return_time: 5,
+        },
+        Operation {
+            client_id: 1,
+            input: LossyInput::Read,
+            output: Some(99),
+            call: 6,
+            return_time: 10,
+        },
+    ];
+    assert_eq!(
+        porcupine::checker::check_operations(&model, &history, None),
+        CheckResult::Illegal,
+        "INV-ND-01 + INV-LIN-02: a read of an impossible value must be Illegal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// INV-LIN-04: cache soundness — identical ND inputs yield identical results.
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// Two calls to check_operations with the same ND history must return the
+    /// same result.  INV-LIN-04.
+    #[test]
+    fn prop_nd_cache_sound_deterministic(len in 1usize..6) {
+        let model = PowerSetModel(LossyNdRegister);
+        let history: Vec<Operation<LossyInput, Option<i64>>> = (0..len)
+            .map(|i| Operation {
+                client_id: i as u64,
+                input: LossyInput::Write(i as i64),
+                output: None,
+                call: (i as u64) * 2,
+                return_time: (i as u64) * 2 + 1,
+            })
+            .collect();
+        let r1 = porcupine::checker::check_operations(&model, &history, None);
+        let r2 = porcupine::checker::check_operations(&model, &history, None);
+        prop_assert_eq!(r1, r2,
+            "INV-LIN-04: identical ND inputs must yield identical results");
+    }
 }

@@ -13,6 +13,7 @@ Linearizability is a correctness condition for concurrent systems. A history of 
 - Optional timeout-based checking with a tri-state `CheckResult`
 - P-compositional checking for partitionable models (e.g., key-value stores partitioned by key)
 - Efficient DFS with backtracking, bitset-based state tracking, and caching
+- `NondeterministicModel` trait + `PowerSetModel` adapter for models with branching step semantics (e.g. lossy writes, replica reads, internal non-observable choices)
 
 ## Usage
 

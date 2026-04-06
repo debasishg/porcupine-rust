@@ -294,13 +294,20 @@ Uses [`proptest`](https://docs.rs/proptest) to generate random inputs. Each prop
 
 ### 4.1 Sequential model
 
-All property tests use a simple integer-register model:
+Most property tests use a simple integer-register model:
 
 - **State**: `i64` (current register value, init `0`)
 - **Write(v)**: always succeeds, transitions state to `v`
 - **Read → v**: succeeds iff `v == current_state`
 
-### 4.2 Test inventory — sequential paths (default)
+### 4.2 Nondeterministic models (INV-ND-01 tests)
+
+Two `NondeterministicModel` implementations are used for the `prop_nd_*` tests:
+
+- **`DeterministicNdRegister`**: wraps `RegisterModel` as a `NondeterministicModel`; step always returns exactly one successor (or empty). Used to verify that `PowerSetModel` of a degenerate ND model agrees with the equivalent deterministic `Model`.
+- **`LossyNdRegister`**: a genuine branching model where a write of value `v` from state `s` may succeed (`→ v`) or be lost (`→ s`). Read must return exact current state.
+
+### 4.3 Test inventory — sequential paths (default)
 
 | Test | INV-* | Description |
 |------|-------|-------------|
@@ -318,9 +325,19 @@ All property tests use a simple integer-register model:
 | `prop_events_cache_sound_deterministic` | INV-LIN-04 | Two calls to `check_events` with identical input return the same result |
 | `prop_events_empty_history_is_ok` | INV-LIN-01 | Empty event history returns `CheckResult::Ok` |
 
-**Expected output**: 13 property tests, all passing.
+### 4.4 Test inventory — `NondeterministicModel` / `PowerSetModel` (INV-ND-01)
 
-### 4.3 The illegal history used in `prop_illegal_history_is_detected`
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `prop_nd_deterministic_agrees_with_model` | INV-ND-01 | `PowerSetModel(DeterministicNdRegister)` and `RegisterModel` return the same `CheckResult` for every sequential history |
+| `prop_nd_sequential_writes_linearizable` | INV-ND-01, INV-LIN-01, INV-LIN-02 | A sequential write-only history through `LossyNdRegister` is always `Ok` |
+| `prop_nd_single_op_is_linearizable` | INV-ND-01, INV-LIN-01 | A single-write operation is trivially linearizable under `LossyNdRegister` |
+| `prop_nd_impossible_read_is_illegal` | INV-ND-01, INV-LIN-02 | A read of a value outside the reachable power-state is always `Illegal` |
+| `prop_nd_cache_sound_deterministic` | INV-LIN-04 | Two calls to `check_operations` with the same ND history return the same result |
+
+**Expected output**: 18 property tests, all passing.
+
+### 4.5 The illegal history used in `prop_illegal_history_is_detected`
 
 ```
 Client 0: write(1)  [0, 10]    — completes at t=10
@@ -330,13 +347,52 @@ Client 2: read → 0  [12, 20]   — starts AFTER write (t=12 > t=10); must retu
 
 This history has no valid linearization: `Illegal` is the only correct answer.
 
-### 4.4 The KV model used in compositionality tests
+### 4.6 The KV model used in compositionality tests
 
 `KvModel` maps `key → i64`. Its `partition` function groups operation indices by key, giving independent sub-histories — one per key. `check_operations` uses this partition internally when `Model::partition` returns `Some(_)`, checking all partitions concurrently via rayon.
 
 ---
 
-## 5. Model-Based Tests (`cargo test --features quint-mbt --test quint_mbt`)
+## 5. Nondeterministic Model Tests (`cargo test --test nondeterministic`)
+
+**Location**: `tests/nondeterministic.rs`
+
+**Run**:
+
+```bash
+cargo test --test nondeterministic
+```
+
+Integration tests for the `NondeterministicModel` trait and `PowerSetModel` adapter
+(both defined in `src/model.rs`).  Two concrete models are used:
+
+- **`BranchingCounter`** — a counter that increments by either 1 or 2 on each step.
+  Input: `()`. Output: `u32` (observed value).
+- **`NdRegister`** — a lossy register where a write may succeed or be dropped.
+  Input: `RegOp::Write(v) | RegOp::Read`. Output: `Option<u32>`.
+
+### 5.1 Test inventory
+
+| Test | Model | API | Expected |
+|------|-------|-----|----------|
+| `branching_counter_single_op_ok` | BranchingCounter | `check_operations` | `Ok` (output = 0+1) |
+| `branching_counter_single_op_skip_ok` | BranchingCounter | `check_operations` | `Ok` (output = 0+2) |
+| `branching_counter_single_op_illegal` | BranchingCounter | `check_operations` | `Illegal` (output = 3, impossible) |
+| `branching_counter_sequential_ok` | BranchingCounter | `check_operations` | `Ok` (1 then 2) |
+| `branching_counter_sequential_illegal` | BranchingCounter | `check_operations` | `Illegal` (1 then 4) |
+| `branching_counter_concurrent_ok` | BranchingCounter | `check_operations` | `Ok` (overlapping A→B) |
+| `nd_register_lossy_write_read_old_ok` | NdRegister | `check_operations` | `Ok` (write 42, read 0 — lost write) |
+| `nd_register_lossy_write_read_new_ok` | NdRegister | `check_operations` | `Ok` (write 42, read 42 — write succeeded) |
+| `nd_register_lossy_write_read_illegal` | NdRegister | `check_operations` | `Illegal` (write 42, read 99 — impossible) |
+| `branching_counter_events_single_ok` | BranchingCounter | `check_events` | `Ok` |
+| `branching_counter_events_single_illegal` | BranchingCounter | `check_events` | `Illegal` |
+| `branching_counter_events_sequential_ok` | BranchingCounter | `check_events` | `Ok` (skip then increment) |
+
+**Expected output**: 12 tests, all passing.
+
+---
+
+## 6. Model-Based Tests (`cargo test --features quint-mbt --test quint_mbt`)
 
 **Location**: `tests/quint_mbt.rs`
 
@@ -380,70 +436,28 @@ op3: read → 2  [18, 25]
 
 ---
 
-## 6. Quint Model Checking (`quint verify`)
+## 7. Quint Model Checking
 
-**Location**: `tla/Porcupine.qnt`
-
-**Run**:
+### 7.1 DFS algorithm — `quint verify tla/Porcupine.qnt`
 
 ```bash
 quint verify tla/Porcupine.qnt --invariant safetyInvariant
 ```
 
-This invokes **Apalache** (bundled with Quint) to perform bounded model checking over all reachable states up to `--max-steps` (default: 10).
+Checks the six sub-invariants covering INV-HIST-01, INV-HIST-03, INV-LIN-01–04, INV-PAR-01.
 
-### What is verified
+**Expected output**: `[ok] No violation found`
 
-`safetyInvariant` is the conjunction of six sub-invariants, each corresponding to an `INV-*` entry in `docs/spec.md`:
-
-| Sub-invariant | INV-* | Condition |
-|---------------|-------|-----------|
-| `histWellFormedInv` | INV-HIST-01 | All operations in `HISTORY` have `call_ts ≥ 0` and `ret_ts ≥ call_ts` |
-| `minimalCallFrontier` | INV-HIST-03 | Every operation in the frontier (eligible for linearization) is truly minimal — no unlinearized earlier operation exists |
-| `cacheSound` | INV-LIN-04 | No two frames on the DFS stack share the same `op_id` (unique linearized set per stack depth) |
-| `resultConsistent` | INV-LIN-01, INV-LIN-02 | `result = "Ok"` implies all ops linearized; `result = "Illegal"` implies frontier is empty |
-| `pCompositionality` | INV-LIN-03 | When `result = "Ok"`, applying the ops in stack order from `INIT_VAL` is accepted by the register model at every step — the stack records a valid sequential execution |
-| `parallelKillFlagInvariant` | INV-PAR-01 | `result` is always one of `"Unknown"`, `"Ok"`, or `"Illegal"` (models the write-once kill-flag monotonicity of the parallel implementation) |
-
-The model also guards the `step` action with `result != "Unknown"` to stutter once the DFS terminates, preventing post-termination state mutations from violating `resultConsistent` and `pCompositionality`.
-
-**Expected output**:
-
-```
-[ok] No violation found
-```
-
-### Concrete history modelled
-
-```
-op0: write(1)  [0, 10]
-op1: read → 1  [5, 15]
-op2: write(2)  [12, 20]
-op3: read → 2  [18, 25]
-```
-
-This history is linearizable (`op0 → op1 → op2 → op3`). The model checker confirms no invariant is violated along any execution path.
-
----
-
-## 7. Quint Simulation (`quint run`)
-
-**Run**:
+### 7.2 Power-set construction — `quint verify tla/NondeterministicModel.qnt`
 
 ```bash
-quint run tla/Porcupine.qnt
+quint verify tla/NondeterministicModel.qnt --invariant safetyInvariant
 ```
 
-Runs a single randomised simulation (not exhaustive). Useful for:
+Checks INV-ND-01 (`powerSetSoundnessInv`): empty power-state implies rejection, and
+acceptance implies non-empty power-state.  Models the `NdRegister` (lossy write).
 
-- Generating ITF traces for MBT (used by `tests/quint_mbt.rs`)
-- Sanity-checking model behaviour interactively
-
-To emit a trace file explicitly:
-
-```bash
-quint run tla/Porcupine.qnt --out-itf /tmp/porcupine_trace.itf.json --max-steps 20
-```
+**Expected output**: `[ok] No violation found`
 
 ---
 
@@ -455,14 +469,16 @@ quint run tla/Porcupine.qnt --out-itf /tmp/porcupine_trace.itf.json --max-steps 
 cargo test
 ```
 
-Runs all suites without feature flags: **104 tests** passing across four test targets.
+Runs all suites without feature flags: **116 tests** passing across five test targets.
 
 | Target | Command | Count |
 |--------|---------|-------|
 | Lib unit tests | `cargo test --lib` | 60 |
 | Go compatibility | `cargo test --test go_compat` | 15 (+ 2 ignored) |
 | TiPocket models | `cargo test --test tipocket` | 16 |
-| Property tests | `cargo test --test property_tests` | 13 |
+| Property tests | `cargo test --test property_tests` | 18 |
+| Nondeterministic model | `cargo test --test nondeterministic` | 12 |
+| Doc tests | `cargo test --doc` | 1 |
 
 rayon is an unconditional dependency; no feature flags are required for any of the above.
 
@@ -490,13 +506,14 @@ quint verify tla/Porcupine.qnt --invariant safetyInvariant
 
 | INV-* | Name | Unit tests | Property tests | Quint invariant | MBT |
 |-------|------|------------|----------------|-----------------|-----|
-| INV-HIST-01 | Well-Formed History | — | `prop_well_formed_history` | `histWellFormedInv` | — |
-| INV-HIST-02 | Real-Time Order | structural | `prop_sequential_history_is_linearizable` | `realTimeOrder` (pure def) | — |
-| INV-HIST-03 | Minimal-Call Frontier | structural | covered by soundness tests | `minimalCallFrontier` | — |
-| INV-LIN-01 | Soundness | `timeout_very_long_does_not_affect_result`, `two_partition_ok_history` | `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_check_events_matches_quint_trace` |
-| INV-LIN-02 | Completeness | `timeout_very_long_does_not_affect_illegal_result`, `two_partition_illegal_history` | `prop_illegal_history_is_detected` | `resultConsistent` | `mbt_trace_matches_rust_checker` |
-| INV-LIN-03 | P-Compositionality | `check_events_partition_*`, `two_partition_*`, `three_partitions_all_ok` | `prop_compositionality_partitions_disjoint`, `prop_compositionality_end_to_end` | `pCompositionality` | — |
-| INV-LIN-04 | Cache Soundness | `timeout_none_matches_none_no_timeout` | `prop_cache_sound_deterministic`, `prop_events_cache_sound_deterministic` | `cacheSound` | — |
-| INV-PAR-01 | Kill-Flag Monotonicity | `timeout_zero_duration_returns_unknown_or_definitive`, `timeout_short_duration_returns_unknown`, `timeout_short_duration_events_returns_unknown` | — | `parallelKillFlagInvariant` | — |
+| INV-HIST-01 | Well-Formed History | — | `prop_well_formed_history` | `Porcupine.qnt histWellFormedInv` | — |
+| INV-HIST-02 | Real-Time Order | structural | `prop_sequential_history_is_linearizable` | `Porcupine.qnt realTimeOrder` (pure def) | — |
+| INV-HIST-03 | Minimal-Call Frontier | structural | covered by soundness tests | `Porcupine.qnt minimalCallFrontier` | — |
+| INV-LIN-01 | Soundness | `timeout_very_long_does_not_affect_result`, `two_partition_ok_history` | `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `Porcupine.qnt resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_check_events_matches_quint_trace` |
+| INV-LIN-02 | Completeness | `timeout_very_long_does_not_affect_illegal_result`, `two_partition_illegal_history` | `prop_illegal_history_is_detected` | `Porcupine.qnt resultConsistent` | `mbt_trace_matches_rust_checker` |
+| INV-LIN-03 | P-Compositionality | `check_events_partition_*`, `two_partition_*`, `three_partitions_all_ok` | `prop_compositionality_partitions_disjoint`, `prop_compositionality_end_to_end` | `Porcupine.qnt pCompositionality` | — |
+| INV-LIN-04 | Cache Soundness | `timeout_none_matches_none_no_timeout` | `prop_cache_sound_deterministic`, `prop_events_cache_sound_deterministic`, `prop_nd_cache_sound_deterministic` | `Porcupine.qnt cacheSound` | — |
+| INV-PAR-01 | Kill-Flag Monotonicity | `timeout_zero_duration_returns_unknown_or_definitive`, `timeout_short_duration_returns_unknown`, `timeout_short_duration_events_returns_unknown` | — | `Porcupine.qnt parallelKillFlagInvariant` | — |
+| INV-ND-01 | Power-Set Reduction Soundness | structural (`PowerSetModel::step`) | `prop_nd_deterministic_agrees_with_model`, `prop_nd_sequential_writes_linearizable`, `prop_nd_single_op_is_linearizable`, `prop_nd_impossible_read_is_illegal` | `NondeterministicModel.qnt powerSetSoundnessInv` | — |
 
 Full invariant definitions: `docs/spec.md`.

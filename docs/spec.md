@@ -126,16 +126,50 @@ always yield the same sub-tree result. The cache may safely prune any node whose
 
 ---
 
-## 3. Invariant Traceability Matrix
+## 3. Nondeterministic Model Invariants
 
-| ID | spec.md | invariants.rs | property_tests.rs | Porcupine.qnt |
-|----|---------|---------------|-------------------|---------------|
-| INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` | `histWellFormed` |
-| INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order` | `realTimeOrder` |
-| INV-HIST-03 | §1 | `assert_minimal_call` | `prop_soundness` | `minimalCallFrontier` |
-| INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `resultConsistent` |
-| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` | `resultConsistent` |
-| INV-LIN-03 | §2 | `assert_partition_independent` | `prop_compositionality_*` | `pCompositionality` |
-| INV-LIN-04 | §2 | `assert_cache_sound` | `prop_cache_sound` | `cacheSound` |
+The `NondeterministicModel` trait and `PowerSetModel` adapter introduce one new invariant
+governing the correctness of the power-set construction.
+
+### INV-ND-01: Power-Set Reduction Soundness
+
+```
+∀ M: NondeterministicModel, ∀ history:
+  check_operations(PowerSetModel(M), history) = Ok
+    ↔  ∃ sequential linearization of history consistent with M.step
+```
+
+The `PowerSetModel` adapter faithfully reduces a `NondeterministicModel` to the
+deterministic `Model` interface.  Three structural properties guarantee this:
+
+1. **Empty-set preserving** — If `M.step(s, i, o) = []` for every `s` in the
+   current power-state, `PowerSetModel::step` returns `None` (rejection).
+2. **Non-empty propagation** — If any `s` in the power-state has at least one
+   valid successor, `PowerSetModel::step` returns `Some(successors)`.
+3. **Deduplication** — The successor set is deduplicated via `PartialEq`; the
+   power-state never contains two states that compare equal.
+
+A degenerate `NondeterministicModel` whose step always returns exactly one
+successor is equivalent to the corresponding deterministic `Model`; the two must
+agree on all histories.
+
+- **Enforced by**: `PowerSetModel::step` in `src/model.rs` (structural)
+- **Checked by**: `tests/property_tests.rs` — `prop_nd_*`
+- **Formal**: `tla/NondeterministicModel.qnt` — `powerSetSoundnessInv`
+
+---
+
+## 4. Invariant Traceability Matrix
+
+| ID | spec.md | invariants.rs | property_tests.rs | Quint |
+|----|---------|---------------|-------------------|-------|
+| INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` | `Porcupine.qnt histWellFormed` |
+| INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order` | `Porcupine.qnt realTimeOrder` |
+| INV-HIST-03 | §1 | `assert_minimal_call` | `prop_soundness` | `Porcupine.qnt minimalCallFrontier` |
+| INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `Porcupine.qnt resultConsistent` |
+| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` | `Porcupine.qnt resultConsistent` |
+| INV-LIN-03 | §2 | `assert_partition_independent` | `prop_compositionality_*` | `Porcupine.qnt pCompositionality` |
+| INV-LIN-04 | §2 | `assert_cache_sound` | `prop_cache_sound` | `Porcupine.qnt cacheSound` |
+| INV-ND-01 | §3 | (structural in `PowerSetModel::step`) | `prop_nd_*` | `NondeterministicModel.qnt powerSetSoundnessInv` |
 
 > **Parallel execution**: `check_operations` and `check_events` always use rayon to check partitions concurrently (unconditional dependency, no feature flag), matching Go's goroutine-per-partition behaviour.

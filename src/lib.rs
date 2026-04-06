@@ -7,5 +7,5 @@ pub(crate) mod invariants;
 pub mod model;
 pub mod types;
 
-pub use model::Model;
+pub use model::{Model, NondeterministicModel, PowerSetModel};
 pub use types::{CheckResult, Event, EventKind, LinearizationInfo, Operation};
