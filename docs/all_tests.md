@@ -392,7 +392,103 @@ Integration tests for the `NondeterministicModel` trait and `PowerSetModel` adap
 
 ---
 
-## 6. Model-Based Tests (`cargo test --features quint-mbt --test quint_mbt`)
+## 6. S2 Stream Model Tests (`cargo test --test s2_model`)
+
+**Location**: `tests/s2_model.rs`
+
+**Run**:
+
+```bash
+cargo test --test s2_model
+```
+
+Linearizability tests for [S2](https://s2.dev), an append-only stream-storage service.  The model
+is a direct port of the Go `NondeterministicModel` in
+[s2-streamstore/s2-verification](https://github.com/s2-streamstore/s2-verification).
+
+### Why nondeterministic?
+
+S2 appends can return `AppendIndefiniteFailure` (network or transient server error) — the write
+may or may not have become durable.  The model returns both possible successor states for such
+operations, which is why it implements `NondeterministicModel` and is wrapped in `PowerSetModel`
+before being passed to `check_events`.
+
+### State and I/O types
+
+| Type | Description |
+|------|-------------|
+| `S2StreamState { tail, xxh3, fencing_token }` | `tail: u32` — next append offset; `xxh3: u64` — hash of last-appended batch; `fencing_token: Option<String>` — stream-level mutual-exclusion token |
+| `S2Input` | `Append { num_records, xxh3, set_fencing_token, fencing_token, match_seq_num }` / `Read` / `CheckTail` |
+| `S2Output` | `AppendSuccess { tail }` / `AppendDefiniteFailure` / `AppendIndefiniteFailure` / `ReadSuccess { tail, xxh3 }` / `ReadFailure` / `CheckTailSuccess { tail }` / `CheckTailFailure` |
+
+### Step semantics
+
+| Output | Semantics |
+|--------|-----------|
+| `AppendDefiniteFailure` | Guaranteed not durable → state unchanged |
+| `AppendIndefiniteFailure` | May or may not be durable. If fencing token mismatches or `matchSeqNum` ≠ current tail, the write cannot have succeeded → state unchanged. Otherwise → both optimistic and original states are returned |
+| `AppendSuccess { tail }` | Validates fencing token and `matchSeqNum` guards; verifies reported tail = `state.tail + num_records`; transitions to the optimistic state |
+| `ReadSuccess { tail, xxh3 }` | `xxh3` must match current state; `tail` must equal current tail → state unchanged |
+| `ReadFailure` / `CheckTailFailure` | State unchanged |
+| `CheckTailSuccess { tail }` | `tail` must equal current tail → state unchanged |
+
+### Test inventory
+
+The first five tests are direct ports of the Go test suite in
+`golang/s2-porcupine/main_test.go`.  The sixth test is an optional file-based integration test.
+
+| Test | Go equivalent | Expected | Description |
+|------|--------------|----------|-------------|
+| `basic_no_concurrency` | `TestBasicNoConcurrency` | `Ok` | Sequential Append(4) → Read → CheckTail, all succeed |
+| `definite_failure_linearizable` | `TestBasicNoConcurrencyDefiniteFailure1` | `Ok` | Definite-failed append; subsequent read returns pre-failure tail |
+| `definite_failure_illegal` | `TestBasicNoConcurrencyDefiniteFailure2` | `Illegal` | Definite-failed append; subsequent read claims updated tail — impossible |
+| `indefinite_failure_updated_tail_ok` | `TestBasicNoConcurrencyIndefiniteFailure1` | `Ok` | Indefinite failure; next read returns updated tail (failure became durable) |
+| `indefinite_failure_original_tail_ok` | `TestBasicNoConcurrencyIndefiniteFailure2` | `Ok` | Indefinite failure; next read returns original tail (failure did not become durable) |
+| `check_jsonl_file_if_present` | — | `Ok` | Reads `S2_HISTORY_FILE` env var (or `test_data/s2_records.jsonl`); skips silently if absent |
+
+**Expected output**: **6 tests** passing (file-based test skips when no history file is present).
+
+### Checking a real S2 history
+
+**Step 1 — Collect a history** using `collect-history` from s2-verification:
+
+```bash
+# In the s2-streamstore/s2-verification repo:
+cargo run --bin collect-history -- <basin> <stream> \
+  --num-concurrent-clients 5 --num-ops-per-client 100 --workflow regular
+# Produces: ./data/records.<timestamp>.jsonl
+```
+
+**Step 2 — Run the checker** (two options):
+
+```bash
+# Option A — via the file-based test (requires S2_HISTORY_FILE env var):
+S2_HISTORY_FILE=path/to/records.jsonl cargo test --test s2_model check_jsonl_file_if_present
+
+# Option B — via the CLI example binary:
+cargo run --example s2_checker -- path/to/records.jsonl
+# Optional timeout (seconds):
+cargo run --example s2_checker -- path/to/records.jsonl 60
+```
+
+The `s2_checker` example exits 0 if the history is linearizable, 1 otherwise.
+
+### JSONL format
+
+The parser (`parse_s2_jsonl` in `tests/s2_model.rs` and `examples/s2_checker.rs`) handles the
+mixed string/object event format emitted by `collect-history`:
+
+```jsonl
+{"event":{"Start":{"Append":{"num_records":4,"last_record_xxh3":12345,...}}},"client_id":0,"op_id":0}
+{"event":{"Finish":{"AppendSuccess":{"tail":4}}},"client_id":0,"op_id":0}
+{"event":{"Start":"Read"},"client_id":0,"op_id":1}
+{"event":{"Finish":{"ReadSuccess":{"tail":4,"xxh3":12345}}},"client_id":0,"op_id":1}
+{"event":{"Finish":"AppendDefiniteFailure"},"client_id":1,"op_id":2}
+```
+
+---
+
+## 7. Model-Based Tests (`cargo test --features quint-mbt --test quint_mbt`)
 
 **Location**: `tests/quint_mbt.rs`
 
@@ -436,9 +532,9 @@ op3: read → 2  [18, 25]
 
 ---
 
-## 7. Quint Model Checking
+## 8. Quint Model Checking
 
-### 7.1 DFS algorithm — `quint verify tla/Porcupine.qnt`
+### 8.1 DFS algorithm — `quint verify tla/Porcupine.qnt`
 
 ```bash
 quint verify tla/Porcupine.qnt --invariant safetyInvariant
@@ -448,7 +544,7 @@ Checks the six sub-invariants covering INV-HIST-01, INV-HIST-03, INV-LIN-01–04
 
 **Expected output**: `[ok] No violation found`
 
-### 7.2 Power-set construction — `quint verify tla/NondeterministicModel.qnt`
+### 8.2 Power-set construction — `quint verify tla/NondeterministicModel.qnt`
 
 ```bash
 quint verify tla/NondeterministicModel.qnt --invariant safetyInvariant
@@ -461,7 +557,7 @@ acceptance implies non-empty power-state.  Models the `NdRegister` (lossy write)
 
 ---
 
-## 8. Full Test Suites at a Glance
+## 9. Full Test Suites at a Glance
 
 ### Run everything (no Quint required)
 
@@ -469,7 +565,7 @@ acceptance implies non-empty power-state.  Models the `NdRegister` (lossy write)
 cargo test
 ```
 
-Runs all suites without feature flags: **116 tests** passing across five test targets.
+Runs all suites without feature flags: **122 tests** passing across six test targets.
 
 | Target | Command | Count |
 |--------|---------|-------|
@@ -478,6 +574,7 @@ Runs all suites without feature flags: **116 tests** passing across five test ta
 | TiPocket models | `cargo test --test tipocket` | 16 |
 | Property tests | `cargo test --test property_tests` | 18 |
 | Nondeterministic model | `cargo test --test nondeterministic` | 12 |
+| S2 stream model | `cargo test --test s2_model` | 6 |
 | Doc tests | `cargo test --doc` | 1 |
 
 rayon is an unconditional dependency; no feature flags are required for any of the above.
@@ -502,7 +599,7 @@ quint verify tla/Porcupine.qnt --invariant safetyInvariant
 
 ---
 
-## 9. Invariant Coverage Matrix
+## 10. Invariant Coverage Matrix
 
 | INV-* | Name | Unit tests | Property tests | Quint invariant | MBT |
 |-------|------|------------|----------------|-----------------|-----|
