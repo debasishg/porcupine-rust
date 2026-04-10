@@ -1,23 +1,41 @@
+// Production backing: SmallVec<[u64; 4]> gives zero heap allocation for ≤256 ops.
+// Verify backing:     Vec<u64> — no external-crate dependency for Charon extraction.
+#[cfg(not(feature = "verify"))]
 use smallvec::SmallVec;
 
-/// Compact bitset backed by a `SmallVec<[u64; 4]>`.
+/// Compact bitset for tracking linearized operations and as a DFS cache key.
 ///
-/// Bit layout: bits 0–63 in `data[0]`, bits 64–127 in `data[1]`, etc.
+/// Bit layout: bits 0–63 in chunk 0, bits 64–127 in chunk 1, etc.
 /// Mirrors `bitset.go` from the original porcupine implementation.
 ///
-/// Inline capacity of 4 covers up to 256 operations without heap allocation.
-/// Typical histories (etcd ~170 ops → 3 chunks, KV per-partition ≤50 ops → 1 chunk)
-/// fit entirely on the stack, eliminating heap allocation on every `clone()`.
+/// **Production** (`SmallVec<[u64; 4]>`): inline capacity covers up to 256 ops
+/// without heap allocation; typical etcd (~170 ops) and KV (≤50 ops/partition)
+/// histories fit entirely on the stack.
+///
+/// **Verify** (`Vec<u64>`): same semantics, no external-crate dependency,
+/// enabling clean Charon/Aeneas LLBC extraction (`--features verify`).
+#[cfg(not(feature = "verify"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bitset(SmallVec<[u64; 4]>);
+
+#[cfg(feature = "verify")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bitset(Vec<u64>);
 
 impl Bitset {
     /// Allocate a bitset large enough to hold `n` bits, all initially zero.
     pub fn new(n: usize) -> Self {
         let chunks = n.div_ceil(64);
-        let mut data: SmallVec<[u64; 4]> = SmallVec::new();
-        data.resize(chunks, 0u64);
-        Bitset(data)
+        #[cfg(not(feature = "verify"))]
+        {
+            let mut data: SmallVec<[u64; 4]> = SmallVec::new();
+            data.resize(chunks, 0u64);
+            Bitset(data)
+        }
+        #[cfg(feature = "verify")]
+        {
+            Bitset(vec![0u64; chunks])
+        }
     }
 
     fn index(pos: usize) -> (usize, usize) {

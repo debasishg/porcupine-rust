@@ -1,0 +1,14 @@
+# Charon requires a pinned nightly toolchain that matches its own rustc driver.
+#
+# IMPORTANT: Before running `charon`, check the exact nightly Charon requires:
+#
+#   curl -s https://raw.githubusercontent.com/AeneasVerif/charon/main/rust-toolchain \
+#     | grep channel
+#
+# Then update the channel below to match. The date here is a known-good starting
+# point as of the time this file was written; it may need to be bumped.
+#
+# The main porcupine crate is NOT affected — it keeps its own stable toolchain.
+[toolchain]
+channel = "nightly-2025-03-22"
+components = ["rustc", "cargo", "rust-src", "rustfmt", "clippy"]

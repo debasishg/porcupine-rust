@@ -1,0 +1,11 @@
+[package]
+name = "porcupine-verify"
+version = "0.1.0"
+edition = "2024"
+description = "Toolchain anchor and Lean 4 proof directory for Charon/Aeneas extraction"
+publish = false
+
+# No source code, no dependencies.
+# Charon is run directly on the main `porcupine` crate with --features verify.
+# See verify/src/lib.rs for the full extraction workflow.
+[dependencies]
