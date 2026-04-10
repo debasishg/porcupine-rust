@@ -1,3 +1,7 @@
+[workspace]
+members = ["verify"]
+resolver = "2"
+
 [package]
 name = "porcupine"
 version = "0.1.0"
@@ -12,6 +16,18 @@ categories = ["development-tools::testing"]
 # Enable model-based testing via quint-connect trace replay.
 # Requires the `quint-connect` CLI to be installed.
 quint-mbt = []
+
+# Charon/Aeneas extraction target.
+#
+# Swaps SmallVec → Vec<u64> in Bitset and FxHashMap → std::collections::HashMap
+# in the DFS cache, replacing all external-crate types with std equivalents so
+# Charon can extract clean LLBC.  Concurrency infrastructure (rayon, AtomicBool,
+# Mutex, Condvar) is compiled out entirely under this feature.
+#
+# ONLY for Charon extraction — do not use in production builds or tests.
+#
+#   charon --crate porcupine --features verify --dest verify/llbc/
+verify = []
 
 [dependencies]
 rayon = "1"

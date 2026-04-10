@@ -15,12 +15,25 @@
 //     - Cache prunes duplicate (bitset, state) branches (INV-LIN-04).
 //  6. Return Ok / Illegal.
 
+// Concurrency and performance imports — compiled out under `--features verify`
+// so Charon sees only pure-Rust code.
+#[cfg(not(feature = "verify"))]
 use rayon::prelude::*;
+#[cfg(not(feature = "verify"))]
 use rustc_hash::FxHashMap;
+#[cfg(not(feature = "verify"))]
 use smallvec::SmallVec;
+#[cfg(not(feature = "verify"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(feature = "verify"))]
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(not(feature = "verify"))]
 use std::time::Duration;
+
+// Verify mode: use std::collections::HashMap in place of FxHashMap.
+// The API is identical for all operations the DFS uses (.get, .entry, .or_default).
+#[cfg(feature = "verify")]
+use std::collections::HashMap as FxHashMap;
 
 use crate::bitset::Bitset;
 use crate::invariants::{
@@ -267,6 +280,41 @@ impl<I, O> NodeArena<I, O> {
 }
 
 // ---------------------------------------------------------------------------
+// KillSwitch — abstracts AtomicBool (production) and bool (verify)
+// ---------------------------------------------------------------------------
+
+/// Trait over the kill signal passed into [`check_single`].
+///
+/// In production, the implementor is [`std::sync::atomic::AtomicBool`] (shared
+/// across rayon threads via `Arc`).  Under `--features verify` the implementor
+/// is plain `bool`, which Charon can extract without any atomic-memory reasoning.
+trait KillSwitch {
+    fn is_killed(&self) -> bool;
+}
+
+impl KillSwitch for bool {
+    fn is_killed(&self) -> bool {
+        *self
+    }
+}
+
+#[cfg(not(feature = "verify"))]
+impl KillSwitch for AtomicBool {
+    fn is_killed(&self) -> bool {
+        self.load(Ordering::Relaxed)
+    }
+}
+
+// Arc<AtomicBool> is what check_parallel holds; implement here so call-sites
+// can pass `&kill` directly without an explicit deref.
+#[cfg(not(feature = "verify"))]
+impl KillSwitch for Arc<AtomicBool> {
+    fn is_killed(&self) -> bool {
+        self.load(Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DFS cache
 // ---------------------------------------------------------------------------
 
@@ -275,9 +323,16 @@ struct CacheEntry<S> {
     state: S,
 }
 
+// Cache bucket type: SmallVec in production (stack-inline for 0–1 collisions),
+// Vec in verify mode (no external-crate dependency for Charon).
+#[cfg(not(feature = "verify"))]
+type CacheMap<S> = FxHashMap<u64, SmallVec<[CacheEntry<S>; 2]>>;
+#[cfg(feature = "verify")]
+type CacheMap<S> = FxHashMap<u64, Vec<CacheEntry<S>>>;
+
 #[inline]
 fn cache_contains<S: PartialEq>(
-    cache: &FxHashMap<u64, SmallVec<[CacheEntry<S>; 2]>>,
+    cache: &CacheMap<S>,
     hash: u64,
     bitset: &Bitset,
     state: &S,
@@ -305,10 +360,10 @@ struct CallFrame<S> {
 // check_single — the core DFS
 // ---------------------------------------------------------------------------
 
-fn check_single<M: Model>(
+fn check_single<M: Model, K: KillSwitch>(
     model: &M,
     entries: Vec<Entry<M::Input, M::Output>>,
-    kill: &AtomicBool,
+    kill: &K,
 ) -> bool {
     if entries.is_empty() {
         return true;
@@ -317,14 +372,14 @@ fn check_single<M: Model>(
     let n_ops = entries.len() / 2; // number of operations
     let mut arena = NodeArena::from_entries(entries);
     let mut linearized = Bitset::new(n_ops);
-    let mut cache: FxHashMap<u64, SmallVec<[CacheEntry<M::State>; 2]>> = FxHashMap::default();
+    let mut cache: CacheMap<M::State> = FxHashMap::default();
     let mut calls: Vec<CallFrame<M::State>> = Vec::new();
     let mut state = model.init();
 
     let mut cursor = arena.head_next();
 
     loop {
-        if kill.load(Ordering::Relaxed) {
+        if kill.is_killed() {
             return false;
         }
 
@@ -362,7 +417,7 @@ fn check_single<M: Model>(
                                 let old_state = std::mem::replace(&mut state, next_state);
                                 cache
                                     .entry(h)
-                                    .or_insert_with(SmallVec::new)
+                                    .or_default()
                                     .push(CacheEntry {
                                         linearized: new_linearized,
                                         state: state.clone(), // state == next_state
@@ -417,6 +472,7 @@ fn check_single<M: Model>(
 /// and proves non-linearizability (as opposed to being killed mid-search by a
 /// timeout).  This lets `to_check_result` give `Illegal` priority over `Unknown`,
 /// matching Go's `checkParallel` semantics.
+#[cfg(not(feature = "verify"))]
 fn check_parallel<M>(
     model: &M,
     mut partitions: Vec<Vec<Entry<M::Input, M::Output>>>,
@@ -511,6 +567,7 @@ where
 // Timeout infrastructure
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "verify"))]
 /// Handle returned by [`spawn_timer`].
 ///
 /// Holds both the read-side flag (`timed_out`, written by the timer thread and
@@ -521,6 +578,7 @@ struct TimerHandle {
     cancel: Arc<(Mutex<bool>, Condvar)>,
 }
 
+#[cfg(not(feature = "verify"))]
 impl TimerHandle {
     /// Wake the timer thread immediately so it exits without sleeping the full
     /// duration.  Safe to call more than once (subsequent calls are no-ops).
@@ -531,6 +589,7 @@ impl TimerHandle {
     }
 }
 
+#[cfg(not(feature = "verify"))]
 /// Spawns a background timer thread that sets `kill` (and `timed_out`) after
 /// `duration`, unless [`TimerHandle::cancel`] is called first.
 ///
@@ -555,6 +614,7 @@ fn spawn_timer(kill: &Arc<AtomicBool>, duration: Duration) -> TimerHandle {
     TimerHandle { timed_out, cancel }
 }
 
+#[cfg(not(feature = "verify"))]
 /// Translate `(ok, timed_out, definitive_illegal)` into a [`CheckResult`].
 ///
 /// Priority (matches Go's `checkParallel`):
@@ -581,6 +641,7 @@ fn to_check_result(
 // Public entry points
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "verify"))]
 /// Check an operation-based history for linearizability.
 ///
 /// `timeout` bounds the search: if the DFS has not finished within the given
@@ -634,6 +695,7 @@ where
     to_check_result(ok, &timed_out, &definitive_illegal)
 }
 
+#[cfg(not(feature = "verify"))]
 /// Check an event-based history for linearizability.
 ///
 /// `timeout` works identically to [`check_operations`]: `None` means unbounded.
