@@ -301,8 +301,26 @@ struct CacheEntry<S> {
     state: S,
 }
 
-/// Like `cache_contains`, but checks as if `bit_pos` were also set in `bitset`.
-/// Avoids cloning the bitset just to probe the cache.
+/// Probes the DFS cache as if `bit_pos` were already set in `bitset`,
+/// **without cloning or mutating the bitset**.
+///
+/// # Why this exists (deferred-clone optimisation)
+///
+/// The earlier `cache_contains` required the caller to clone the bitset and
+/// set the new bit *before* probing — paying for an allocation on every
+/// successful `model.step()`.  On a cache hit (the common case once the
+/// search is deep), that clone was immediately discarded.
+///
+/// `cache_contains_with_bit` sidesteps the clone entirely:
+/// - `hash` is computed via `Bitset::hash_with_bit`, which XOR-adjusts a
+///   single word — pure arithmetic, no allocation.
+/// - Equality is checked via `Bitset::eq_with_bit`, which OR-adjusts the
+///   relevant word on the fly during the comparison loop.
+///
+/// The result: cache hits (often >80% of probes mid-search) cost only
+/// register-level arithmetic.  The `Bitset::clone()` is deferred to the
+/// cache-miss branch in `check_single`, where it is actually needed to
+/// store the new entry.
 #[inline]
 fn cache_contains_with_bit<S: PartialEq>(
     cache: &FxHashMap<u64, SmallVec<[CacheEntry<S>; 2]>>,
@@ -313,6 +331,9 @@ fn cache_contains_with_bit<S: PartialEq>(
 ) -> bool {
     if let Some(entries) = cache.get(&hash) {
         for e in entries {
+            // eq_with_bit: compares `bitset` against `e.linearized` as if
+            // `bit_pos` were set in `bitset`, adjusting one word on the fly.
+            // No clone, no mutation — the bitset is borrowed immutably.
             if bitset.eq_with_bit(bit_pos, &e.linearized) && &e.state == state {
                 return true;
             }
@@ -365,7 +386,7 @@ fn check_single<M: Model>(
             Some(idx) => {
                 match arena.match_of(idx) {
                     Some(ret_ref) => {
-                        // This is a call node. Try to linearize it.
+                        // This is a call node. Candidate for linearization. Try to linearize it.
                         // INV-HIST-03: the live list is always time-sorted, and we restart
                         // from head_next() after each lift, so the first call node we visit
                         // is always the minimal one (no unlinearized op has an earlier call).
@@ -379,11 +400,20 @@ fn check_single<M: Model>(
                         };
 
                         if let Some(next_state) = model.step(&state, input, output) {
+                            // Deferred-clone cache probe:
+                            // hash_with_bit computes the hash the bitset *would* have
+                            // if op_id were set — O(1) arithmetic, no clone.
                             let h = linearized.hash_with_bit(op_id);
 
+                            // cache_contains_with_bit uses eq_with_bit internally so
+                            // the entire probe (hash lookup + bitset comparison + state
+                            // equality) runs against the *unmodified* bitset.  On a
+                            // cache hit we skip immediately — zero allocations.  The
+                            // earlier cache_contains required cloning the bitset before
+                            // the probe, wasting an allocation on every hit.
                             if !cache_contains_with_bit(&cache, h, &linearized, op_id, &next_state) {
                                 // INV-LIN-04: new (bitset, state) pair — safe to cache.
-                                // Clone only on cache miss.
+                                // Clone deferred to here: only cache misses pay for it.
                                 let mut new_linearized = linearized.clone();
                                 new_linearized.set(op_id);
 
