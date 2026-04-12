@@ -139,10 +139,10 @@ fn convert_entries<I: Clone, O: Clone>(events: &[Event<I, O>]) -> Vec<Entry<I, O
 // `value` is `None` only for the sentinel; always `Some` for real nodes.
 struct Node<I, O> {
     value: Option<EntryValue<I, O>>,
-    match_idx: Option<NodeRef>, // Some(ret_ref) for call nodes, None for return/sentinel
-    id: usize,
-    prev: NodeRef,              // NodeRef(0) for sentinel-owned nodes
-    next: Option<NodeRef>,      // None at end of list
+    id: u32,
+    match_idx: u32,   // NodeRef::NONE if absent
+    prev: u32,
+    next: u32,        // NodeRef::NONE if absent
 }
 
 struct NodeArena<I, O> {
@@ -151,11 +151,18 @@ struct NodeArena<I, O> {
 
 /// Typed index into a [`NodeArena`]. The sentinel HEAD is always `NodeRef(0)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct NodeRef(usize);
+struct NodeRef(u32);
 
 impl NodeRef {
+    const NONE: u32 = u32::MAX;
+
     #[inline]
     fn get(self) -> usize {
+        self.0 as usize
+    }
+
+    #[inline]
+    fn raw(self) -> u32 {
         self.0
     }
 }
@@ -169,10 +176,10 @@ impl<I, O> NodeArena<I, O> {
         // Sentinel at index 0 — value is None (never accessed in DFS).
         arena_nodes.push(Node {
             value: None,
-            match_idx: None,
-            id: usize::MAX,
-            prev: NodeRef(0),
-            next: None,
+            match_idx: NodeRef::NONE,
+            id: NodeRef::NONE,
+            prev: 0,
+            next: NodeRef::NONE,
         });
 
         // Track which node ref holds the return for each operation id.
@@ -180,37 +187,37 @@ impl<I, O> NodeArena<I, O> {
 
         // Allocate a slot for each entry.
         for (i, entry) in entries.into_iter().enumerate() {
-            let node_ref = NodeRef(i + 1); // 1-indexed
+            let node_ref = NodeRef((i + 1) as u32); // 1-indexed
             if entry.value.is_return() {
                 return_idx.insert(entry.id, node_ref);
             }
             arena_nodes.push(Node {
                 value: Some(entry.value),
-                match_idx: None, // filled in next pass
-                id: entry.id,
-                prev: NodeRef(0),
-                next: None,
+                match_idx: NodeRef::NONE, // filled in next pass
+                id: entry.id as u32,
+                prev: 0,
+                next: NodeRef::NONE,
             });
         }
 
         // Fill match_idx for call nodes.
         for node in arena_nodes.iter_mut().skip(1) {
             if node.value.as_ref().is_some_and(|v| v.is_call()) {
-                let op_id = node.id;
+                let op_id = node.id as usize;
                 if let Some(&ret_ref) = return_idx.get(&op_id) {
-                    node.match_idx = Some(ret_ref);
+                    node.match_idx = ret_ref.raw();
                 }
             }
         }
 
         // Link nodes in order: sentinel → 1 → 2 → … → n
         for (i, node) in arena_nodes.iter_mut().enumerate().skip(1) {
-            node.prev = NodeRef(i - 1);
+            node.prev = (i - 1) as u32;
             if i < n {
-                node.next = Some(NodeRef(i + 1));
+                node.next = (i + 1) as u32;
             }
         }
-        arena_nodes[0].next = if n > 0 { Some(NodeRef(1)) } else { None };
+        arena_nodes[0].next = if n > 0 { 1 } else { NodeRef::NONE };
 
         NodeArena { nodes: arena_nodes }
     }
@@ -218,50 +225,69 @@ impl<I, O> NodeArena<I, O> {
     /// Index of the first live node after sentinel HEAD.
     #[inline]
     fn head_next(&self) -> Option<NodeRef> {
-        self.nodes[0].next
+        let n = self.nodes[0].next;
+        if n == NodeRef::NONE { None } else { Some(NodeRef(n)) }
+    }
+
+    /// Next node after `r`, or `None` if at end.
+    #[inline]
+    fn next_of(&self, r: NodeRef) -> Option<NodeRef> {
+        let n = self.nodes[r.get()].next;
+        if n == NodeRef::NONE { None } else { Some(NodeRef(n)) }
+    }
+
+    /// Match index for a call node, or `None` for return/sentinel.
+    #[inline]
+    fn match_of(&self, r: NodeRef) -> Option<NodeRef> {
+        let m = self.nodes[r.get()].match_idx;
+        if m == NodeRef::NONE { None } else { Some(NodeRef(m)) }
     }
 
     /// Remove `call_ref` and its matched return node from the live list.
     #[inline]
     fn lift(&mut self, call_ref: NodeRef) {
-        let match_ref = self.nodes[call_ref.get()].match_idx.unwrap();
+        let match_raw = self.nodes[call_ref.get()].match_idx;
+        debug_assert_ne!(match_raw, NodeRef::NONE);
+        let match_idx = match_raw as usize;
 
         // Unlink call node.
-        let call_prev = self.nodes[call_ref.get()].prev;
+        let call_prev = self.nodes[call_ref.get()].prev as usize;
         let call_next = self.nodes[call_ref.get()].next;
-        self.nodes[call_prev.get()].next = call_next;
-        if let Some(cn) = call_next {
-            self.nodes[cn.get()].prev = call_prev;
+        self.nodes[call_prev].next = call_next;
+        if call_next != NodeRef::NONE {
+            self.nodes[call_next as usize].prev = call_prev as u32;
         }
 
         // Unlink return node.
-        let ret_prev = self.nodes[match_ref.get()].prev;
-        let ret_next = self.nodes[match_ref.get()].next;
-        self.nodes[ret_prev.get()].next = ret_next;
-        if let Some(rn) = ret_next {
-            self.nodes[rn.get()].prev = ret_prev;
+        let ret_prev = self.nodes[match_idx].prev as usize;
+        let ret_next = self.nodes[match_idx].next;
+        self.nodes[ret_prev].next = ret_next;
+        if ret_next != NodeRef::NONE {
+            self.nodes[ret_next as usize].prev = ret_prev as u32;
         }
     }
 
     /// Re-insert `call_ref` and its matched return node back into the live list.
     #[inline]
     fn unlift(&mut self, call_ref: NodeRef) {
-        let match_ref = self.nodes[call_ref.get()].match_idx.unwrap();
+        let match_raw = self.nodes[call_ref.get()].match_idx;
+        debug_assert_ne!(match_raw, NodeRef::NONE);
+        let match_idx = match_raw as usize;
 
         // Re-link return node.
-        let ret_prev = self.nodes[match_ref.get()].prev;
-        let ret_next = self.nodes[match_ref.get()].next;
-        self.nodes[ret_prev.get()].next = Some(match_ref);
-        if let Some(rn) = ret_next {
-            self.nodes[rn.get()].prev = match_ref;
+        let ret_prev = self.nodes[match_idx].prev as usize;
+        let ret_next = self.nodes[match_idx].next;
+        self.nodes[ret_prev].next = match_raw;
+        if ret_next != NodeRef::NONE {
+            self.nodes[ret_next as usize].prev = match_raw;
         }
 
         // Re-link call node.
-        let call_prev = self.nodes[call_ref.get()].prev;
+        let call_prev = self.nodes[call_ref.get()].prev as usize;
         let call_next = self.nodes[call_ref.get()].next;
-        self.nodes[call_prev.get()].next = Some(call_ref);
-        if let Some(cn) = call_next {
-            self.nodes[cn.get()].prev = call_ref;
+        self.nodes[call_prev].next = call_ref.raw();
+        if call_next != NodeRef::NONE {
+            self.nodes[call_next as usize].prev = call_ref.raw();
         }
     }
 }
@@ -275,16 +301,19 @@ struct CacheEntry<S> {
     state: S,
 }
 
+/// Like `cache_contains`, but checks as if `bit_pos` were also set in `bitset`.
+/// Avoids cloning the bitset just to probe the cache.
 #[inline]
-fn cache_contains<S: PartialEq>(
+fn cache_contains_with_bit<S: PartialEq>(
     cache: &FxHashMap<u64, SmallVec<[CacheEntry<S>; 2]>>,
     hash: u64,
     bitset: &Bitset,
+    bit_pos: usize,
     state: &S,
 ) -> bool {
     if let Some(entries) = cache.get(&hash) {
         for e in entries {
-            if e.linearized == *bitset && &e.state == state {
+            if bitset.eq_with_bit(bit_pos, &e.linearized) && &e.state == state {
                 return true;
             }
         }
@@ -334,13 +363,13 @@ fn check_single<M: Model>(
                 return true;
             }
             Some(idx) => {
-                match arena.nodes[idx.get()].match_idx {
+                match arena.match_of(idx) {
                     Some(ret_ref) => {
                         // This is a call node. Try to linearize it.
                         // INV-HIST-03: the live list is always time-sorted, and we restart
                         // from head_next() after each lift, so the first call node we visit
                         // is always the minimal one (no unlinearized op has an earlier call).
-                        let op_id = arena.nodes[idx.get()].id;
+                        let op_id = arena.nodes[idx.get()].id as usize;
                         let (input, output) = match (
                             arena.nodes[idx.get()].value.as_ref().unwrap(),
                             arena.nodes[ret_ref.get()].value.as_ref().unwrap(),
@@ -350,12 +379,14 @@ fn check_single<M: Model>(
                         };
 
                         if let Some(next_state) = model.step(&state, input, output) {
-                            let mut new_linearized = linearized.clone();
-                            new_linearized.set(op_id);
-                            let h = new_linearized.hash();
+                            let h = linearized.hash_with_bit(op_id);
 
-                            if !cache_contains(&cache, h, &new_linearized, &next_state) {
+                            if !cache_contains_with_bit(&cache, h, &linearized, op_id, &next_state) {
                                 // INV-LIN-04: new (bitset, state) pair — safe to cache.
+                                // Clone only on cache miss.
+                                let mut new_linearized = linearized.clone();
+                                new_linearized.set(op_id);
+
                                 // Move old state onto the backtrack stack (no clone), then
                                 // replace current state with next_state and clone once for
                                 // the cache entry — halves state clone count per step.
@@ -376,11 +407,11 @@ fn check_single<M: Model>(
                                 cursor = arena.head_next();
                             } else {
                                 // Already explored this (bitset, state) — skip.
-                                cursor = arena.nodes[idx.get()].next;
+                                cursor = arena.next_of(idx);
                             }
                         } else {
                             // Model rejected this linearization point — try next.
-                            cursor = arena.nodes[idx.get()].next;
+                            cursor = arena.next_of(idx);
                         }
                     }
                     None => {
@@ -390,12 +421,12 @@ fn check_single<M: Model>(
                             return false;
                         }
                         let frame = calls.pop().unwrap();
-                        let call_op_id = arena.nodes[frame.node_ref.get()].id;
+                        let call_op_id = arena.nodes[frame.node_ref.get()].id as usize;
                         state = frame.state;
                         linearized.clear(call_op_id);
                         arena.unlift(frame.node_ref);
                         // Advance past the restored call node.
-                        cursor = arena.nodes[frame.node_ref.get()].next;
+                        cursor = arena.next_of(frame.node_ref);
                     }
                 }
             }
@@ -957,15 +988,15 @@ mod tests {
 
         arena.lift(NodeRef(1)); // remove nodes 1 and 4 → list: 0 → 2 → 3
         assert_eq!(arena.head_next(), Some(NodeRef(2)));
-        assert_eq!(arena.nodes[2].next, Some(NodeRef(3)));
-        assert_eq!(arena.nodes[3].next, None);
+        assert_eq!(arena.nodes[2].next, 3);
+        assert_eq!(arena.nodes[3].next, NodeRef::NONE);
 
         arena.unlift(NodeRef(1)); // full list restored: 0 → 1 → 2 → 3 → 4
         assert_eq!(arena.head_next(), Some(NodeRef(1)));
-        assert_eq!(arena.nodes[1].next, Some(NodeRef(2)));
-        assert_eq!(arena.nodes[2].next, Some(NodeRef(3)));
-        assert_eq!(arena.nodes[3].next, Some(NodeRef(4)));
-        assert_eq!(arena.nodes[4].next, None);
+        assert_eq!(arena.nodes[1].next, 2);
+        assert_eq!(arena.nodes[2].next, 3);
+        assert_eq!(arena.nodes[3].next, 4);
+        assert_eq!(arena.nodes[4].next, NodeRef::NONE);
     }
 
     #[test]
@@ -983,19 +1014,19 @@ mod tests {
         arena.lift(NodeRef(1)); // remove 1,5 → list: 0→2→3→4→6
         arena.lift(NodeRef(2)); // remove 2,3 → list: 0→4→6
         assert_eq!(arena.head_next(), Some(NodeRef(4)));
-        assert_eq!(arena.nodes[4].next, Some(NodeRef(6)));
+        assert_eq!(arena.nodes[4].next, 6);
 
         arena.unlift(NodeRef(2)); // restore 2,3 → list: 0→2→3→4→6
         assert_eq!(arena.head_next(), Some(NodeRef(2)));
-        assert_eq!(arena.nodes[2].next, Some(NodeRef(3)));
-        assert_eq!(arena.nodes[3].next, Some(NodeRef(4)));
+        assert_eq!(arena.nodes[2].next, 3);
+        assert_eq!(arena.nodes[3].next, 4);
 
         arena.unlift(NodeRef(1)); // restore 1,5 → full list: 0→1→2→3→4→5→6
         assert_eq!(arena.head_next(), Some(NodeRef(1)));
-        assert_eq!(arena.nodes[1].next, Some(NodeRef(2)));
-        assert_eq!(arena.nodes[4].next, Some(NodeRef(5)));
-        assert_eq!(arena.nodes[5].next, Some(NodeRef(6)));
-        assert_eq!(arena.nodes[6].next, None);
+        assert_eq!(arena.nodes[1].next, 2);
+        assert_eq!(arena.nodes[4].next, 5);
+        assert_eq!(arena.nodes[5].next, 6);
+        assert_eq!(arena.nodes[6].next, NodeRef::NONE);
     }
 
     // -----------------------------------------------------------------------

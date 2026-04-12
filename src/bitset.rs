@@ -50,6 +50,34 @@ impl Bitset {
         }
         h
     }
+
+    /// Compute the hash that `self` would have if bit `pos` were also set.
+    /// Does **not** mutate `self`. The caller must guarantee `pos` is currently clear.
+    #[inline]
+    pub fn hash_with_bit(&self, pos: usize) -> u64 {
+        let (major, minor) = Self::index(pos);
+        let old_word = self.0[major];
+        let new_word = old_word | (1u64 << minor);
+        // popcnt increases by 1; XOR contribution of chunk `major` changes.
+        self.hash() ^ old_word ^ new_word ^ 1
+    }
+
+    /// Check equality as if bit `pos` were set in `self`.
+    /// Does **not** mutate `self`. The caller must guarantee `pos` is currently clear.
+    #[inline]
+    pub fn eq_with_bit(&self, pos: usize, other: &Bitset) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        let (major, minor) = Self::index(pos);
+        for (i, (&a, &b)) in self.0.iter().zip(other.0.iter()).enumerate() {
+            let a_adj = if i == major { a | (1u64 << minor) } else { a };
+            if a_adj != b {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]
