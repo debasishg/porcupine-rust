@@ -35,7 +35,7 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
 │  │                                                             │  │
 │  │  Vec<Node> with sentinel HEAD at index 0                    │  │
 │  │                                                             │  │
-│  │  Node { value, match_idx, id, prev, next }                  │  │
+│  │  Node { value, match_idx: u32, id: u32, prev: u32, next: u32 } │  │
 │  │                                                             │  │
 │  │  Sentinel ──► Node₁ ◄──► Node₂ ◄──► … ◄──► Nodeₙ          │  │
 │  │   (idx 0)    (call)  (return)                               │  │
@@ -50,12 +50,13 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
 │             │  cursor ──► walk live list           │               │
 │             │                                      │               │
 │             │  Call node?                          │               │
-│             │    model.step(state, in, out)        │               │
-│             │    ├─ None  → advance cursor         │               │
-│             │    └─ Some  → cache_contains?        │               │
-│             │               ├─ hit  → skip         │               │
-│             │               └─ miss → push frame,  │               │
-│             │                         lift, restart│               │
+│             │    model.step(state, in, out)              │               │
+│             │    ├─ None  → advance cursor               │               │
+│             │    └─ Some  → cache_contains_with_bit?     │               │
+│             │               ├─ hit  → skip               │               │
+│             │               └─ miss → clone bitset,      │               │
+│             │                         push frame,        │               │
+│             │                         lift, restart      │               │
 │             │                                      │               │
 │             │  Return node? → backtrack            │               │
 │             │    pop frame, unlift, advance        │               │
@@ -64,12 +65,12 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
 │             └──────────────┬───────────────────────┘               │
 │                            │                                       │
 │             ┌──────────────▼───────────────────────┐              │
-│             │   DFS Cache                           │              │
-│             │                                       │              │
-│             │   HashMap<u64, Vec<CacheEntry<S>>>    │              │
-│             │                                       │              │
-│             │   key   = bitset.hash()               │              │
-│             │   value = Vec<{ Bitset, State }>      │              │
+│             │   DFS Cache                                    │              │
+│             │                                                │              │
+│             │   FxHashMap<u64, SmallVec<[CacheEntry<S>; 2]>> │              │
+│             │                                                │              │
+│             │   key   = bitset.hash_with_bit(op_id)          │              │
+│             │   value = SmallVec<{ Bitset, State }>           │              │
 │             │                                       │              │
 │             │   Prunes duplicate (bitset, state)    │              │
 │             │   branches (INV-LIN-04)               │              │
@@ -106,9 +107,9 @@ A Rust port of [porcupine](https://github.com/anishathalye/porcupine), a fast li
            │                        │
            ▼                        ▼
 ┌──────────────────┐     ┌────────────────────────────────────────────────────────┐
-│   bitset.rs      │     │   model.rs                                             │
-│                  │     │                                                         │
-│  Bitset(Vec<u64>)│     │  trait Model {                                         │
+│   bitset.rs              │  │   model.rs                                             │
+│                          │  │                                                         │
+│  Bitset(SmallVec<[u64;4]>)│  │  trait Model {                                         │
 │                  │     │    type State: Clone + PartialEq;                      │
 │  set(pos)        │     │    type Input: Clone;                                  │
 │  clear(pos)      │     │    type Output: Clone;                                 │
@@ -206,7 +207,9 @@ This mirrors the `checkParallel` function in the Go original and enables dramati
 
 ### Stability vs. the Go original
 
-The Go implementation uses `goroutines` to run partition checks in parallel. This Rust port mirrors that design via the optional `parallel` Cargo feature: `check_parallel_rayon` uses `rayon::par_iter` with a shared `Arc<AtomicBool>` kill flag. The default (`check_parallel`) remains sequential so the library stays zero-dependency. The parallel path requires `M: Sync` and `M::Input/Output: Send` — weaker than the original goal of `M::State: Send`; state values are created inside the rayon closure and never cross a thread boundary.
+The Go implementation uses `goroutines` to run partition checks in parallel. This Rust port uses `rayon::par_iter` with a shared `Arc<AtomicBool>` kill flag. Parallel checking requires `M: Sync` and `M::Input/Output: Send` — weaker than `M::State: Send`; state values are created inside the rayon closure and never cross a thread boundary.
+
+A sequential fallback is used for small total work (< 2000 entries) to avoid rayon task-dispatch overhead, which dominates for tiny partitions. Etcd-style models (single partition) always take the single-partition fast path, bypassing rayon entirely.
 
 ---
 
@@ -216,7 +219,7 @@ The Go implementation uses `goroutines` to run partition checks in parallel. Thi
 
 #### Compact bitset (storage + cache locality)
 
-`Bitset(Vec<u64>)` stores one bit per operation. For `n = 64` ops (a large history), the entire bitset is a single 8-byte word — the whole linearized set fits in a register. Even for `n = 256`, it is four 64-bit words, a single cache line. Compare to `HashSet<usize>`, which allocates heap memory and involves pointer chasing.
+`Bitset(SmallVec<[u64; 4]>)` stores one bit per operation with inline capacity for up to 256 operations (4 × 64 bits) — no heap allocation for typical histories. For `n = 64` ops, the entire bitset is a single 8-byte word. Even for `n = 256`, it is four 64-bit words, a single cache line. Compare to `HashSet<usize>`, which allocates heap memory and involves pointer chasing.
 
 #### Single-allocation node arena (layout optimization)
 
@@ -231,7 +234,11 @@ The Go implementation uses `goroutines` to run partition checks in parallel. Thi
 
 #### In-place bitset mutation (no clone on backtrack)
 
-The `linearized` bitset is mutated in-place with `set(op_id)` on linearization and `clear(op_id)` on backtrack — no clone needed on the backtrack path. A clone is only made when inserting a new entry into the DFS cache (`new_linearized.clone()` on the forward path). This means the common backtrack path (pop frame, clear bit, unlift) is allocation-free.
+The `linearized` bitset is mutated in-place with `set(op_id)` on linearization and `clear(op_id)` on backtrack — no clone needed on the backtrack path. A clone is only made when inserting a new entry into the DFS cache (on the forward path, cache-miss branch only). This means the common backtrack path (pop frame, clear bit, unlift) is allocation-free.
+
+#### Deferred bitset clone with incremental hash (cache-miss only)
+
+Before probing the DFS cache, `hash_with_bit(op_id)` computes the hash the bitset *would* have if `op_id` were set — without cloning or mutating the bitset. Similarly, `eq_with_bit(op_id, &other)` compares equality as-if the bit were set, adjusting a single word on the fly. The actual `linearized.clone()` is deferred to the cache-miss branch, so cache hits (the common case in mid-DFS) avoid allocation entirely.
 
 #### `POPCNT` hardware instruction via `count_ones()`
 
@@ -261,11 +268,11 @@ The DFS walks the linked list node-by-node via `cursor = arena.nodes[idx].next`.
 
 #### Bitset equality fast-path
 
-`Bitset::equals` compares two `Vec<u64>` slices element-by-element. LLVM typically auto-vectorises this with SIMD (SSE2/AVX2), but an explicit `SIMD` implementation using `std::simd` (stabilising in Rust) would guarantee vectorisation and could be 2–4× faster for large histories (`n > 256`). Not yet implemented.
+`Bitset::eq_with_bit` compares two `SmallVec<[u64; 4]>` slices element-by-element, adjusting one word on the fly. LLVM typically auto-vectorises this with SIMD (SSE2/AVX2), but an explicit `SIMD` implementation using `std::simd` (stabilising in Rust) would guarantee vectorisation and could be 2–4× faster for large histories (`n > 256`). Not yet implemented.
 
 #### Cache eviction / bounded memory
 
-The DFS cache (`HashMap<u64, Vec<CacheEntry<S>>>`) grows unbounded for the duration of a single `check_single` call. For very long histories this could consume significant memory. A bounded LRU cache (e.g. evicting least-recently-used entries) would cap memory use at the cost of potentially re-exploring some subtrees. Not yet implemented; the Go original also uses an unbounded cache.
+The DFS cache (`FxHashMap<u64, SmallVec<[CacheEntry<S>; 2]>>`) grows unbounded for the duration of a single `check_single` call. For very long histories this could consume significant memory. A bounded LRU cache (e.g. evicting least-recently-used entries) would cap memory use at the cost of potentially re-exploring some subtrees. Not yet implemented; the Go original also uses an unbounded cache.
 
 ---
 
@@ -273,29 +280,51 @@ The DFS cache (`HashMap<u64, Vec<CacheEntry<S>>>`) grows unbounded for the durat
 
 ### Single parallel dispatch path
 
-All partition checking runs through rayon. This mirrors Go's `checkParallel`, which launches one goroutine per partition immediately. There is no sequential fallback.
+All partition checking runs through `check_parallel`, which has three modes:
+
+1. **Single partition** — bypasses rayon entirely (zero overhead).
+2. **Small total work** (< 2000 entries) — runs partitions sequentially to avoid rayon dispatch costs.
+3. **Large total work** — uses `rayon::par_iter` with partitions sorted largest-first for thread utilisation.
+
+A shared `Arc<AtomicBool>` kill flag connects all paths: as soon as one partition proves non-linearizability, the flag is set and siblings abort within microseconds.
 
 ```rust
-// check_parallel — rayon parallel iterator, kill flag shared with timer
+// check_parallel — single-partition fast path, sequential fallback, rayon parallel
+if partitions.len() == 1 {
+    let ok = check_single(model, partitions.into_iter().next().unwrap(), &kill);
+    // ...
+    return ok;
+}
+if total_entries < SEQUENTIAL_THRESHOLD {
+    for partition in partitions {
+        if kill.load(Ordering::Relaxed) { return false; }
+        let ok = check_single(model, partition, &kill);
+        // ...
+    }
+    return true;
+}
 let found_illegal = partitions.into_par_iter().any(|partition| {
-    if kill.load(Ordering::Relaxed) { return false; } // timeout or sibling Illegal
+    if kill.load(Ordering::Relaxed) { return false; }
     let ok = check_single(model, partition, &kill);
     if !ok { kill.store(true, Ordering::Relaxed); }
     !ok
 });
-!found_illegal
 ```
 
 ```rust
 // check_operations / check_events — timeout wiring
 let kill      = Arc::new(AtomicBool::new(false));
-let timed_out = timeout.map(|d| spawn_timer(&kill, d))
-                       .unwrap_or_default(); // no timer if None
-let ok = check_parallel(model, partitions, kill);
-to_check_result(ok, &timed_out) // Unknown / Ok / Illegal
+let timer     = timeout.map(|d| spawn_timer(&kill, d));
+let definitive_illegal = AtomicBool::new(false);
+let ok = check_parallel(model, partitions, kill, &definitive_illegal);
+if let Some(t) = &timer { t.cancel(); }
+to_check_result(ok, &timed_out, &definitive_illegal)
+// Unknown / Ok / Illegal
 ```
 
-`par_iter().any()` short-circuits after the first illegal partition is found. In-flight DFS loops on other rayon threads abort within microseconds via the `kill.load(Relaxed)` check at the top of each DFS iteration. The same `kill` flag is shared with the timeout timer — if the timer fires, all DFS loops also abort.
+`par_iter().any()` short-circuits after the first illegal partition is found. In-flight DFS loops on other rayon threads abort via the `kill.load(Relaxed)` check at the top of each DFS iteration. The same `kill` flag is shared with the timeout timer — if the timer fires, all DFS loops also abort.
+
+The `definitive_illegal` flag distinguishes between a partition that completed its full DFS (proving non-linearizability) and one that was killed mid-search by a timeout. This lets `to_check_result` give `Illegal` priority over `Unknown`.
 
 ### Required Send/Sync bounds
 
