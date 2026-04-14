@@ -57,6 +57,21 @@ Benchmarks are run with [Criterion.rs](https://github.com/bheisler/criterion.rs)
 
 Rust leads Go on every benchmark. The key contributors are: compact `Node` struct with `u32` indices and sentinel-based linked-list (3× smaller index overhead per node, better cache-line utilization); deferred bitset clone with incremental hash computation (clone only on cache miss, `hash_with_bit()` avoids O(chunks) scan); `FxHashMap` for the DFS cache (replacing SipHash); `SmallVec<[u64; 4]>` for the bitset (zero heap allocation for ≤ 256 operations); `SmallVec<[CacheEntry; 2]>` for the DFS cache collision list (eliminates heap allocation for the common 0–1 collision case); `Arc<str>` for KV model state (atomic refcount bump instead of `String` clone on every DFS step); a single-partition fast path that skips rayon dispatch; a sequential fallback for small inputs (< 2000 total entries); and `#[inline]` hints on the hot-path `lift`/`unlift`/`cache_contains` functions called thousands of times per history check.
 
+### Results (Apple M5 Pro)
+
+| Benchmark | Rust | Go | Speedup |
+|-----------|------|----|---------|
+| etcd — single file (sequential) | 25 µs | 90 µs | **3.6×** |
+| etcd — 102 files (sequential) | 86 ms | 267 ms | **3.1×** |
+| etcd — single file (parallel) | 18 µs | 90 µs | **5.0×** |
+| etcd — 102 files (parallel) | 45 ms | 267 ms | **5.9×** |
+| kv `c10-ok` (sequential) | 115 µs | 188 µs | **1.6×** |
+| kv `c10-bad` (sequential) | 55 µs | 93 µs | **1.7×** |
+| kv `c10-ok` (parallel) | 105 µs | 188 µs | **1.8×** |
+| kv `c10-bad` (parallel) | 46 µs | 93 µs | **2.0×** |
+
+The M5 Pro gives both languages a ~1.3–1.8× raw speedup over M1. Rust benefits more from M5's wider execution pipeline — the etcd parallel all-files benchmark improved from 3.5× → 5.9× advantage over Go. The KV partitioned benchmarks also widened their Rust-over-Go margin slightly.
+
 ## Status
 
 Complete — all core features of the [original Go implementation](https://github.com/anishathalye/porcupine) are ported. See [SKILLS.md](SKILLS.md) for the self-verified pipeline (Quint formal model, property tests, model-based tests).

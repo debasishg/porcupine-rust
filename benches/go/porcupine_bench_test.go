@@ -128,13 +128,14 @@ func parseJepsenLogBench(path string) []Operation {
 	defer f.Close()
 
 	type pending struct {
-		id    int
-		input etcdBenchInput
+		id       int
+		input    etcdBenchInput
+		callTime int64
 	}
 	pendingMap := make(map[int]pending) // process → pending call
-	var ops []Operation
 	var completedOps []Operation
 	opID := 0
+	var ts int64 // monotonic timestamp
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -151,6 +152,8 @@ func parseJepsenLogBench(path string) []Operation {
 		status := parts[1]
 		opStr := parts[2]
 		val := strings.TrimRight(parts[3], "\r\n ")
+
+		ts++
 
 		switch status {
 		case ":invoke":
@@ -170,7 +173,7 @@ func parseJepsenLogBench(path string) []Operation {
 			default:
 				continue
 			}
-			pendingMap[process] = pending{id: opID, input: inp}
+			pendingMap[process] = pending{id: opID, input: inp, callTime: ts}
 			opID++
 
 		case ":ok", ":fail":
@@ -184,6 +187,8 @@ func parseJepsenLogBench(path string) []Operation {
 				completedOps = append(completedOps, Operation{
 					Input:  p.input,
 					Output: etcdBenchOutput{unknown: true},
+					Call:   p.callTime,
+					Return: ts,
 				})
 				continue
 			}
@@ -207,17 +212,21 @@ func parseJepsenLogBench(path string) []Operation {
 			completedOps = append(completedOps, Operation{
 				Input:  p.input,
 				Output: out,
+				Call:   p.callTime,
+				Return: ts,
 			})
 		}
 	}
 	// Timed-out ops (":info") that never got a return
+	ts++
 	for _, p := range pendingMap {
 		completedOps = append(completedOps, Operation{
 			Input:  p.input,
 			Output: etcdBenchOutput{unknown: true},
+			Call:   p.callTime,
+			Return: ts,
 		})
 	}
-	_ = ops
 	return completedOps
 }
 
@@ -294,10 +303,12 @@ func parseKvLogBench(path string) []Operation {
 	}
 
 	type pendingEntry struct {
-		input kvBenchInput
+		input    kvBenchInput
+		callTime int64
 	}
 	pendingMap := make(map[int]pendingEntry)
 	var ops []Operation
+	var ts int64
 
 	for _, rawLine := range strings.Split(string(content), "\n") {
 		line := strings.TrimSpace(rawLine)
@@ -309,6 +320,8 @@ func parseKvLogBench(path string) []Operation {
 		f := kvFieldToken(line, ":f ")
 		key := kvFieldQuoted(line, ":key \"")
 		value := kvFieldValue(line)
+
+		ts++
 
 		switch typ {
 		case ":invoke":
@@ -323,13 +336,15 @@ func parseKvLogBench(path string) []Operation {
 			default:
 				panic("unknown kv op: " + f)
 			}
-			pendingMap[process] = pendingEntry{input: kvBenchInput{op: op, key: key, value: value}}
+			pendingMap[process] = pendingEntry{input: kvBenchInput{op: op, key: key, value: value}, callTime: ts}
 		case ":ok":
 			p := pendingMap[process]
 			delete(pendingMap, process)
 			ops = append(ops, Operation{
 				Input:  p.input,
 				Output: kvBenchOutput{value: value},
+				Call:   p.callTime,
+				Return: ts,
 			})
 		}
 	}

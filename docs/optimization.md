@@ -1,7 +1,7 @@
 # porcupine-rust — Optimization Catalogue
 
-> **Last updated**: 2026-04-12  
-> **Machine**: Apple M1 | **Rust**: stable | **Go**: 1.26.1
+> **Last updated**: 2026-04-15  
+> **Machines**: Apple M1, Apple M5 Pro | **Rust**: stable | **Go**: 1.26.x
 
 This document catalogues every optimization applied to `porcupine-rust`, grouped by
 theme. Each entry explains the problem, the fix, the relevant code, and the measured
@@ -650,6 +650,8 @@ short-lived histories that terminate quickly. **Reverted.**
 
 ### Final Numbers vs Go
 
+#### Apple M1
+
 | Benchmark | Initial | Final | Go | Final vs Go |
 |-----------|--------:|------:|---:|------------:|
 | etcd seq / single file | 107 µs | **38 µs** | 114 µs | **3.0× faster** |
@@ -660,6 +662,23 @@ short-lived histories that terminate quickly. **Reverted.**
 | kv c10-bad seq | 217 µs | **91 µs** | 168 µs | **1.85× faster** |
 | kv c10-ok par | 318 µs | **186 µs** | 239 µs | **1.29× faster** |
 | kv c10-bad par | 266 µs | **84 µs** | 168 µs | **2.0× faster** |
+
+#### Apple M5 Pro
+
+| Benchmark | Rust | Go | Rust vs Go |
+|-----------|-----:|---:|-----------:|
+| etcd seq / single file | **25 µs** | 90 µs | **3.6× faster** |
+| etcd seq / all 102 files | **86 ms** | 267 ms | **3.1× faster** |
+| etcd par / single file | **18 µs** | 90 µs | **5.0× faster** |
+| etcd par / all 102 files | **45 ms** | 267 ms | **5.9× faster** |
+| kv c10-ok seq | **115 µs** | 188 µs | **1.6× faster** |
+| kv c10-bad seq | **55 µs** | 93 µs | **1.7× faster** |
+| kv c10-ok par | **105 µs** | 188 µs | **1.8× faster** |
+| kv c10-bad par | **46 µs** | 93 µs | **2.0× faster** |
+
+The M5 Pro gives both languages a ~1.3–1.8× raw speedup over M1. Rust benefits
+more from M5's wider execution pipeline — the etcd parallel all-files benchmark
+improved from 3.5× → 5.9× advantage over Go.
 
 ### Total Speedup by Theme
 
@@ -672,4 +691,4 @@ short-lived histories that terminate quickly. **Reverted.**
 | Incremental hash + virtual-bit probing | 15–20% |
 | Inlining | 5–10% |
 
-Rust now beats Go on **every** benchmark, from 1.25× to 3.5× faster.
+Rust now beats Go on **every** benchmark, from 1.6× to 5.9× faster (M5 Pro).
