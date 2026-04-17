@@ -550,6 +550,42 @@ freshly allocated clone was immediately thrown away.  For histories with
 hundreds of operations and deep DFS trees, this produced millions of
 short-lived allocations that pressure the allocator and pollute CPU caches.
 
+**Concrete example.**  Suppose we are checking a history with four operations
+`{A, B, C, D}` and the DFS is deep in the search tree, having already
+linearized `{A, B}` (bits 0 and 1 set).  The DFS finds operation C callable:
+
+```text
+linearized = {A, B}
+
+── try C ──────────────────────────────────────────────────
+1. model.step(state, C) succeeds → next_state_C
+2. Clone {A, B}        → alloc SmallVec → cloned = {A, B}
+3. Set bit 2 in cloned → cloned = {A, B, C}
+4. Hash cloned         → h₁
+5. Probe cache (h₁, {A,B,C}, next_state_C)
+6. Cache HIT — already reached via order B → A → C
+   → clone DISCARDED                        ← wasted alloc
+
+── try D ──────────────────────────────────────────────────
+1. model.step(state, D) succeeds → next_state_D
+2. Clone {A, B}        → alloc SmallVec → cloned = {A, B}
+3. Set bit 3 in cloned → cloned = {A, B, D}
+4. Hash cloned         → h₂
+5. Probe cache (h₂, {A,B,D}, next_state_D)
+6. Cache HIT — already explored via B → A → D
+   → clone DISCARDED                        ← wasted alloc
+```
+
+Both probes were cache hits, yet each paid for a full `Bitset::clone()` — a
+`SmallVec` heap copy plus bookkeeping — only to immediately discard the
+result.  At depth, where the hit rate commonly exceeds 80 %, four out of
+every five clones are thrown away unused.  Over 10⁴–10⁵ DFS branches this
+amounts to tens of thousands of pointless allocations that:
+
+- **pressure the allocator** — malloc / free churn on every step,
+- **pollute CPU data caches** — freshly allocated memory evicts hot lines,
+- **do no useful work** — the clone is never stored or read again.
+
 #### The current strategy: virtual probe with `cache_contains_with_bit`
 
 The key insight is that a cache probe only needs to *read* the bitset with an

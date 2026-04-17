@@ -296,6 +296,21 @@ impl<I, O> NodeArena<I, O> {
 // DFS cache
 // ---------------------------------------------------------------------------
 
+/// DFS cache's value type: a (bitset, state) pair representing a linearization prefix and the
+/// corresponding model state.
+/// The Bitset models the set of operations that have been linearized so far in a 
+/// particular DFS path.
+
+/// Each concurrent operation in the history is assigned a numeric ID (op_id). 
+/// Setting bit i in the Bitset means "operation i has already been placed into the 
+/// linearization order." So the Bitset is essentially a compact representation of a 
+/// subset of operations.
+/// 
+/// Why a bitset and not, say, a HashSet<usize>: The set of linearized ops only needs 
+/// membership tracking and equality comparison. A bitset is far more compact 
+/// (one bit per operation, inline up to 256 ops via SmallVec<[u64; 4]>) and supports 
+/// O(1) set/test, plus cheap hashing and equality — critical since cache probes happen 
+/// on every DFS step.
 struct CacheEntry<S> {
     linearized: Bitset,
     state: S,
@@ -367,6 +382,39 @@ fn check_single<M: Model>(
     let n_ops = entries.len() / 2; // number of operations
     let mut arena = NodeArena::from_entries(entries);
     let mut linearized = Bitset::new(n_ops);
+    //
+    // DFS cache — `FxHashMap<u64, SmallVec<[CacheEntry<M::State>; 2]>>`
+    //
+    // This is a hash map from `u64` to `SmallVec<[CacheEntry<S>; 2]>`:
+    //
+    // - Key (`u64`): A precomputed hash of the `Bitset` (the set of
+    //   linearized operations).  This is computed via `Bitset::hash_with_bit`
+    //   — cheap arithmetic, no allocation.
+    //
+    // - Value (`SmallVec<[CacheEntry<S>; 2]>`): A small vector of cache
+    //   entries that share the same bitset hash.  The `SmallVec` with inline
+    //   capacity 2 means most hash buckets store their entries on the stack
+    //   without heap allocation (hash collisions on the bitset hash are rare
+    //   but possible, so it is a list).
+    //
+    // Each `CacheEntry` records a `(linearized: Bitset, state: S)` pair.
+    // The `Bitset` models the set of operations that have been linearized so
+    // far in a particular DFS path — setting bit `i` means "operation `i`
+    // has already been placed into the linearization order."  The checker
+    // prunes a DFS branch when both the linearized set and the model state
+    // match an already-explored entry (INV-LIN-04 / cache soundness).
+    //
+    // Lookup flow:
+    //   1. Hash the bitset → get the `u64` key.
+    //   2. Look up the bucket in `FxHashMap`.
+    //   3. Linear-scan the `SmallVec` comparing `(bitset, state)` pairs for
+    //      exact equality.
+    //
+    // `FxHashMap` (from the `rustc-hash` crate) is used instead of
+    // `std::HashMap` because it uses a faster, non-cryptographic hash
+    // function — appropriate here since the keys are already hashes and
+    // there is no adversarial-input concern.
+    //
     let mut cache: FxHashMap<u64, SmallVec<[CacheEntry<M::State>; 2]>> = FxHashMap::default();
     let mut calls: Vec<CallFrame<M::State>> = Vec::new();
     let mut state = model.init();
