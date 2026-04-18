@@ -602,7 +602,7 @@ The new flow:
 
 ```text
 1. model.step() succeeds → next_state
-2. hash_with_bit(op_id)                   ← O(1), no allocation
+2. hash_with_bit(op_id)                   ← O(1) (cached hash), no allocation
 3. cache_contains_with_bit(…)             ← virtual equality, no allocation
 4. Cache HIT  → skip (zero allocations)   ← the fast path stays fast
 5. Cache MISS → clone bitset, set bit, insert into cache, proceed
@@ -626,17 +626,17 @@ yielding measurable wall-clock improvements on large histories.
 ### Rust implementation (`src/bitset.rs`, `src/checker.rs`)
 
 ```rust
-// Incremental hash — no clone needed
+// Incremental hash — no clone needed, O(1) via cached hash
 pub fn hash_with_bit(&self, pos: usize) -> u64 {
     let (major, minor) = Self::index(pos);
-    let old_word = self.0[major];
+    let old_word = self.data[major];
     let new_word = old_word | (1u64 << minor);
-    self.hash() ^ old_word ^ new_word ^ 1
+    self.cached_hash ^ old_word ^ new_word ^ 1
 }
 
 // Virtual equality — no clone needed
 pub fn eq_with_bit(&self, pos: usize, other: &Bitset) -> bool {
-    for (i, (&a, &b)) in self.0.iter().zip(other.0.iter()).enumerate() {
+    for (i, (&a, &b)) in self.data.iter().zip(other.data.iter()).enumerate() {
         let a_adj = if i == major { a | (1u64 << minor) } else { a };
         if a_adj != b { return false; }
     }
@@ -661,13 +661,19 @@ linearized.
 ### Rust implementation (`src/bitset.rs`)
 
 ```rust
-pub struct Bitset(SmallVec<[u64; 4]>);
+pub struct Bitset {
+    data: SmallVec<[u64; 4]>,
+    cached_hash: u64,
+}
 ```
 
 - Inline capacity of 4 words covers up to 256 operations without heap
   allocation.  Typical histories fit entirely on the stack.
-- `set(pos)` / `clear(pos)` — single bit operation, no hashing.
-- `hash()` — XOR fold over all words, seeded with `popcnt`.
+- `set(pos)` / `clear(pos)` — single bit operation, incrementally updates the
+  cached hash.
+- `hash()` — returns the cached hash in O(1).  The hash value is equivalent to
+  an XOR fold over all words seeded with `popcnt`, but is maintained
+  incrementally by `set()` and `clear()` rather than recomputed.
 - `popcnt()` — uses `u64::count_ones()`, which compiles to a single hardware
   `POPCNT` instruction.
 
@@ -767,12 +773,36 @@ all concrete states the system could be in.  Each `step` fans out over every
 state in the current set, collects all successors, deduplicates them, and
 returns `Some(set)` if non-empty or `None` if empty.
 
+### Deduplication strategies
+
+The power-set construction must deduplicate successor states after each step.
+Two adapters are provided, trading off trait bounds against performance:
+
+| Adapter | State bounds | Dedup cost | Use when |
+|---------|-------------|------------|----------|
+| `PowerSetModel` | `PartialEq` | O(n²) linear scan | Default; works with any state type |
+| `HashedPowerSetModel` | `Eq + Hash` | O(n) via `HashSet` | State already implements `Eq + Hash` and branching factor is large |
+
+`PowerSetModel` requires only `PartialEq` on the state type — the same bound
+required by `NondeterministicModel` itself — so it works out of the box with
+any conforming model.  Its O(n²) dedup via `Vec::contains` is adequate for
+the small state sets typical of nondeterministic specifications.
+
+`HashedPowerSetModel` is an opt-in fast path for models whose state type
+already implements `Eq + Hash`.  It uses a `HashSet` for O(n) average-case
+deduplication, which matters when the branching factor is large enough for the
+quadratic scan to become a bottleneck.
+
+Both adapters delegate `partition` and `partition_events` to the inner model
+unchanged.
+
 ### Rust implementation (`src/model.rs`)
 
 ```rust
 pub struct PowerSetModel<M>(pub M);
 
-impl<M: NondeterministicModel> Model for PowerSetModel<M> {
+impl<M: NondeterministicModel> Model for PowerSetModel<M>
+where M::State: Clone + PartialEq {
     type State = Vec<M::State>;  // the power-state
 
     fn init(&self) -> Self::State { deduplicate(self.0.init()) }
@@ -786,7 +816,28 @@ impl<M: NondeterministicModel> Model for PowerSetModel<M> {
         if deduped.is_empty() { None } else { Some(deduped) }
     }
 }
+
+pub struct HashedPowerSetModel<M>(pub M);
+
+impl<M: NondeterministicModel> Model for HashedPowerSetModel<M>
+where M::State: Clone + Eq + Hash {
+    type State = Vec<M::State>;
+
+    fn init(&self) -> Self::State { deduplicate_hashed(self.0.init()) }
+
+    fn step(&self, state: &Self::State, input: &Self::Input,
+            output: &Self::Output) -> Option<Self::State> {
+        let next: Vec<_> = state.iter()
+            .flat_map(|s| self.0.step(s, input, output))
+            .collect();
+        let deduped = deduplicate_hashed(next);
+        if deduped.is_empty() { None } else { Some(deduped) }
+    }
+}
 ```
+
+`deduplicate` uses `Vec::contains` (O(n²)); `deduplicate_hashed` uses a
+`HashSet` (O(n) average).  Both preserve first-occurrence order.
 
 ---
 
