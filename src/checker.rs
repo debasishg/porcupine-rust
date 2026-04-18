@@ -24,7 +24,8 @@ use std::time::Duration;
 
 use crate::bitset::Bitset;
 use crate::invariants::{
-    assert_partition_independent, assert_well_formed, assert_well_formed_events,
+    assert_partition_covers_ops, assert_partition_events_paired, assert_well_formed,
+    assert_well_formed_events,
 };
 use crate::model::Model;
 use crate::types::{CheckResult, Event, EventKind, Operation};
@@ -87,6 +88,39 @@ fn make_entries<I: Clone, O: Clone>(ops: &[Operation<I, O>]) -> Vec<Entry<I, O>>
     entries
 }
 
+/// Build entries for a partition directly from the full history and an index
+/// list, assigning dense 0-based ids within the partition.  Avoids cloning
+/// entire sub-histories into an intermediate `Vec<Operation>`.
+fn make_entries_from_indices<I: Clone, O: Clone>(
+    history: &[Operation<I, O>],
+    indices: &[usize],
+) -> Vec<Entry<I, O>> {
+    let mut entries = Vec::with_capacity(indices.len() * 2);
+    for (local_id, &global_idx) in indices.iter().enumerate() {
+        let op = &history[global_idx];
+        entries.push(Entry {
+            id: local_id,
+            time: op.call,
+            value: EntryValue::Call(op.input.clone()),
+        });
+        entries.push(Entry {
+            id: local_id,
+            time: op.return_time,
+            value: EntryValue::Return(op.output.clone()),
+        });
+    }
+    entries.sort_by(|a, b| {
+        a.time.cmp(&b.time).then_with(|| {
+            match (&a.value, &b.value) {
+                (EntryValue::Call(_), EntryValue::Return(_)) => std::cmp::Ordering::Less,
+                (EntryValue::Return(_), EntryValue::Call(_)) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            }
+        })
+    });
+    entries
+}
+
 /// Renumber `Event` IDs to be contiguous starting at 0.
 fn renumber<I: Clone, O: Clone>(events: &[Event<I, O>]) -> Vec<Event<I, O>> {
     let mut out = Vec::with_capacity(events.len());
@@ -127,6 +161,40 @@ fn convert_entries<I: Clone, O: Clone>(events: &[Event<I, O>]) -> Vec<Entry<I, O
             }
         })
         .collect()
+}
+
+/// Build entries for a partition directly from the full event history and an
+/// index list, renumbering ids and converting in a single pass.  Avoids
+/// cloning entire sub-event-lists into intermediate `Vec<Event>` allocations.
+fn convert_entries_from_indices<I: Clone, O: Clone>(
+    history: &[Event<I, O>],
+    indices: &[usize],
+) -> Vec<Entry<I, O>> {
+    let mut id_map: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut next_id = 0u64;
+    let mut entries = Vec::with_capacity(indices.len());
+    for (local_time, &global_idx) in indices.iter().enumerate() {
+        let ev = &history[global_idx];
+        let new_id = *id_map.entry(ev.id).or_insert_with(|| {
+            let id = next_id;
+            next_id += 1;
+            id
+        });
+        let value = match ev.kind {
+            EventKind::Call => {
+                EntryValue::Call(ev.input.clone().expect("Call event must have input"))
+            }
+            EventKind::Return => {
+                EntryValue::Return(ev.output.clone().expect("Return event must have output"))
+            }
+        };
+        entries.push(Entry {
+            id: new_id as usize,
+            time: local_time as u64,
+            value,
+        });
+    }
+    entries
 }
 
 // ---------------------------------------------------------------------------
@@ -182,14 +250,15 @@ impl<I, O> NodeArena<I, O> {
             next: NodeRef::NONE,
         });
 
-        // Track which node ref holds the return for each operation id.
-        let mut return_idx: FxHashMap<usize, NodeRef> = FxHashMap::default();
+        // Op ids are dense 0..n_ops, so a Vec lookup is faster than a HashMap.
+        let n_ops = n / 2;
+        let mut return_idx: Vec<u32> = vec![NodeRef::NONE; n_ops];
 
         // Allocate a slot for each entry.
         for (i, entry) in entries.into_iter().enumerate() {
             let node_ref = NodeRef((i + 1) as u32); // 1-indexed
             if entry.value.is_return() {
-                return_idx.insert(entry.id, node_ref);
+                return_idx[entry.id] = node_ref.raw();
             }
             arena_nodes.push(Node {
                 value: Some(entry.value),
@@ -204,8 +273,9 @@ impl<I, O> NodeArena<I, O> {
         for node in arena_nodes.iter_mut().skip(1) {
             if node.value.as_ref().is_some_and(|v| v.is_call()) {
                 let op_id = node.id as usize;
-                if let Some(&ret_ref) = return_idx.get(&op_id) {
-                    node.match_idx = ret_ref.raw();
+                let ret_ref = return_idx[op_id];
+                if ret_ref != NodeRef::NONE {
+                    node.match_idx = ret_ref;
                 }
             }
         }
@@ -714,18 +784,11 @@ where
 
     let partitions: Vec<Vec<Entry<M::Input, M::Output>>> =
         if let Some(parts) = model.partition(history) {
-            // INV-LIN-03
-            assert_partition_independent!(parts);
+            // INV-LIN-03: no duplicates, full coverage, bounds check
+            assert_partition_covers_ops!(parts, history.len());
             parts
                 .iter()
-                .map(|indices| {
-                    make_entries(
-                        &indices
-                            .iter()
-                            .map(|&i| history[i].clone())
-                            .collect::<Vec<_>>(),
-                    )
-                })
+                .map(|indices| make_entries_from_indices(history, indices))
                 .collect()
         } else {
             vec![make_entries(history)]
@@ -765,14 +828,11 @@ where
 
     let partitions: Vec<Vec<Entry<M::Input, M::Output>>> =
         if let Some(parts) = model.partition_events(history) {
-            assert_partition_independent!(parts);
+            // INV-LIN-03: no duplicates, full coverage, bounds, paired events
+            assert_partition_events_paired!(parts, history);
             parts
                 .iter()
-                .map(|indices| {
-                    let sub: Vec<Event<M::Input, M::Output>> =
-                        indices.iter().map(|&i| history[i].clone()).collect();
-                    convert_entries(&renumber(&sub))
-                })
+                .map(|indices| convert_entries_from_indices(history, indices))
                 .collect()
         } else {
             vec![convert_entries(&renumber(history))]

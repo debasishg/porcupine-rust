@@ -37,12 +37,14 @@ impl Bitset {
     }
 
     /// Count the number of set bits.
-    pub fn popcnt(&self) -> usize {
+    #[allow(dead_code)]
+    pub(crate) fn popcnt(&self) -> usize {
         self.0.iter().map(|v| v.count_ones() as usize).sum()
     }
 
-    /// Hash of the bitset. Matches the Go implementation:
-    /// `hash = popcnt; for each chunk: hash ^= chunk`.
+    /// Hash of the bitset: `popcnt XOR chunk[0] XOR chunk[1] XOR ...`.
+    /// Matches the Go implementation.
+    #[inline]
     pub fn hash(&self) -> u64 {
         let mut h = self.popcnt() as u64;
         for &v in &self.0 {
@@ -58,7 +60,7 @@ impl Bitset {
         let (major, minor) = Self::index(pos);
         let old_word = self.0[major];
         let new_word = old_word | (1u64 << minor);
-        // popcnt increases by 1; XOR contribution of chunk `major` changes.
+        // Derive from current hash: popcnt increases by 1, chunk `major` changes.
         self.hash() ^ old_word ^ new_word ^ 1
     }
 

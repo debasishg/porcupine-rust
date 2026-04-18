@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::hash::Hash;
+
 use crate::types::{Event, Operation};
 
 /// A sequential specification that a concurrent history is checked against.
@@ -180,10 +183,110 @@ where
 }
 
 /// Remove duplicate states from `states`, preserving first-occurrence order.
+///
+/// This is O(n²) via linear scan, which is adequate for the small state sets
+/// typical of nondeterministic models. If the power-set model is used with
+/// large branching factors, callers should consider a custom adapter with
+/// `Hash + Eq` bounds for O(n) deduplication.
 fn deduplicate<S: PartialEq>(states: Vec<S>) -> Vec<S> {
     let mut out: Vec<S> = Vec::with_capacity(states.len());
     for s in states {
         if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Like [`PowerSetModel`], but requires `Eq + Hash` on the state type for O(n)
+/// deduplication via `HashSet`.
+///
+/// Use this adapter when your nondeterministic model's state type already
+/// implements `Eq + Hash` and the branching factor is large enough that the
+/// O(n²) dedup in [`PowerSetModel`] becomes a bottleneck.
+///
+/// # Example
+///
+/// ```rust
+/// use porcupine::model::{NondeterministicModel, HashedPowerSetModel};
+/// use porcupine::checker::check_operations;
+/// use porcupine::types::{CheckResult, Operation};
+///
+/// struct MyNdModel;
+///
+/// impl NondeterministicModel for MyNdModel {
+///     type State = u32;
+///     type Input  = ();
+///     type Output = ();
+///
+///     fn init(&self) -> Vec<u32> { vec![0] }
+///
+///     fn step(&self, state: &u32, _input: &(), _output: &()) -> Vec<u32> {
+///         vec![state + 1, state + 2]
+///     }
+/// }
+///
+/// let model = HashedPowerSetModel(MyNdModel);
+/// let history: Vec<Operation<(), ()>> = vec![];
+/// let result = check_operations(&model, &history, None);
+/// assert_eq!(result, CheckResult::Ok);
+/// ```
+pub struct HashedPowerSetModel<M>(pub M);
+
+impl<M> Model for HashedPowerSetModel<M>
+where
+    M: NondeterministicModel,
+    M::State: Clone + Eq + Hash,
+    M::Input: Clone,
+    M::Output: Clone,
+{
+    type State = Vec<M::State>;
+    type Input = M::Input;
+    type Output = M::Output;
+
+    fn init(&self) -> Self::State {
+        deduplicate_hashed(self.0.init())
+    }
+
+    fn step(
+        &self,
+        state: &Self::State,
+        input: &Self::Input,
+        output: &Self::Output,
+    ) -> Option<Self::State> {
+        let mut successors: Vec<M::State> = Vec::new();
+        for s in state {
+            successors.extend(self.0.step(s, input, output));
+        }
+        let deduped = deduplicate_hashed(successors);
+        if deduped.is_empty() {
+            None
+        } else {
+            Some(deduped)
+        }
+    }
+
+    fn partition(
+        &self,
+        history: &[Operation<Self::Input, Self::Output>],
+    ) -> Option<Vec<Vec<usize>>> {
+        self.0.partition(history)
+    }
+
+    fn partition_events(
+        &self,
+        history: &[Event<Self::Input, Self::Output>],
+    ) -> Option<Vec<Vec<usize>>> {
+        self.0.partition_events(history)
+    }
+}
+
+/// Remove duplicate states from `states` in O(n) average time using a `HashSet`.
+fn deduplicate_hashed<S: Clone + Eq + Hash>(states: Vec<S>) -> Vec<S> {
+    let mut seen = HashSet::with_capacity(states.len());
+    let mut out: Vec<S> = Vec::with_capacity(states.len());
+    for s in states {
+        if seen.insert(s.clone()) {
             out.push(s);
         }
     }

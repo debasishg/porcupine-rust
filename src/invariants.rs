@@ -68,7 +68,11 @@ macro_rules! assert_minimal_call {
 /// Assert that partitions produced by the model do not share any operation indices,
 /// ensuring sub-histories are truly independent.
 ///
+/// Subsumed by `assert_partition_covers_ops!` and `assert_partition_events_paired!`
+/// which also check full coverage and bounds. Kept for spec traceability.
+///
 /// # INV-LIN-03
+#[allow(unused_macros)]
 macro_rules! assert_partition_independent {
     ($partitions:expr) => {
         #[cfg(debug_assertions)]
@@ -80,6 +84,122 @@ macro_rules! assert_partition_independent {
                         seen.insert(idx),
                         "INV-LIN-03: operation index {} appears in more than one partition",
                         idx
+                    );
+                }
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// INV-LIN-03b: Partition Full Coverage (operations)
+// ---------------------------------------------------------------------------
+
+/// Assert that partitions collectively cover every operation in the history.
+/// A buggy partitioner that omits an operation would make the checker silently
+/// skip work and potentially return `Ok` incorrectly.
+///
+/// # INV-LIN-03
+macro_rules! assert_partition_covers_ops {
+    ($partitions:expr, $history_len:expr) => {
+        if cfg!(debug_assertions) {
+            let mut seen = std::collections::HashSet::new();
+            for partition in $partitions.iter() {
+                for &idx in partition.iter() {
+                    assert!(
+                        idx < $history_len,
+                        "INV-LIN-03: partition index {} is out of bounds (history length {})",
+                        idx,
+                        $history_len
+                    );
+                    assert!(
+                        seen.insert(idx),
+                        "INV-LIN-03: operation index {} appears in more than one partition",
+                        idx
+                    );
+                }
+            }
+            assert!(
+                seen.len() == $history_len,
+                "INV-LIN-03: partitions cover {} operations but history has {} — \
+                 {} operation(s) missing from all partitions",
+                seen.len(),
+                $history_len,
+                $history_len - seen.len()
+            );
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// INV-LIN-03c: Partition Event Pair Integrity
+// ---------------------------------------------------------------------------
+
+/// Assert that event-based partitions keep call/return pairs together.
+/// If a partitioner splits a pair across partitions, the per-partition DFS
+/// sees a malformed history and can return spurious `Illegal`.
+///
+/// Also validates full coverage (every event index appears in exactly one
+/// partition) and bounds.
+///
+/// # INV-LIN-03
+macro_rules! assert_partition_events_paired {
+    ($partitions:expr, $history:expr) => {
+        if cfg!(debug_assertions) {
+            let history_len = $history.len();
+            // Build a map: event index → partition index
+            let mut idx_to_part: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+            for (part_idx, partition) in $partitions.iter().enumerate() {
+                for &ev_idx in partition.iter() {
+                    assert!(
+                        ev_idx < history_len,
+                        "INV-LIN-03: event index {} is out of bounds (history length {})",
+                        ev_idx,
+                        history_len
+                    );
+                    let prev = idx_to_part.insert(ev_idx, part_idx);
+                    assert!(
+                        prev.is_none(),
+                        "INV-LIN-03: event index {} appears in more than one partition",
+                        ev_idx
+                    );
+                }
+            }
+            assert!(
+                idx_to_part.len() == history_len,
+                "INV-LIN-03: partitions cover {} events but history has {} — \
+                 {} event(s) missing from all partitions",
+                idx_to_part.len(),
+                history_len,
+                history_len - idx_to_part.len()
+            );
+            // For every event id, find both its Call and Return indices and
+            // check they map to the same partition.
+            let mut call_indices: std::collections::HashMap<u64, usize> =
+                std::collections::HashMap::new();
+            let mut return_indices: std::collections::HashMap<u64, usize> =
+                std::collections::HashMap::new();
+            for (pos, ev) in $history.iter().enumerate() {
+                match ev.kind {
+                    $crate::types::EventKind::Call => {
+                        call_indices.insert(ev.id, pos);
+                    }
+                    $crate::types::EventKind::Return => {
+                        return_indices.insert(ev.id, pos);
+                    }
+                }
+            }
+            for (&id, &call_pos) in &call_indices {
+                if let Some(&ret_pos) = return_indices.get(&id) {
+                    let call_part = idx_to_part[&call_pos];
+                    let ret_part = idx_to_part[&ret_pos];
+                    assert!(
+                        call_part == ret_part,
+                        "INV-LIN-03: event id={} has Call (index {}) in partition {} \
+                         and Return (index {}) in partition {} — \
+                         call/return pairs must not be split across partitions",
+                        id, call_pos, call_part, ret_pos, ret_part
                     );
                 }
             }
@@ -199,6 +319,11 @@ macro_rules! assert_well_formed_events {
 pub(crate) use assert_cache_sound;
 #[allow(unused_imports)]
 pub(crate) use assert_minimal_call;
+#[allow(unused_imports)]
+pub(crate) use assert_partition_covers_ops;
+#[allow(unused_imports)]
+pub(crate) use assert_partition_events_paired;
+#[allow(unused_imports)]
 pub(crate) use assert_partition_independent;
 pub(crate) use assert_well_formed;
 pub(crate) use assert_well_formed_events;
