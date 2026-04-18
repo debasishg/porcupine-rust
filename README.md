@@ -42,18 +42,18 @@ Benchmarks are run with [Criterion.rs](https://github.com/bheisler/criterion.rs)
 
 **Parallelism control**: the Rust sequential benchmarks use a dedicated `rayon::ThreadPool` with `num_threads(1)`, so sequential Rust and single-threaded Go are genuinely apples-to-apples. The parallel benchmarks use the default rayon thread pool (one thread per logical core).
 
-### Results (Apple M1)
+### Results (Apple M1, 3-run average)
 
 | Benchmark | Rust | Go | Speedup |
 |-----------|------|----|---------|
-| etcd — single file (sequential) | 38 µs | 114 µs | **3.0×** |
-| etcd — 102 files (sequential) | 154 ms | 290 ms | **1.9×** |
-| etcd — single file (parallel) | 32 µs | 114 µs | **3.6×** |
-| etcd — 102 files (parallel) | 82 ms | 290 ms | **3.5×** |
-| kv `c10-ok` (sequential) | 194 µs | 239 µs | **1.23×** |
-| kv `c10-bad` (sequential) | 90 µs | 168 µs | **1.87×** |
-| kv `c10-ok` (parallel) | 184 µs | 239 µs | **1.30×** |
-| kv `c10-bad` (parallel) | 84 µs | 168 µs | **2.00×** |
+| etcd — single file (sequential) | 40.8 µs | 114 µs | **2.8×** |
+| etcd — 102 files (sequential) | 145.1 ms | 290 ms | **2.0×** |
+| etcd — single file (parallel) | 31.9 µs | 114 µs | **3.6×** |
+| etcd — 102 files (parallel) | 77.8 ms | 290 ms | **3.7×** |
+| kv `c10-ok` (sequential) | 180.4 µs | 239 µs | **1.32×** |
+| kv `c10-bad` (sequential) | 84.7 µs | 168 µs | **1.98×** |
+| kv `c10-ok` (parallel) | 175.5 µs | 239 µs | **1.36×** |
+| kv `c10-bad` (parallel) | 79.8 µs | 168 µs | **2.10×** |
 
 Rust leads Go on every benchmark. The key contributors are: compact `Node` struct with `u32` indices and sentinel-based linked-list (3× smaller index overhead per node, better cache-line utilization); deferred bitset clone with incremental hash computation (clone only on cache miss, `hash_with_bit()` avoids O(chunks) scan); `FxHashMap` for the DFS cache (replacing SipHash); `SmallVec<[u64; 4]>` for the bitset (zero heap allocation for ≤ 256 operations); `SmallVec<[CacheEntry; 2]>` for the DFS cache collision list (eliminates heap allocation for the common 0–1 collision case); `Arc<str>` for KV model state (atomic refcount bump instead of `String` clone on every DFS step); a single-partition fast path that skips rayon dispatch; a sequential fallback for small inputs (< 2000 total entries); and `#[inline]` hints on the hot-path `lift`/`unlift`/`cache_contains` functions called thousands of times per history check.
 
