@@ -45,3 +45,15 @@ Some invariants (e.g., INV-HIST-02 real-time ordering, INV-LIN-01/02 soundness/c
 are enforced structurally by the algorithm rather than by explicit `debug_assert!` macros.
 These are documented in the traceability matrix in `docs/spec.md` and are exempt from the
 code-only warning. List the known structural-only IDs here as they are established.
+
+## Retired enforcement names
+
+When a check is renamed or replaced, the old name should disappear from
+`src/invariants.rs` entirely — `/spec-sync` is text-based, so a stale comment
+will keep matching the ID. Names removed so far:
+
+- `assert_partition_independent!` (macro) — superseded by the
+  `assert_partition_covers_ops` and `assert_partition_events_paired`
+  functions, which check disjoint + complete + in-bounds (and pairing for the
+  events form). INV-LIN-03 enforcement is unchanged in scope; only the form
+  changed (macro → `pub(crate) fn`).

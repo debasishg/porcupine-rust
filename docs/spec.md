@@ -103,8 +103,14 @@ A history is linearizable if and only if each partition produced by `Model::part
 is independently linearizable. This holds only when the partitioning function produces
 truly independent sub-histories (no cross-partition real-time dependencies).
 
-- **Enforced by**: `debug_assert!` in `invariants::assert_partition_independent`
-- **Checked by**: `tests/property_tests.rs` — `prop_compositionality`
+- **Enforced by**: `debug_assert!` in `invariants::assert_partition_covers_ops`
+  (operations form) and `invariants::assert_partition_events_paired`
+  (events form). Both are debug-only `pub(crate) fn`s; the older
+  `assert_partition_independent!` macro was retired in favour of these two
+  stronger checks (disjoint + complete + in-bounds, plus call/return pairing
+  for the events form).
+- **Checked by**: `tests/property_tests.rs` — `prop_compositionality`,
+  plus `src/invariants.rs::tests` for the structural cases.
 - **Formal**: Quint `pCompositionality`
 
 ---
@@ -168,7 +174,7 @@ agree on all histories.
 | INV-HIST-03 | §1 | `assert_minimal_call` | `prop_soundness` | `Porcupine.qnt minimalCallFrontier` |
 | INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `Porcupine.qnt resultConsistent` |
 | INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` | `Porcupine.qnt resultConsistent` |
-| INV-LIN-03 | §2 | `assert_partition_independent` | `prop_compositionality_*` | `Porcupine.qnt pCompositionality` |
+| INV-LIN-03 | §2 | `assert_partition_covers_ops`, `assert_partition_events_paired` | `prop_compositionality_*` | `Porcupine.qnt pCompositionality` |
 | INV-LIN-04 | §2 | `assert_cache_sound` | `prop_cache_sound` | `Porcupine.qnt cacheSound` |
 | INV-ND-01 | §3 | (structural in `PowerSetModel::step`) | `prop_nd_*` | `NondeterministicModel.qnt powerSetSoundnessInv` |
 

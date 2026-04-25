@@ -785,7 +785,7 @@ where
     let partitions: Vec<Vec<Entry<M::Input, M::Output>>> =
         if let Some(parts) = model.partition(history) {
             // INV-LIN-03: no duplicates, full coverage, bounds check
-            assert_partition_covers_ops!(parts, history.len());
+            assert_partition_covers_ops(&parts, history.len());
             parts
                 .iter()
                 .map(|indices| make_entries_from_indices(history, indices))
@@ -829,7 +829,7 @@ where
     let partitions: Vec<Vec<Entry<M::Input, M::Output>>> =
         if let Some(parts) = model.partition_events(history) {
             // INV-LIN-03: no duplicates, full coverage, bounds, paired events
-            assert_partition_events_paired!(parts, history);
+            assert_partition_events_paired(&parts, history);
             parts
                 .iter()
                 .map(|indices| convert_entries_from_indices(history, indices))

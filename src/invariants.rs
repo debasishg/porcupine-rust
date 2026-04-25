@@ -1,7 +1,19 @@
 // Runtime invariant assertions for porcupine-rust.
 //
-// Every macro here corresponds to an `INV-*` identifier in `docs/spec.md`.
-// Run `/spec-sync` to verify that no INV-* ID exists in one place but not the other.
+// Every macro / function here corresponds to an `INV-*` identifier in
+// `docs/spec.md`. Run `/spec-sync` to verify that no INV-* ID exists in one
+// place but not the other.
+//
+// Style note: the *history-shape* invariants (INV-HIST-01, INV-HIST-03,
+// INV-LIN-04) stay as macros because their per-call format strings interpolate
+// caller-local fields (e.g. `op.client_id`). The *partition-shape* invariants
+// (INV-LIN-03) are plain `pub(crate) fn`s — they take only `&[Vec<usize>]`
+// (and for the events form, `&[Event<I, O>]`), gain nothing from macro
+// expansion, and now share a single coverage scan.
+
+use std::collections::HashMap;
+
+use crate::types::{Event, EventKind};
 
 // ---------------------------------------------------------------------------
 // INV-HIST-01: Well-Formed History
@@ -64,147 +76,135 @@ macro_rules! assert_minimal_call {
 // ---------------------------------------------------------------------------
 // INV-LIN-03: P-Compositionality (partition independence)
 // ---------------------------------------------------------------------------
+//
+// A `Model::partition` (or `partition_events`) implementation must produce
+// index sets that are
+//
+//   (a) disjoint   — no index appears in two partitions
+//   (b) complete   — every index in [0, history.len()) appears in exactly one
+//                    partition
+//   (c) in-bounds  — every index is `< history.len()`
+//
+// The events form additionally requires
+//
+//   (d) call/return paired — for every event id, the Call and Return events
+//                            land in the same partition
+//
+// Violations of (a)/(b)/(c) make the per-partition DFS skip work or index out
+// of bounds; (d) violations show the per-partition DFS a malformed
+// sub-history. All four are debug-only invariants — the production binary
+// trusts the partitioner.
+//
+// Formal counterpart: `tla/Porcupine.qnt :: pCompositionality` verifies the
+// algorithmic side (a successful linearization is a real sequential
+// execution); the functions below verify the partitioner-output side.
 
-/// Assert that partitions produced by the model do not share any operation indices,
-/// ensuring sub-histories are truly independent.
+/// Walk every partition once, enforcing (a), (b), (c). Returns a per-index
+/// table mapping each entry to the partition that owns it; the events form
+/// reuses that table to check pairing without re-hashing.
 ///
-/// Subsumed by `assert_partition_covers_ops!` and `assert_partition_events_paired!`
-/// which also check full coverage and bounds. Kept for spec traceability.
+/// `Vec<Option<u32>>` over `HashMap<usize, usize>` because indices are a dense
+/// `[0, n)` range — direct array indexing is cheaper than hashing and gives
+/// (b) for free as a length / count comparison.
 ///
 /// # INV-LIN-03
-#[allow(unused_macros)]
-macro_rules! assert_partition_independent {
-    ($partitions:expr) => {
-        #[cfg(debug_assertions)]
-        {
-            let mut seen = std::collections::HashSet::new();
-            for partition in $partitions.iter() {
-                for &idx in partition.iter() {
+fn scan_partition_covering(partitions: &[Vec<usize>], n: usize) -> Vec<Option<u32>> {
+    let mut idx_to_part: Vec<Option<u32>> = vec![None; n];
+    let mut count: usize = 0;
+    for (part_idx, partition) in partitions.iter().enumerate() {
+        let part_id = u32::try_from(part_idx).expect("partition count fits in u32");
+        for &idx in partition.iter() {
+            // (c) in-bounds
+            debug_assert!(
+                idx < n,
+                "INV-LIN-03: partition index {} is out of bounds (history length {})",
+                idx,
+                n
+            );
+            // (a) disjoint
+            debug_assert!(
+                idx_to_part[idx].is_none(),
+                "INV-LIN-03: index {} appears in more than one partition",
+                idx
+            );
+            idx_to_part[idx] = Some(part_id);
+            count += 1;
+        }
+    }
+    // (b) complete
+    debug_assert!(
+        count == n,
+        "INV-LIN-03: partitions cover {} entries but history has {} — \
+         {} entry/entries missing from all partitions",
+        count,
+        n,
+        n.saturating_sub(count)
+    );
+    idx_to_part
+}
+
+/// Operations form: assert the partition output is disjoint, complete, and
+/// in-bounds.
+///
+/// Compiles out (other than the early-return) in release builds because every
+/// check inside `scan_partition_covering` is `debug_assert!`.
+///
+/// # INV-LIN-03
+#[inline]
+pub(crate) fn assert_partition_covers_ops(partitions: &[Vec<usize>], history_len: usize) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let _ = scan_partition_covering(partitions, history_len);
+}
+
+/// Events form: assert the partition output is disjoint, complete, in-bounds,
+/// AND keeps every `(Call, Return)` pair together (d).
+///
+/// Single linear pass over `history`: each event looks up its partition in
+/// the dense `idx_to_part` table built by `scan_partition_covering`, and a
+/// per-id `HashMap` records the partition observed at the Call so the matching
+/// Return can compare. The event-id space is sparse (`u64`), so a `HashMap`
+/// is the right structure here — unlike the dense per-index table.
+///
+/// # INV-LIN-03
+#[inline]
+pub(crate) fn assert_partition_events_paired<I, O>(
+    partitions: &[Vec<usize>],
+    history: &[Event<I, O>],
+) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let n = history.len();
+    let idx_to_part = scan_partition_covering(partitions, n);
+
+    // event id → partition recorded at the Call event. `with_capacity(n / 2)`
+    // because a well-formed history has exactly n/2 distinct ids.
+    let mut call_part: HashMap<u64, u32> = HashMap::with_capacity(n / 2);
+    for (pos, ev) in history.iter().enumerate() {
+        // `expect` is sound: scan_partition_covering already asserted (b)
+        // — every position in [0, n) has Some(_).
+        let part = idx_to_part[pos].expect("INV-LIN-03: covers guarantees Some");
+        match ev.kind {
+            EventKind::Call => {
+                call_part.insert(ev.id, part);
+            }
+            EventKind::Return => {
+                if let Some(&cpart) = call_part.get(&ev.id) {
                     debug_assert!(
-                        seen.insert(idx),
-                        "INV-LIN-03: operation index {} appears in more than one partition",
-                        idx
+                        cpart == part,
+                        "INV-LIN-03: event id={} has Call in partition {} but Return in partition {} \
+                         — call/return pairs must not be split across partitions",
+                        ev.id, cpart, part
                     );
                 }
+                // Returns without a matching Call are an INV-HIST-01 violation
+                // — caught by `assert_well_formed_events!` upstream, so we
+                // intentionally do nothing here.
             }
         }
-    };
-}
-
-// ---------------------------------------------------------------------------
-// INV-LIN-03b: Partition Full Coverage (operations)
-// ---------------------------------------------------------------------------
-
-/// Assert that partitions collectively cover every operation in the history.
-/// A buggy partitioner that omits an operation would make the checker silently
-/// skip work and potentially return `Ok` incorrectly.
-///
-/// # INV-LIN-03
-macro_rules! assert_partition_covers_ops {
-    ($partitions:expr, $history_len:expr) => {
-        if cfg!(debug_assertions) {
-            let mut seen = std::collections::HashSet::new();
-            for partition in $partitions.iter() {
-                for &idx in partition.iter() {
-                    assert!(
-                        idx < $history_len,
-                        "INV-LIN-03: partition index {} is out of bounds (history length {})",
-                        idx,
-                        $history_len
-                    );
-                    assert!(
-                        seen.insert(idx),
-                        "INV-LIN-03: operation index {} appears in more than one partition",
-                        idx
-                    );
-                }
-            }
-            assert!(
-                seen.len() == $history_len,
-                "INV-LIN-03: partitions cover {} operations but history has {} — \
-                 {} operation(s) missing from all partitions",
-                seen.len(),
-                $history_len,
-                $history_len - seen.len()
-            );
-        }
-    };
-}
-
-// ---------------------------------------------------------------------------
-// INV-LIN-03c: Partition Event Pair Integrity
-// ---------------------------------------------------------------------------
-
-/// Assert that event-based partitions keep call/return pairs together.
-/// If a partitioner splits a pair across partitions, the per-partition DFS
-/// sees a malformed history and can return spurious `Illegal`.
-///
-/// Also validates full coverage (every event index appears in exactly one
-/// partition) and bounds.
-///
-/// # INV-LIN-03
-macro_rules! assert_partition_events_paired {
-    ($partitions:expr, $history:expr) => {
-        if cfg!(debug_assertions) {
-            let history_len = $history.len();
-            // Build a map: event index → partition index
-            let mut idx_to_part: std::collections::HashMap<usize, usize> =
-                std::collections::HashMap::new();
-            for (part_idx, partition) in $partitions.iter().enumerate() {
-                for &ev_idx in partition.iter() {
-                    assert!(
-                        ev_idx < history_len,
-                        "INV-LIN-03: event index {} is out of bounds (history length {})",
-                        ev_idx,
-                        history_len
-                    );
-                    let prev = idx_to_part.insert(ev_idx, part_idx);
-                    assert!(
-                        prev.is_none(),
-                        "INV-LIN-03: event index {} appears in more than one partition",
-                        ev_idx
-                    );
-                }
-            }
-            assert!(
-                idx_to_part.len() == history_len,
-                "INV-LIN-03: partitions cover {} events but history has {} — \
-                 {} event(s) missing from all partitions",
-                idx_to_part.len(),
-                history_len,
-                history_len - idx_to_part.len()
-            );
-            // For every event id, find both its Call and Return indices and
-            // check they map to the same partition.
-            let mut call_indices: std::collections::HashMap<u64, usize> =
-                std::collections::HashMap::new();
-            let mut return_indices: std::collections::HashMap<u64, usize> =
-                std::collections::HashMap::new();
-            for (pos, ev) in $history.iter().enumerate() {
-                match ev.kind {
-                    $crate::types::EventKind::Call => {
-                        call_indices.insert(ev.id, pos);
-                    }
-                    $crate::types::EventKind::Return => {
-                        return_indices.insert(ev.id, pos);
-                    }
-                }
-            }
-            for (&id, &call_pos) in &call_indices {
-                if let Some(&ret_pos) = return_indices.get(&id) {
-                    let call_part = idx_to_part[&call_pos];
-                    let ret_part = idx_to_part[&ret_pos];
-                    assert!(
-                        call_part == ret_part,
-                        "INV-LIN-03: event id={} has Call (index {}) in partition {} \
-                         and Return (index {}) in partition {} — \
-                         call/return pairs must not be split across partitions",
-                        id, call_pos, call_part, ret_pos, ret_part
-                    );
-                }
-            }
-        }
-    };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,11 +319,105 @@ macro_rules! assert_well_formed_events {
 pub(crate) use assert_cache_sound;
 #[allow(unused_imports)]
 pub(crate) use assert_minimal_call;
-#[allow(unused_imports)]
-pub(crate) use assert_partition_covers_ops;
-#[allow(unused_imports)]
-pub(crate) use assert_partition_events_paired;
-#[allow(unused_imports)]
-pub(crate) use assert_partition_independent;
 pub(crate) use assert_well_formed;
 pub(crate) use assert_well_formed_events;
+
+// ---------------------------------------------------------------------------
+// Unit tests for the INV-LIN-03 partition functions
+// ---------------------------------------------------------------------------
+//
+// Each test pins one of the four invariants (a)–(d) and confirms that a
+// debug build panics when it is violated. The previous macro form could not
+// host these tests cleanly; converting to functions enables this coverage.
+//
+// Gated on `debug_assertions` because the functions are intentional no-ops
+// in release builds — `#[should_panic]` would never fire there, and a
+// "valid partition passes" assertion would be tautological.
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use crate::types::{Event, EventKind};
+
+    fn call(id: u64) -> Event<i32, i32> {
+        Event {
+            client_id: id,
+            kind: EventKind::Call,
+            input: Some(0),
+            output: None,
+            id,
+        }
+    }
+
+    fn ret(id: u64) -> Event<i32, i32> {
+        Event {
+            client_id: id,
+            kind: EventKind::Return,
+            input: None,
+            output: Some(0),
+            id,
+        }
+    }
+
+    /// INV-LIN-03 (a) + (b) + (c): a clean partitioning passes.
+    #[test]
+    fn ops_valid_partition_passes() {
+        let parts = vec![vec![0, 2], vec![1, 3]];
+        assert_partition_covers_ops(&parts, 4);
+    }
+
+    /// INV-LIN-03 (a): an index appearing in two partitions must panic.
+    #[test]
+    #[should_panic(expected = "INV-LIN-03")]
+    fn ops_overlapping_partitions_panic() {
+        let parts = vec![vec![0, 1], vec![1, 2]];
+        assert_partition_covers_ops(&parts, 3);
+    }
+
+    /// INV-LIN-03 (b): an index never appearing in any partition must panic.
+    #[test]
+    #[should_panic(expected = "INV-LIN-03")]
+    fn ops_missing_index_panics() {
+        let parts = vec![vec![0, 2]];
+        assert_partition_covers_ops(&parts, 3); // index 1 missing
+    }
+
+    /// INV-LIN-03 (c): an index ≥ history length must panic.
+    #[test]
+    #[should_panic(expected = "INV-LIN-03")]
+    fn ops_out_of_bounds_panics() {
+        let parts = vec![vec![0, 1, 2, 5]];
+        assert_partition_covers_ops(&parts, 3);
+    }
+
+    /// INV-LIN-03 events form: a clean partitioning that keeps Call/Return
+    /// pairs together passes.
+    #[test]
+    fn events_valid_partition_passes() {
+        // history layout: [C0, C1, R0, R1] with id 0 in part 0, id 1 in part 1
+        let history = vec![call(0), call(1), ret(0), ret(1)];
+        let parts = vec![vec![0, 2], vec![1, 3]];
+        assert_partition_events_paired(&parts, &history);
+    }
+
+    /// INV-LIN-03 (d): splitting a (Call, Return) pair across partitions must
+    /// panic.
+    #[test]
+    #[should_panic(expected = "INV-LIN-03")]
+    fn events_split_pair_panics() {
+        // id 0's Call is at index 0 (part 0) but its Return is at index 2 (part 1).
+        let history = vec![call(0), call(1), ret(0), ret(1)];
+        let parts = vec![vec![0, 1], vec![2, 3]];
+        assert_partition_events_paired(&parts, &history);
+    }
+
+    /// INV-LIN-03 events form (b): missing event index must panic before the
+    /// pairing check even starts.
+    #[test]
+    #[should_panic(expected = "INV-LIN-03")]
+    fn events_missing_index_panics() {
+        let history = vec![call(0), call(1), ret(0), ret(1)];
+        let parts = vec![vec![0, 2], vec![1]]; // index 3 missing
+        assert_partition_events_paired(&parts, &history);
+    }
+}
