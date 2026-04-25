@@ -68,6 +68,10 @@ docs/spec.md  →  tla/Porcupine.qnt  →  src/invariants.rs (debug_assert!)
   `(structural)` enforcement note.
 - Run `/spec-sync` to detect drift. The skill flags an ID only when it is
   *neither* asserted *nor* marked structural in the spec.
+- For the full picture of how detection runs (manual, Claude hook, CI),
+  the script internals, worked drift examples, and a maintenance guide
+  for adding/renaming/retiring invariants, see
+  [`docs/spec-sync.md`](../docs/spec-sync.md).
 
 #### Why "structural" exists as a category
 
