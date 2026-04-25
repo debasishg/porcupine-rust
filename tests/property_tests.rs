@@ -1,53 +1,24 @@
-use porcupine::{
-    model::{NondeterministicModel, PowerSetModel},
-    CheckResult, Event, EventKind, Model, Operation,
-};
 /// Property-based tests for porcupine linearizability checker.
 ///
 /// Each test corresponds to one or more INV-* invariants from docs/spec.md.
-/// All tests use `proptest` to generate random histories and models.
+/// All tests use `proptest` to generate random histories and models. Models
+/// and history builders are shared with `tests/hegel_properties.rs` via
+/// `tests/common/mod.rs`.
 ///
 /// Run:  cargo test --test property_tests
+use porcupine::{CheckResult, Event, Model, Operation, model::PowerSetModel};
 use proptest::prelude::*;
 
-// ---------------------------------------------------------------------------
-// A concrete sequential model: an integer register.
-//
-// Input:  (is_write: bool, value: i64)
-// Output: i64  (last written value for reads; ignored for writes)
-// ---------------------------------------------------------------------------
+mod common;
 
-#[derive(Clone)]
-struct RegisterModel;
-
-#[derive(Clone, Debug)]
-struct RegisterInput {
-    is_write: bool,
-    value: i64,
-}
-
-impl Model for RegisterModel {
-    type State = i64;
-    type Input = RegisterInput;
-    type Output = i64;
-
-    fn init(&self) -> i64 {
-        0
-    }
-
-    fn step(&self, state: &i64, input: &RegisterInput, output: &i64) -> Option<i64> {
-        if input.is_write {
-            Some(input.value)
-        } else if *output == *state {
-            Some(*state)
-        } else {
-            None
-        }
-    }
-}
+use common::{
+    DeterministicNdRegister, KvInput, KvModel, LossyInput, LossyNdRegister, RegisterInput,
+    RegisterModel, illegal_register_history, illegal_register_history_as_events,
+    sequential_history, sequential_ops_to_events, single_op_history,
+};
 
 // ---------------------------------------------------------------------------
-// Arbitrary generators
+// proptest-specific generator: a single sequential operation.
 // ---------------------------------------------------------------------------
 
 prop_compose! {
@@ -64,43 +35,6 @@ prop_compose! {
             return_time: ts_start + duration,
         }
     }
-}
-
-/// Build a purely sequential history of write operations.
-/// A sequential history is trivially linearizable (INV-LIN-01 must hold).
-fn sequential_history(len: usize) -> Vec<Operation<RegisterInput, i64>> {
-    let mut ts = 0u64;
-    (0..len)
-        .map(|i| {
-            let call = ts;
-            let return_time = ts + 5;
-            ts = return_time + 1;
-            Operation {
-                client_id: i as u64,
-                input: RegisterInput {
-                    is_write: true,
-                    value: i as i64,
-                },
-                call,
-                output: 0,
-                return_time,
-            }
-        })
-        .collect()
-}
-
-/// Build a single-operation history — trivially linearizable.
-fn single_op_history(value: i64) -> Vec<Operation<RegisterInput, i64>> {
-    vec![Operation {
-        client_id: 0,
-        input: RegisterInput {
-            is_write: true,
-            value,
-        },
-        call: 0,
-        output: 0,
-        return_time: 10,
-    }]
 }
 
 // ---------------------------------------------------------------------------
@@ -153,49 +87,6 @@ proptest! {
 // ---------------------------------------------------------------------------
 // INV-LIN-03: P-Compositionality
 // ---------------------------------------------------------------------------
-
-/// A model that partitions a key-value history by key.
-/// Each key's sub-history is independent.
-#[derive(Clone)]
-struct KvModel;
-
-#[derive(Clone, Debug)]
-struct KvInput {
-    key: u8,
-    is_write: bool,
-    value: i64,
-}
-
-impl Model for KvModel {
-    type State = std::collections::HashMap<u8, i64>;
-    type Input = KvInput;
-    type Output = i64;
-
-    fn init(&self) -> Self::State {
-        std::collections::HashMap::new()
-    }
-
-    fn step(&self, state: &Self::State, input: &KvInput, output: &i64) -> Option<Self::State> {
-        let mut next = state.clone();
-        if input.is_write {
-            next.insert(input.key, input.value);
-            Some(next)
-        } else {
-            let stored = state.get(&input.key).copied().unwrap_or(0);
-            if *output == stored { Some(next) } else { None }
-        }
-    }
-
-    fn partition(&self, history: &[Operation<KvInput, i64>]) -> Option<Vec<Vec<usize>>> {
-        // Group operation indices by key.
-        let mut by_key: std::collections::HashMap<u8, Vec<usize>> =
-            std::collections::HashMap::new();
-        for (i, op) in history.iter().enumerate() {
-            by_key.entry(op.input.key).or_default().push(i);
-        }
-        Some(by_key.into_values().collect())
-    }
-}
 
 proptest! {
     /// Partitions produced by KvModel must be disjoint (INV-LIN-03).
@@ -250,61 +141,6 @@ proptest! {
 // ---------------------------------------------------------------------------
 // INV-LIN-02: Completeness — a non-linearizable history must be detected
 // ---------------------------------------------------------------------------
-
-/// Build a provably non-linearizable register history:
-///
-///   Client 0: write(1)  [0, 100]   (long, spans everything)
-///   Client 1: read → 0  [1, 50]    (concurrent with write; reads 0 before write commits)
-///   Client 2: read → 1  [60, 90]   (after client 1's read; reads 1)
-///
-/// Both reads are concurrent with the write. For this to be linearizable, the
-/// write must be ordered either before or after each read. But if write comes
-/// before read-0 (read returns 0), the state is 0 before write — contradiction.
-/// If write comes after read-1 (read returns 1), write must precede the second
-/// read in real time — impossible since write[0,100] and read2[60,90] overlap.
-///
-/// Actually the simplest non-linearizable register history is:
-///
-///   Client 0: write(1)  [0, 10]
-///   Client 1: read → 0  [5, 15]   — overlaps with write; reads old value (ok)
-///   Client 2: read → 0  [12, 20]  — AFTER write completes; must read 1, reads 0 (illegal)
-fn illegal_register_history() -> Vec<Operation<RegisterInput, i64>> {
-    vec![
-        // write(1): completes at t=10
-        Operation {
-            client_id: 0,
-            input: RegisterInput {
-                is_write: true,
-                value: 1,
-            },
-            call: 0,
-            output: 0,
-            return_time: 10,
-        },
-        // read→0: overlaps with write (ok to return 0 or 1)
-        Operation {
-            client_id: 1,
-            input: RegisterInput {
-                is_write: false,
-                value: 0,
-            },
-            call: 5,
-            output: 0,
-            return_time: 15,
-        },
-        // read→0: STARTS AFTER write finishes (t=12 > t=10) — must return 1, not 0 (illegal)
-        Operation {
-            client_id: 2,
-            input: RegisterInput {
-                is_write: false,
-                value: 0,
-            },
-            call: 12,
-            output: 0,
-            return_time: 20,
-        },
-    ]
-}
 
 #[test]
 fn prop_illegal_history_is_detected() {
@@ -368,40 +204,6 @@ proptest! {
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Helpers: convert a sequential Operation history to an ordered Event slice.
-//
-// For a sequential (non-overlapping) history the events are already in time
-// order: each op's call comes before its return, and ops don't interleave.
-// We emit events in the natural order: call_0, ret_0, call_1, ret_1, ...
-// ---------------------------------------------------------------------------
-
-fn sequential_ops_to_events(
-    ops: &[Operation<RegisterInput, i64>],
-) -> Vec<Event<RegisterInput, i64>> {
-    ops.iter()
-        .enumerate()
-        .flat_map(|(i, op)| {
-            [
-                Event {
-                    client_id: op.client_id,
-                    kind: EventKind::Call,
-                    input: Some(op.input.clone()),
-                    output: None,
-                    id: i as u64,
-                },
-                Event {
-                    client_id: op.client_id,
-                    kind: EventKind::Return,
-                    input: None,
-                    output: Some(op.output.clone()),
-                    id: i as u64,
-                },
-            ]
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
 // INV-LIN-01 + INV-LIN-02: sequential events are always linearizable
 // ---------------------------------------------------------------------------
 
@@ -459,55 +261,6 @@ proptest! {
 // INV-LIN-02: a known non-linearizable history must be detected via events
 // ---------------------------------------------------------------------------
 
-/// The same illegal history used in prop_illegal_history_is_detected, but
-/// expressed as an event stream.  After write(1) fully completes, a read
-/// that returns 0 has no valid linearization.
-fn illegal_register_history_as_events() -> Vec<Event<RegisterInput, i64>> {
-    // Equivalent to the 2-op illegal history used in prop_illegal_history_is_detected:
-    //   write(1) fully completes (ret before read's call), then read returns 0.
-    // Event slice order (index = time):
-    //   t=0: call write(1)   [id=0]
-    //   t=1: ret  write      [id=0]  ← write completes
-    //   t=2: call read       [id=1]  ← starts AFTER write (t=2 > t=1)
-    //   t=3: ret  read→0     [id=1]  ← returns 0, must be 1 — illegal
-    vec![
-        Event {
-            client_id: 0,
-            kind: EventKind::Call,
-            input: Some(RegisterInput {
-                is_write: true,
-                value: 1,
-            }),
-            output: None,
-            id: 0,
-        },
-        Event {
-            client_id: 0,
-            kind: EventKind::Return,
-            input: None,
-            output: Some(0),
-            id: 0,
-        },
-        Event {
-            client_id: 1,
-            kind: EventKind::Call,
-            input: Some(RegisterInput {
-                is_write: false,
-                value: 0,
-            }),
-            output: None,
-            id: 1,
-        },
-        Event {
-            client_id: 1,
-            kind: EventKind::Return,
-            input: None,
-            output: Some(0),
-            id: 1,
-        },
-    ]
-}
-
 #[test]
 fn prop_events_illegal_history_is_detected() {
     let events = illegal_register_history_as_events();
@@ -564,77 +317,8 @@ fn prop_events_empty_history_is_ok() {
 //   (d) Repeated calls return the same result (INV-LIN-04).
 // ===========================================================================
 
-// ---------------------------------------------------------------------------
-// DeterministicNdRegister — a NondeterministicModel that wraps RegisterModel.
-//
-// step returns either a singleton (accepted) or an empty vec (rejected),
-// mirroring exactly what RegisterModel::step does.  PowerSetModel of this
-// must agree with RegisterModel on every history.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct DeterministicNdRegister;
-
-impl NondeterministicModel for DeterministicNdRegister {
-    type State = i64;
-    type Input = RegisterInput;
-    type Output = i64;
-
-    fn init(&self) -> Vec<i64> {
-        vec![0]
-    }
-
-    fn step(&self, state: &i64, input: &RegisterInput, output: &i64) -> Vec<i64> {
-        // Mirror RegisterModel exactly, but return Vec<State> instead of Option<State>.
-        if input.is_write {
-            vec![input.value]
-        } else if *output == *state {
-            vec![*state]
-        } else {
-            vec![]
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// LossyNdRegister — a NondeterministicModel with genuine branching.
-//
-// A write of value v from state s may succeed (→ v) or be lost (→ s).
-// A read must return the exact current register value.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct LossyNdRegister;
-
-#[derive(Clone, Debug, PartialEq)]
-enum LossyInput {
-    Write(i64),
-    Read,
-}
-
-impl NondeterministicModel for LossyNdRegister {
-    type State = i64;
-    type Input = LossyInput;
-    type Output = Option<i64>; // None for writes, Some(v) for reads
-
-    fn init(&self) -> Vec<i64> {
-        vec![0]
-    }
-
-    fn step(&self, state: &i64, input: &LossyInput, output: &Option<i64>) -> Vec<i64> {
-        match (input, output) {
-            (LossyInput::Write(v), None) => {
-                if *v == *state {
-                    vec![*state]
-                } else {
-                    vec![*v, *state] // write may succeed or be lost
-                }
-            }
-            (LossyInput::Read, Some(o)) if *o == *state => vec![*state],
-            _ => vec![],
-        }
-    }
-}
+// `DeterministicNdRegister` and `LossyNdRegister` (with `LossyInput`) are
+// shared with hegel_properties via `tests/common/mod.rs`.
 
 // ---------------------------------------------------------------------------
 // INV-ND-01 (a): PowerSetModel with a deterministic ND model agrees with

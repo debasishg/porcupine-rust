@@ -11,6 +11,7 @@ All tests, how to run them, what they verify, and which invariants they cover.
 | Rust / Cargo | stable | `rustup update stable` |
 | Quint CLI | ≥ 0.31.0 | `npm install -g @informalsystems/quint` |
 | Java | ≥ 17 | Required by Apalache (invoked by `quint verify`) |
+| `uv` (Python runner) | any recent | Auto-downloaded into `~/.cache/hegel` on first Hegel test run if not on `PATH`; or install per [astral.sh/uv](https://docs.astral.sh/uv/) |
 
 Verify:
 
@@ -353,6 +354,76 @@ This history has no valid linearization: `Illegal` is the only correct answer.
 
 ---
 
+## 4b. Hegel Property Tests (`cargo test --test hegel_properties`)
+
+**Location**: `tests/hegel_properties.rs`
+
+**Run**:
+
+```bash
+cargo test --test hegel_properties
+```
+
+Uses [Hegel](https://hegel.dev), Antithesis's universal property-based testing protocol — a [Hypothesis](https://github.com/hypothesisworks/hypothesis)-powered generator/shrinker engine with a Rust binding (the `hegeltest` crate, imported as `hegel`). On first run Hegel downloads a private copy of `uv` into `~/.cache/hegel` if `uv` is not already on `PATH`, then talks to a `hegel-core` Python sidecar over a local socket.
+
+This suite mirrors the `proptest` suite (§4) using Hegel's generator/shrinker, plus a few properties that aren't covered by `proptest` (history prefixes, partition idempotence, an incremental stateful machine).
+
+### 4b.1 Why Hegel in addition to proptest?
+
+- Hypothesis's IR-level shrinker tends to find smaller counter-examples than proptest's value-level shrinker, especially for nested structures like operation histories.
+- `#[hegel::state_machine]` provides first-class stateful PBT with the same shrinker; no extra crate needed.
+- Tests are written against the same Hegel protocol available in Go, C++, TS, and OCaml — useful if the porcupine spec ever needs to be cross-validated against a non-Rust implementation.
+- Hegel tests can be lifted into Antithesis's deterministic simulator without rewriting; each `tc.draw` becomes a controlled choice point.
+
+Tradeoff: each test case round-trips through the `hegel-core` sidecar, so the suite is slower than proptest (~7.5 s for 17 × 100 cases). Keep proptest for fast inner-loop coverage; use Hegel as the deeper, slower gate.
+
+For a deeper comparison — pros and cons of each engine, when to reach for which, and the rationale for keeping both — see [`docs/hegel_v_proptest.md`](./hegel_v_proptest.md).
+
+### 4b.2 Models reused
+
+The same `RegisterModel`, `KvModel`, `DeterministicNdRegister`, and `LossyNdRegister` types as `tests/property_tests.rs`, plus a `KvSinglePartition` wrapper used by `hegel_partition_idempotent_with_single_partition`.
+
+### 4b.3 Test inventory — operation API
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_well_formed_history` | INV-HIST-01 | Generated sequential histories satisfy `call ≤ return_time` |
+| `hegel_sequential_history_is_linearizable` | INV-LIN-01, INV-LIN-02 | Random sequential register histories of length 0–8 are always `Ok` |
+| `hegel_single_op_is_linearizable` | INV-LIN-01 | Single-write history is trivially linearizable |
+| `hegel_empty_history_is_ok` | INV-LIN-01 | Empty operation and event histories both return `Ok` |
+| `hegel_prefixes_of_sequential_are_linearizable` | INV-LIN-01 | Every prefix of a generated sequential history is itself `Ok` |
+| `hegel_illegal_history_is_detected` | INV-LIN-02 | Fixed three-op stale-read history returns `Illegal` |
+| `hegel_stale_read_is_always_illegal` | INV-LIN-02 | Generative: a write of `v ≠ 0` followed by a read of `0` after the write completes is always `Illegal` |
+| `hegel_partitions_are_disjoint_and_complete` | INV-LIN-03 | `KvModel::partition` produces disjoint, in-bounds, complete partitions |
+| `hegel_kv_sequential_history_is_linearizable` | INV-LIN-03 | Sequential KV histories are `Ok` through the partition path |
+| `hegel_partition_idempotent_with_single_partition` | INV-LIN-03 | A model whose `partition` returns one all-indices partition agrees with the same model with no partition |
+| `hegel_cache_sound_deterministic_ops` | INV-LIN-04 | Two `check_operations` calls on the same history return the same result |
+
+### 4b.4 Test inventory — event API
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_cache_sound_deterministic_events` | INV-LIN-04 | Two `check_events` calls on the same event stream return the same result |
+| `hegel_events_agree_with_operations` | INV-LIN-01, INV-LIN-02 | `check_operations` and `check_events` agree on the same generated sequential history |
+
+### 4b.5 Test inventory — `NondeterministicModel` / `PowerSetModel`
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_nd_deterministic_agrees_with_model` | INV-ND-01 | `PowerSetModel(DeterministicNdRegister)` and `RegisterModel` produce the same result on every generated history |
+| `hegel_nd_sequential_writes_linearizable` | INV-ND-01, INV-LIN-01 | Sequential ND write histories through `LossyNdRegister` are always `Ok` |
+| `hegel_nd_impossible_read_is_illegal` | INV-ND-01, INV-LIN-02 | A read of a value reachable in no branch of the lossy register is always `Illegal` |
+
+### 4b.6 Stateful test (`#[hegel::state_machine]`)
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_incremental_register_is_linearizable` | INV-LIN-01 | A Hegel state machine grows a sequential register history one op at a time (`append_write`, `append_read_of_last`); after each rule the checker must report `Ok`. Surfaces any soundness bug whose effect depends on history length or interleaving order |
+
+**Expected output**: 17 tests, all passing (≈ 7–10 s including the first-run `uv` install of ~5 MB).
+
+---
+
 ## 5. Nondeterministic Model Tests (`cargo test --test nondeterministic`)
 
 **Location**: `tests/nondeterministic.rs`
@@ -565,19 +636,20 @@ acceptance implies non-empty power-state.  Models the `NdRegister` (lossy write)
 cargo test
 ```
 
-Runs all suites without feature flags: **122 tests** passing across six test targets.
+Runs all suites without feature flags: **153 tests** passing across eight test targets.
 
 | Target | Command | Count |
 |--------|---------|-------|
-| Lib unit tests | `cargo test --lib` | 60 |
+| Lib unit tests | `cargo test --lib` | 67 |
 | Go compatibility | `cargo test --test go_compat` | 15 (+ 2 ignored) |
 | TiPocket models | `cargo test --test tipocket` | 16 |
-| Property tests | `cargo test --test property_tests` | 18 |
+| Property tests (proptest) | `cargo test --test property_tests` | 18 |
+| Property tests (Hegel) | `cargo test --test hegel_properties` | 17 |
 | Nondeterministic model | `cargo test --test nondeterministic` | 12 |
 | S2 stream model | `cargo test --test s2_model` | 6 |
-| Doc tests | `cargo test --doc` | 1 |
+| Doc tests | `cargo test --doc` | 2 |
 
-rayon is an unconditional dependency; no feature flags are required for any of the above.
+rayon is an unconditional dependency; no feature flags are required for any of the above. The Hegel suite auto-installs `uv` into `~/.cache/hegel` on first run if `uv` is not already on `PATH`.
 
 ### Run everything including MBT (Quint required)
 
@@ -601,16 +673,16 @@ quint verify tla/Porcupine.qnt --invariant safetyInvariant
 
 ## 10. Invariant Coverage Matrix
 
-| INV-* | Name | Unit tests | Property tests | Quint invariant | MBT |
-|-------|------|------------|----------------|-----------------|-----|
-| INV-HIST-01 | Well-Formed History | — | `prop_well_formed_history` | `Porcupine.qnt histWellFormedInv` | — |
-| INV-HIST-02 | Real-Time Order | structural | `prop_sequential_history_is_linearizable` | `Porcupine.qnt realTimeOrder` (pure def) | — |
-| INV-HIST-03 | Minimal-Call Frontier | structural | covered by soundness tests | `Porcupine.qnt minimalCallFrontier` | — |
-| INV-LIN-01 | Soundness | `timeout_very_long_does_not_affect_result`, `two_partition_ok_history` | `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `Porcupine.qnt resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_check_events_matches_quint_trace` |
-| INV-LIN-02 | Completeness | `timeout_very_long_does_not_affect_illegal_result`, `two_partition_illegal_history` | `prop_illegal_history_is_detected` | `Porcupine.qnt resultConsistent` | `mbt_trace_matches_rust_checker` |
-| INV-LIN-03 | P-Compositionality | `check_events_partition_*`, `two_partition_*`, `three_partitions_all_ok` | `prop_compositionality_partitions_disjoint`, `prop_compositionality_end_to_end` | `Porcupine.qnt pCompositionality` | — |
-| INV-LIN-04 | Cache Soundness | `timeout_none_matches_none_no_timeout` | `prop_cache_sound_deterministic`, `prop_events_cache_sound_deterministic`, `prop_nd_cache_sound_deterministic` | `Porcupine.qnt cacheSound` | — |
-| INV-PAR-01 | Kill-Flag Monotonicity | `timeout_zero_duration_returns_unknown_or_definitive`, `timeout_short_duration_returns_unknown`, `timeout_short_duration_events_returns_unknown` | — | `Porcupine.qnt parallelKillFlagInvariant` | — |
-| INV-ND-01 | Power-Set Reduction Soundness | structural (`PowerSetModel::step`) | `prop_nd_deterministic_agrees_with_model`, `prop_nd_sequential_writes_linearizable`, `prop_nd_single_op_is_linearizable`, `prop_nd_impossible_read_is_illegal` | `NondeterministicModel.qnt powerSetSoundnessInv` | — |
+| INV-* | Name | Unit tests | proptest | Hegel | Quint invariant | MBT |
+|-------|------|------------|----------|-------|-----------------|-----|
+| INV-HIST-01 | Well-Formed History | — | `prop_well_formed_history` | `hegel_well_formed_history` | `Porcupine.qnt histWellFormedInv` | — |
+| INV-HIST-02 | Real-Time Order | structural | `prop_sequential_history_is_linearizable` | `hegel_sequential_history_is_linearizable`, `hegel_stale_read_is_always_illegal` | `Porcupine.qnt realTimeOrder` (pure def) | — |
+| INV-HIST-03 | Minimal-Call Frontier | structural | covered by soundness tests | covered by soundness tests | `Porcupine.qnt minimalCallFrontier` | — |
+| INV-LIN-01 | Soundness | `timeout_very_long_does_not_affect_result`, `two_partition_ok_history` | `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `hegel_sequential_history_is_linearizable`, `hegel_single_op_is_linearizable`, `hegel_empty_history_is_ok`, `hegel_prefixes_of_sequential_are_linearizable`, `hegel_incremental_register_is_linearizable` | `Porcupine.qnt resultConsistent` | `mbt_trace_matches_rust_checker`, `mbt_check_events_matches_quint_trace` |
+| INV-LIN-02 | Completeness | `timeout_very_long_does_not_affect_illegal_result`, `two_partition_illegal_history` | `prop_illegal_history_is_detected` | `hegel_illegal_history_is_detected`, `hegel_stale_read_is_always_illegal` | `Porcupine.qnt resultConsistent` | `mbt_trace_matches_rust_checker` |
+| INV-LIN-03 | P-Compositionality | `check_events_partition_*`, `two_partition_*`, `three_partitions_all_ok` | `prop_compositionality_partitions_disjoint`, `prop_compositionality_end_to_end` | `hegel_partitions_are_disjoint_and_complete`, `hegel_kv_sequential_history_is_linearizable`, `hegel_partition_idempotent_with_single_partition` | `Porcupine.qnt pCompositionality` | — |
+| INV-LIN-04 | Cache Soundness | `timeout_none_matches_none_no_timeout` | `prop_cache_sound_deterministic`, `prop_events_cache_sound_deterministic`, `prop_nd_cache_sound_deterministic` | `hegel_cache_sound_deterministic_ops`, `hegel_cache_sound_deterministic_events` | `Porcupine.qnt cacheSound` | — |
+| INV-PAR-01 | Kill-Flag Monotonicity | `timeout_zero_duration_returns_unknown_or_definitive`, `timeout_short_duration_returns_unknown`, `timeout_short_duration_events_returns_unknown` | — | — | `Porcupine.qnt parallelKillFlagInvariant` | — |
+| INV-ND-01 | Power-Set Reduction Soundness | structural (`PowerSetModel::step`) | `prop_nd_deterministic_agrees_with_model`, `prop_nd_sequential_writes_linearizable`, `prop_nd_single_op_is_linearizable`, `prop_nd_impossible_read_is_illegal` | `hegel_nd_deterministic_agrees_with_model`, `hegel_nd_sequential_writes_linearizable`, `hegel_nd_impossible_read_is_illegal` | `NondeterministicModel.qnt powerSetSoundnessInv` | — |
 
 Full invariant definitions: `docs/spec.md`.

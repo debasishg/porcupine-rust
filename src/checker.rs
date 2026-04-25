@@ -368,10 +368,10 @@ impl<I, O> NodeArena<I, O> {
 
 /// DFS cache's value type: a (bitset, state) pair representing a linearization prefix and the
 /// corresponding model state.
-/// The Bitset models the set of operations that have been linearized so far in a 
+/// The Bitset models the set of operations that have been linearized so far in a
 /// particular DFS path.
-
-/// Each concurrent operation in the history is assigned a numeric ID (op_id). 
+///
+/// Each concurrent operation in the history is assigned a numeric ID (op_id).
 /// Setting bit i in the Bitset means "operation i has already been placed into the 
 /// linearization order." So the Bitset is essentially a compact representation of a 
 /// subset of operations.
@@ -1848,9 +1848,7 @@ mod tests {
             type Input = ();
             type Output = ();
 
-            fn init(&self) -> () {
-                ()
-            }
+            fn init(&self) {}
 
             fn step(&self, _state: &(), _input: &(), _output: &()) -> Option<()> {
                 std::thread::sleep(Duration::from_millis(STEP_MS));

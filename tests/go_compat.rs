@@ -209,7 +209,7 @@ impl Model for KvModel {
     fn step(&self, state: &Arc<str>, input: &KvInput, output: &KvOutput) -> Option<Arc<str>> {
         match input.op {
             KvOp::Get => {
-                if &*output.value == &**state {
+                if *output.value == **state {
                     Some(Arc::clone(state)) // atomic refcount bump, no heap alloc
                 } else {
                     None

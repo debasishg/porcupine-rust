@@ -112,18 +112,17 @@ impl NondeterministicModel for S2StreamModel {
                     }
                     S2Output::AppendIndefiniteFailure => {
                         // Fencing token mismatch → cannot have become durable.
-                        if let Some(bt) = fencing_token {
-                            if let Some(ft) = &state.fencing_token {
-                                if bt != ft {
-                                    return vec![state.clone()];
-                                }
-                            }
+                        if let Some(bt) = fencing_token
+                            && let Some(ft) = &state.fencing_token
+                            && bt != ft
+                        {
+                            return vec![state.clone()];
                         }
                         // matchSeqNum mismatch → cannot have become durable.
-                        if let Some(msn) = match_seq_num {
-                            if *msn != state.tail {
-                                return vec![state.clone()];
-                            }
+                        if let Some(msn) = match_seq_num
+                            && *msn != state.tail
+                        {
+                            return vec![state.clone()];
                         }
                         // Both outcomes are possible.
                         vec![optimistic, state.clone()]
@@ -137,10 +136,10 @@ impl NondeterministicModel for S2StreamModel {
                                 _ => {}
                             }
                         }
-                        if let Some(msn) = match_seq_num {
-                            if *msn != state.tail {
-                                return vec![];
-                            }
+                        if let Some(msn) = match_seq_num
+                            && *msn != state.tail
+                        {
+                            return vec![];
                         }
                         if *tail != optimistic.tail {
                             return vec![];
