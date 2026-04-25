@@ -1,0 +1,28 @@
+name: spec-sync
+
+# Pre-merge gate: assert each INV-* in docs/spec.md is either asserted in
+# src/invariants.rs or marked "(structural)" on its Enforced by line.
+# See .claude/commands/spec-sync.md for the policy.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/spec.md"
+      - "src/invariants.rs"
+      - ".claude/hooks/spec-sync.sh"
+      - ".github/workflows/spec-sync.yml"
+  pull_request:
+    paths:
+      - "docs/spec.md"
+      - "src/invariants.rs"
+      - ".claude/hooks/spec-sync.sh"
+      - ".github/workflows/spec-sync.yml"
+
+jobs:
+  spec-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run spec-sync
+        run: bash .claude/hooks/spec-sync.sh

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/spec-sync-on-edit.sh",
+            "statusMessage": "spec-sync"
+          }
+        ]
+      }
+    ]
+  }
+}
