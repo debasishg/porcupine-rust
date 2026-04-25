@@ -1,59 +1,99 @@
 # Invariant Cross-Check
 
-Statically verify that `INV-*` identifiers are consistent between `docs/spec.md` and
-`src/invariants.rs`.
+Statically verify that `INV-*` identifiers are consistent between
+`docs/spec.md` and `src/invariants.rs`.
+
+This skill applies the policy in `.claude/CLAUDE.md` § *Invariants
+Convention*: every spec entry is either **asserted** (has a matching
+`debug_assert!` / pub-crate fn in `src/invariants.rs`) or **structural**
+(enforced by the algorithm itself, with the spec entry tagged
+`(structural)` on its *Enforced by* line). A code assertion without a
+matching spec entry is always a violation.
 
 ## What this checks
 
 For every `INV-[A-Z]+-[0-9]+` pattern:
 
-1. Extract all IDs from `docs/spec.md`.
-2. Extract all IDs referenced inside `debug_assert!` calls in `src/invariants.rs`.
-3. Report three categories:
-   - **Matched** — present in both (compliant).
-   - **Spec-only** — documented but no `debug_assert!` (missing runtime enforcement).
-   - **Code-only** — asserted in code but not in spec (undocumented assertion).
+1. **Asserted spec entry, present in code** — Matched.
+2. **Structural spec entry** — Matched (no code assertion required).
+3. **Asserted spec entry, missing from code** — Missing (drift).
+4. **Code assertion, no spec entry at all** — Undocumented (drift).
 
 ## How to run
 
+This skill is a thin wrapper over `/spec-sync`; both share the same
+classification logic. Run that command for the canonical report.
+
 ```bash
-# Extract from spec.md
-grep -oE 'INV-[A-Z]+-[0-9]+' docs/spec.md | sort -u
+# Same pipeline as /spec-sync, abbreviated:
+classified=$(awk '
+  /^### INV-/ {
+    if (id != "") emit()
+    if (match($0, /INV-[A-Z]+-[0-9]+/)) id = substr($0, RSTART, RLENGTH)
+    block = ""
+  }
+  { block = block "\n" $0 }
+  END { if (id != "") emit() }
+  function emit() {
+    if (block ~ /\(structural\)/) print id "\tstructural"
+    else                          print id "\tasserted"
+  }
+' docs/spec.md | sort -u)
 
-# Extract from invariants.rs
+# IDs that must appear in invariants.rs:
+printf '%s\n' "$classified" | awk -F'\t' '$2=="asserted"{print $1}'
+
+# IDs actually in invariants.rs:
 grep -oE 'INV-[A-Z]+-[0-9]+' src/invariants.rs | sort -u
-
-# Diff them
-comm -3 \
-  <(grep -oE 'INV-[A-Z]+-[0-9]+' docs/spec.md | sort -u) \
-  <(grep -oE 'INV-[A-Z]+-[0-9]+' src/invariants.rs | sort -u)
 ```
 
 ## Output format
 
-| ID | spec.md | invariants.rs | Status |
-|----|---------|---------------|--------|
-| INV-HIST-01 | ✓ | ✓ | Matched |
-| INV-HIST-02 | ✓ | — | Spec-only ⚠ |
-| INV-LIN-04 | — | ✓ | Code-only ⚠ |
+| ID | Spec | Code | Status |
+|----|------|------|--------|
+| INV-HIST-01 | asserted    | ✓ | Matched |
+| INV-HIST-02 | structural  | — | Matched (structural) |
+| INV-LIN-01  | structural  | — | Matched (structural) |
+| INV-LIN-02  | structural  | — | Matched (structural) |
+| INV-LIN-03  | asserted    | ✓ | Matched |
+| INV-LIN-04  | asserted    | ✓ | Matched |
+| INV-ND-01   | structural  | — | Matched (structural) |
 
-Exit non-zero if any spec-only or code-only entries are found.
-
-## Note on INV-HIST-02 and INV-LIN-01/02
-
-Some invariants (e.g., INV-HIST-02 real-time ordering, INV-LIN-01/02 soundness/completeness)
-are enforced structurally by the algorithm rather than by explicit `debug_assert!` macros.
-These are documented in the traceability matrix in `docs/spec.md` and are exempt from the
-code-only warning. List the known structural-only IDs here as they are established.
+Exit non-zero only if a row shows **Missing** or **Undocumented**.
 
 ## Retired enforcement names
 
-When a check is renamed or replaced, the old name should disappear from
-`src/invariants.rs` entirely — `/spec-sync` is text-based, so a stale comment
-will keep matching the ID. Names removed so far:
+When a check is renamed or replaced, every reference to the old name must
+be removed from `src/invariants.rs`. `/spec-sync` is text-based, so a
+lingering comment with the old name will keep matching the ID and mask a
+genuine removal.
 
-- `assert_partition_independent!` (macro) — superseded by the
+Names retired so far:
+
+- `assert_partition_independent!` (macro) — superseded by
   `assert_partition_covers_ops` and `assert_partition_events_paired`
-  functions, which check disjoint + complete + in-bounds (and pairing for the
-  events form). INV-LIN-03 enforcement is unchanged in scope; only the form
-  changed (macro → `pub(crate) fn`).
+  functions, which check disjoint + complete + in-bounds (and Call/Return
+  pairing for the events form). INV-LIN-03 enforcement is unchanged in
+  scope; only the form changed (macro → `pub(crate) fn`). Refactored in
+  commit `2e2fd4a`.
+
+## Why some invariants are structural
+
+Some invariants are whole-algorithm correctness properties — a single-line
+`debug_assert!` cannot honestly express them, and a fake assertion would
+just re-verify input data without exercising the algorithm. Examples in
+this codebase:
+
+- INV-LIN-01 / INV-LIN-02 (soundness / completeness): properties of the
+  DFS itself; verified via Quint `resultConsistent` and proptest/Hegel
+  sequential-history tests.
+- INV-HIST-02 (real-time order): held by construction because the entry
+  list is sorted by timestamp before DFS; an assertion would re-verify the
+  sort.
+- INV-ND-01 (power-set reduction): held by `PowerSetModel::step` fanning
+  out across all branches and deduping; verified via Quint
+  `powerSetSoundnessInv`.
+
+These are still verified — at the suite level via Quint, proptest, Hegel,
+and the MBT trace replay — just not as inline runtime asserts. See
+`docs/all_tests.md` § *Invariant Coverage Matrix* for the full picture.

@@ -54,10 +54,39 @@ docs/spec.md  →  tla/Porcupine.qnt  →  src/invariants.rs (debug_assert!)
 ### Invariants Convention
 
 - `docs/spec.md` is the **single source of truth** for all `INV-*` identifiers.
-- Every `INV-*` ID in `docs/spec.md` must have a matching `debug_assert!` in `src/invariants.rs`.
-- Every `debug_assert!` in `src/invariants.rs` must cite its `INV-*` ID.
-- Never add an assertion without a spec entry; never add a spec entry without an assertion.
-- Run `/spec-sync` to detect drift between the two.
+- Each spec entry must have an **Enforced by** line classifying how the
+  invariant is upheld. Two valid forms:
+  - **Asserted**: a `debug_assert!` (or `pub(crate) fn` debug-check) in
+    `src/invariants.rs`. The assertion message must cite the `INV-*` ID.
+  - **Structural**: enforced by the algorithm's construction (e.g. sort
+    order, exhaustive DFS, power-set fan-out). The spec entry must say
+    `(structural)` and name the enforcing site (file + concept), so the
+    rationale is reviewable.
+- Every assertion in `src/invariants.rs` must cite an `INV-*` ID that exists
+  in `docs/spec.md`. Never add an assertion without a spec entry.
+- Never add a spec entry without either an assertion or an explicit
+  `(structural)` enforcement note.
+- Run `/spec-sync` to detect drift. The skill flags an ID only when it is
+  *neither* asserted *nor* marked structural in the spec.
+
+#### Why "structural" exists as a category
+
+Some invariants are whole-algorithm correctness properties — they cannot
+honestly be expressed as a single-line `debug_assert!`. Examples:
+
+- INV-LIN-01 (Soundness): "the DFS result is a valid linearization"
+  — a property of the search itself, not a check at any one call site.
+- INV-LIN-02 (Completeness): "if a linearization exists, the DFS finds it"
+  — same reason; the assertion would be circular.
+- INV-HIST-02 (Real-Time Order): holds by construction because the entry
+  list is sorted by timestamp; an assertion would just re-verify the sort.
+- INV-ND-01 (Power-Set Soundness): enforced by `PowerSetModel::step`
+  fanning out across all branches and deduping; not a point-check.
+
+These are still verified — by Quint (`Porcupine.qnt resultConsistent`,
+`pCompositionality`, `NondeterministicModel.qnt powerSetSoundnessInv`),
+proptest, Hegel, and the MBT trace replay — but at the suite level rather
+than as inline runtime asserts.
 
 ### Verification Commands
 
@@ -91,12 +120,13 @@ See `SKILLS.md` at the project root for the full hierarchy. Quick reference:
 
 | ID | Name | Enforced by |
 |----|------|-------------|
-| INV-HIST-01 | Well-Formed History | `assert_well_formed!` in checker.rs |
-| INV-HIST-02 | Real-Time Order | Entry ordering in linked-list construction |
-| INV-HIST-03 | Minimal-Call Frontier | `assert_minimal_call!` in DFS loop |
-| INV-LIN-01 | Soundness | DFS correctness + Quint `soundness` |
-| INV-LIN-02 | Completeness | DFS exhaustiveness + Quint `completeness` |
-| INV-LIN-03 | P-Compositionality | `assert_partition_independent!` + proptest |
-| INV-LIN-04 | Cache Soundness | `assert_cache_sound!` + Quint `cacheSound` |
+| INV-HIST-01 | Well-Formed History | `assert_well_formed!` / `assert_well_formed_events!` (asserted) |
+| INV-HIST-02 | Real-Time Order | Entry ordering in linked-list construction (structural) |
+| INV-HIST-03 | Minimal-Call Frontier | `assert_minimal_call!` in DFS loop (asserted) |
+| INV-LIN-01 | Soundness | DFS correctness + Quint `resultConsistent` (structural) |
+| INV-LIN-02 | Completeness | DFS exhaustiveness + Quint `resultConsistent` (structural) |
+| INV-LIN-03 | P-Compositionality | `assert_partition_covers_ops` / `assert_partition_events_paired` + proptest (asserted) |
+| INV-LIN-04 | Cache Soundness | `assert_cache_sound!` + Quint `cacheSound` (asserted) |
+| INV-ND-01 | Power-Set Reduction Soundness | `PowerSetModel::step` in `src/model.rs` + Quint `powerSetSoundnessInv` (structural) |
 
 Full definitions: `docs/spec.md`. Traceability matrix: `docs/spec.md §3`.

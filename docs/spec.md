@@ -37,7 +37,7 @@ and every call event precedes its matching return event in the slice (position =
 If operation A completes before operation B begins, A must appear before B in any
 linearization of the history.
 
-- **Enforced by**: entry ordering in linked-list construction inside `checker.rs`
+- **Enforced by**: entry ordering in linked-list construction inside `checker.rs` (structural)
 - **Checked by**: `tests/property_tests.rs` — `prop_real_time_order`
 - **Formal**: Quint `realTimeOrder`
 
@@ -71,7 +71,7 @@ If the checker returns `Ok`, there must exist a sequential permutation of the op
 that (a) is consistent with real-time order and (b) satisfies the model's step function
 at every step.
 
-- **Enforced by**: correctness of DFS + backtracking in `checker.rs`
+- **Enforced by**: correctness of DFS + backtracking in `checker.rs` (structural)
 - **Checked by**: `tests/property_tests.rs` — `prop_soundness`
 - **Formal**: Quint `soundness`
 
@@ -86,7 +86,7 @@ history is linearizable w.r.t. model  →  check_operations(model, history) = Ok
 If a valid linearization exists, the checker will find it (given sufficient time — no
 timeout supplied).
 
-- **Enforced by**: exhaustive DFS in `checker.rs`
+- **Enforced by**: exhaustive DFS in `checker.rs` (structural)
 - **Checked by**: `tests/property_tests.rs` — `prop_completeness`
 - **Formal**: Quint `completeness`
 
