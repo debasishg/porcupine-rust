@@ -164,6 +164,88 @@ impl NondeterministicModel for LossyNdRegister {
 }
 
 // ---------------------------------------------------------------------------
+// Partition wrappers (used by §3 P-compositionality equivalence tests)
+// ---------------------------------------------------------------------------
+
+/// `KvModel` step semantics with `partition` disabled — `check_operations`
+/// runs the whole history as a single partition.
+#[derive(Clone)]
+pub struct KvNoPartition;
+
+impl Model for KvNoPartition {
+    type State = HashMap<u8, i64>;
+    type Input = KvInput;
+    type Output = i64;
+    fn init(&self) -> Self::State {
+        HashMap::new()
+    }
+    fn step(&self, state: &Self::State, input: &KvInput, output: &i64) -> Option<Self::State> {
+        KvModel.step(state, input, output)
+    }
+}
+
+/// `KvModel` step semantics with `partition` returning the same partitions
+/// in *reversed* order. Used by the partition-order-invariance test.
+#[derive(Clone)]
+pub struct KvModelReversedPartition;
+
+impl Model for KvModelReversedPartition {
+    type State = HashMap<u8, i64>;
+    type Input = KvInput;
+    type Output = i64;
+    fn init(&self) -> Self::State {
+        HashMap::new()
+    }
+    fn step(&self, state: &Self::State, input: &KvInput, output: &i64) -> Option<Self::State> {
+        KvModel.step(state, input, output)
+    }
+    fn partition(&self, history: &[Operation<KvInput, i64>]) -> Option<Vec<Vec<usize>>> {
+        let mut p = KvModel.partition(history)?;
+        p.reverse();
+        Some(p)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Degenerate ND fixtures (used by §4 always-reject / always-stutter tests)
+// ---------------------------------------------------------------------------
+
+/// Nondeterministic model whose `step` always returns `vec![]` — every
+/// transition is rejected. Wrapped in `PowerSetModel`, every non-empty
+/// history must be `Illegal`.
+#[derive(Clone)]
+pub struct AlwaysRejectNd;
+
+impl NondeterministicModel for AlwaysRejectNd {
+    type State = ();
+    type Input = ();
+    type Output = ();
+    fn init(&self) -> Vec<()> {
+        vec![()]
+    }
+    fn step(&self, _: &(), _: &(), _: &()) -> Vec<()> {
+        vec![]
+    }
+}
+
+/// Nondeterministic model whose `step` always stutters (returns the same
+/// state). Wrapped in `PowerSetModel`, every history must be `Ok`.
+#[derive(Clone)]
+pub struct AlwaysStutterNd;
+
+impl NondeterministicModel for AlwaysStutterNd {
+    type State = ();
+    type Input = ();
+    type Output = ();
+    fn init(&self) -> Vec<()> {
+        vec![()]
+    }
+    fn step(&self, _: &(), _: &(), _: &()) -> Vec<()> {
+        vec![()]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // History builders
 // ---------------------------------------------------------------------------
 
@@ -273,6 +355,89 @@ pub fn sequential_ops_to_events(
             ]
         })
         .collect()
+}
+
+/// Build a 2-op (write, read) history where the write occupies
+/// `[0, write_dur]` and the read occupies
+/// `[read_call, read_call + read_dur]`. Caller must ensure
+/// `read_call < write_dur` for the windows to overlap.
+pub fn build_overlap_write_read(
+    write_value: i64,
+    write_dur: u64,
+    read_call: u64,
+    read_dur: u64,
+    read_output: i64,
+) -> Vec<Operation<RegisterInput, i64>> {
+    vec![
+        Operation {
+            client_id: 0,
+            input: RegisterInput {
+                is_write: true,
+                value: write_value,
+            },
+            call: 0,
+            output: 0,
+            return_time: write_dur,
+        },
+        Operation {
+            client_id: 1,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: read_call,
+            output: read_output,
+            return_time: read_call + read_dur,
+        },
+    ]
+}
+
+/// Build a 3-op (write1, write2, late-read) history where the two writes
+/// overlap (caller ensures `w2_call < t1`) and the read is strictly after
+/// both writes return.
+pub fn build_two_writers_late_reader(
+    v1: i64,
+    v2: i64,
+    t1: u64,
+    w2_call: u64,
+    w2_dur: u64,
+    r_dur: u64,
+    read_output: i64,
+) -> Vec<Operation<RegisterInput, i64>> {
+    let w2_return = w2_call + w2_dur;
+    let r_call = std::cmp::max(t1, w2_return) + 1;
+    vec![
+        Operation {
+            client_id: 0,
+            input: RegisterInput {
+                is_write: true,
+                value: v1,
+            },
+            call: 0,
+            output: 0,
+            return_time: t1,
+        },
+        Operation {
+            client_id: 1,
+            input: RegisterInput {
+                is_write: true,
+                value: v2,
+            },
+            call: w2_call,
+            output: 0,
+            return_time: w2_return,
+        },
+        Operation {
+            client_id: 2,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: r_call,
+            output: read_output,
+            return_time: r_call + r_dur,
+        },
+    ]
 }
 
 /// Convert any operation history to an event slice ordered by time, with

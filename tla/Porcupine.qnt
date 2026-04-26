@@ -279,6 +279,66 @@ module Porcupine {
     parallelKillFlagInvariant
 
   // ---------------------------------------------------------------------------
+  // Algebraic invariants of check (cross-execution)
+  //
+  // These properties relate `check(h_1)` and `check(h_2)` where h_2 is a
+  // representational transformation of h_1 (time-shift, slice permutation,
+  // op append). They are *cross-execution* properties — they cannot be
+  // expressed as inductive state-machine invariants verifiable by
+  // `quint verify`. Each holds because the checker reads only the abstract
+  // linearizability question, never incidental representation details.
+  //
+  // Empirical verification: see the `prop_*_invariance` /
+  // `hegel_*_invariance` tests and `prop_append_preserves_illegal` /
+  // `hegel_append_preserves_illegal` in the Rust test suites.
+  // ---------------------------------------------------------------------------
+
+  // 2.1 — Time-shift invariance.
+  //
+  // ∀ h, Δ ≥ 0:  check(h).result = check(shiftHistory(h, Δ)).result
+  //
+  // Reason: `precedesInRealTime(a, b) = a.ret_ts < b.call_ts` is invariant
+  // under uniform addition of Δ to every timestamp. The checker never reads
+  // absolute time — only the difference between any two timestamps.
+  pure def shiftHistory(h: List[Op], delta: int): List[Op] =
+    h.foldl([], (acc, op) => acc.append({
+      id:       op.id,
+      call_ts:  op.call_ts + delta,
+      ret_ts:   op.ret_ts  + delta,
+      input:    op.input,
+      output:   op.output,
+      is_write: op.is_write,
+    }))
+
+  // 2.2 — Client-ID invariance.
+  //
+  // The Op record in this Quint model has no `client_id` field; the
+  // checker is structurally independent of client identity. (In Rust,
+  // `Operation.client_id` exists as caller metadata but `checker.rs` never
+  // reads it — `Entry` carries only `id`/`time`/`value`.)
+
+  // 2.3 / 2.4 — Slice-order independence.
+  //
+  // `make_entries` in checker.rs sorts entries by `(time, kind)` before
+  // DFS, so input slice order is irrelevant. With distinct timestamps the
+  // sort is total; with ties the Call-before-Return tiebreak (and the
+  // stable sort) yields a deterministic canonical order. Two slices that
+  // permute the same multiset of ops must therefore produce the same
+  // result.
+
+  // 2.5 — Append-preserves-Illegal.
+  //
+  // ∀ h, suffix with min(suffix.call_ts) > max(h.ret_ts):
+  //   check(h).result = "Illegal"  →  check(h ++ suffix).result = "Illegal"
+  //
+  // Reason: any valid linearization σ' of (h ++ suffix) restricted to h is
+  // itself a valid linearization of h. If h has no valid linearization,
+  // neither can h ++ suffix — appending only adds constraints.
+  // (`tail` is a Quint built-in, hence the parameter name `suffix`.)
+  pure def appendHistory(h: List[Op], suffix: List[Op]): List[Op] =
+    suffix.foldl(h, (acc, op) => acc.append(op))
+
+  // ---------------------------------------------------------------------------
   // Temporal properties (for `quint verify --temporal`)
   // ---------------------------------------------------------------------------
 

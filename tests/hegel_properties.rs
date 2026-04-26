@@ -35,9 +35,14 @@ use porcupine::{CheckResult, Event, Model, Operation, model::PowerSetModel};
 mod common;
 
 use common::{
-    DeterministicNdRegister, KvInput, KvModel, LossyInput, LossyNdRegister, RegisterInput,
-    RegisterModel, ops_to_events_sorted_by_time, sequential_ops_to_events,
+    AlwaysRejectNd, AlwaysStutterNd, DeterministicNdRegister, KvInput, KvModel,
+    KvModelReversedPartition, KvNoPartition, LossyInput, LossyNdRegister, RegisterInput,
+    RegisterModel, build_overlap_write_read, build_two_writers_late_reader,
+    illegal_register_history, ops_to_events_sorted_by_time, sequential_history,
+    sequential_ops_to_events,
 };
+use porcupine::model::HashedPowerSetModel;
+use std::time::Duration;
 
 // ===========================================================================
 // File-local models — only used by the partition-idempotence test below.
@@ -613,6 +618,760 @@ fn hegel_events_agree_with_operations_on_concurrent_history(tc: TestCase) {
         ops_result, events_result,
         "check_operations and check_events must agree on concurrent histories"
     );
+}
+
+// ===========================================================================
+// Algebraic invariance properties
+//
+// These properties relate two runs of `check_operations` on histories
+// that differ only in incidental representation — absolute timestamps,
+// `client_id` values, slice order, or appended ops.  The verdict must
+// depend only on the abstract linearizability question, not on these
+// representational details.
+// ===========================================================================
+
+/// Mix of generators producing both Ok and Illegal histories so the
+/// algebraic checks below exercise both verdicts.
+#[hegel::composite]
+fn gen_register_history(tc: TestCase) -> Vec<Operation<RegisterInput, i64>> {
+    let kind = tc.draw(gs::integers::<u32>().min_value(0).max_value(3));
+    match kind {
+        0 => tc.draw(gen_concurrent_writes_history()),
+        1 => {
+            let write_dur = tc.draw(gs::integers::<u64>().min_value(5).max_value(30));
+            let write_value = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+            let read_call = tc.draw(
+                gs::integers::<u64>()
+                    .min_value(0)
+                    .max_value(write_dur - 1),
+            );
+            let read_dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(30));
+            let arb_out = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+            let output_kind = tc.draw(gs::integers::<u32>().min_value(0).max_value(2));
+            let read_output = match output_kind {
+                0 => 0,
+                1 => write_value,
+                _ => arb_out,
+            };
+            build_overlap_write_read(write_value, write_dur, read_call, read_dur, read_output)
+        }
+        2 => {
+            let t1 = tc.draw(gs::integers::<u64>().min_value(10).max_value(30));
+            let w2_call = tc.draw(gs::integers::<u64>().min_value(0).max_value(t1 - 1));
+            let w2_dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(30));
+            let r_dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(30));
+            let v1 = tc.draw(gs::integers::<i64>().min_value(1).max_value(50));
+            let v2 = tc.draw(gs::integers::<i64>().min_value(1).max_value(50));
+            let arb_out = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+            let output_kind = tc.draw(gs::integers::<u32>().min_value(0).max_value(2));
+            let read_output = match output_kind {
+                0 => v1,
+                1 => v2,
+                _ => arb_out,
+            };
+            build_two_writers_late_reader(v1, v2, t1, w2_call, w2_dur, r_dur, read_output)
+        }
+        _ => illegal_register_history(),
+    }
+}
+
+/// 2.1 — Time-shift invariance.
+///
+/// Shifting every (call, return_time) by Δ must preserve the result.
+/// `precedesInRealTime` reads only `a.return_time < b.call`, which is
+/// invariant under uniform addition.
+///
+/// INV-HIST-02.
+#[hegel::test]
+fn hegel_time_shift_invariance(tc: TestCase) {
+    let history = tc.draw(gen_register_history());
+    let delta = tc.draw(gs::integers::<u64>().min_value(0).max_value(1000));
+    let shifted: Vec<_> = history
+        .iter()
+        .map(|op| Operation {
+            client_id: op.client_id,
+            input: op.input.clone(),
+            call: op.call + delta,
+            output: op.output,
+            return_time: op.return_time + delta,
+        })
+        .collect();
+    let r1 = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    let r2 = porcupine::checker::check_operations(&RegisterModel, &shifted, None);
+    assert_eq!(
+        r1, r2,
+        "INV-HIST-02: shifting all timestamps by {} must preserve the result",
+        delta
+    );
+}
+
+/// 2.2 — Client-ID invariance.
+///
+/// `client_id` is caller metadata; `Entry` doesn't carry it through the
+/// DFS.  Permuting `client_id` (and biasing the new ids upward to detect
+/// any reliance on small/dense values) must not change the result.
+#[hegel::test]
+fn hegel_client_id_invariance(tc: TestCase) {
+    let history = tc.draw(gen_register_history());
+    let n = history.len();
+    let mut perm: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let j = tc.draw(gs::integers::<usize>().min_value(0).max_value(i));
+        perm.swap(i, j);
+    }
+    let permuted: Vec<_> = history
+        .iter()
+        .enumerate()
+        .map(|(i, op)| {
+            let mut new_op = op.clone();
+            new_op.client_id = (perm[i] as u64).wrapping_add(1000);
+            new_op
+        })
+        .collect();
+    let r1 = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    let r2 = porcupine::checker::check_operations(&RegisterModel, &permuted, None);
+    assert_eq!(
+        r1, r2,
+        "client_id permutation must not change the linearizability result"
+    );
+}
+
+/// 2.3 — Equal-timestamp tiebreak invariance.
+///
+/// Two writes share *exactly* the same (call, return_time) pair.  Slice
+/// order then determines which one the stable sort places first, but
+/// both orderings yield valid linearizations — the verdict must be
+/// identical.
+///
+/// INV-HIST-02.
+#[hegel::test]
+fn hegel_equal_timestamp_tiebreak_invariance(tc: TestCase) {
+    let v1 = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+    let v2 = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+    let read_output = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+
+    let h0 = vec![
+        Operation {
+            client_id: 0,
+            input: RegisterInput {
+                is_write: true,
+                value: v1,
+            },
+            call: 0,
+            output: 0,
+            return_time: 10,
+        },
+        Operation {
+            client_id: 1,
+            input: RegisterInput {
+                is_write: true,
+                value: v2,
+            },
+            call: 0,
+            output: 0,
+            return_time: 10,
+        },
+        Operation {
+            client_id: 2,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: 11,
+            output: read_output,
+            return_time: 20,
+        },
+    ];
+    let h1 = vec![h0[1].clone(), h0[0].clone(), h0[2].clone()];
+    let r0 = porcupine::checker::check_operations(&RegisterModel, &h0, None);
+    let r1 = porcupine::checker::check_operations(&RegisterModel, &h1, None);
+    assert_eq!(
+        r0, r1,
+        "tied-timestamp swap must preserve the result (v1={}, v2={}, read_output={})",
+        v1, v2, read_output
+    );
+}
+
+/// 2.4 — Slice-order invariance.
+///
+/// Permuting the input slice (with all distinct timestamps) must not
+/// change the result, because `make_entries` sorts by `(time, kind)`
+/// before the DFS.
+///
+/// INV-HIST-02.
+#[hegel::test]
+fn hegel_slice_order_invariance(tc: TestCase) {
+    let history = tc.draw(gen_register_history());
+    let n = history.len();
+    let mut perm: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let j = tc.draw(gs::integers::<usize>().min_value(0).max_value(i));
+        perm.swap(i, j);
+    }
+    let shuffled: Vec<_> = perm.iter().map(|&i| history[i].clone()).collect();
+    let r1 = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    let r2 = porcupine::checker::check_operations(&RegisterModel, &shuffled, None);
+    assert_eq!(
+        r1, r2,
+        "slice-order permutation must not change the result"
+    );
+}
+
+/// 2.5 — Append-preserves-Illegal.
+///
+/// `check(h) = Illegal` ⇒ `check(h ++ tail) = Illegal` for any
+/// well-formed `tail` whose timestamps are strictly after `h`'s.
+/// Linearizability is monotone under temporal extension; appending
+/// writes (which `RegisterModel::step` accepts unconditionally) cannot
+/// uncover the original violation.
+///
+/// INV-LIN-02.
+#[hegel::test]
+fn hegel_append_preserves_illegal(tc: TestCase) {
+    let n_extras = tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
+    let mut h = illegal_register_history();
+    let mut ts = h.iter().map(|op| op.return_time).max().unwrap_or(0) + 1;
+    for i in 0..n_extras {
+        let dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(20));
+        h.push(Operation {
+            client_id: (100 + i) as u64,
+            input: RegisterInput {
+                is_write: true,
+                value: 100 + i as i64,
+            },
+            call: ts,
+            output: 0,
+            return_time: ts + dur,
+        });
+        ts += dur + 1;
+    }
+    let result = porcupine::checker::check_operations(&RegisterModel, &h, None);
+    assert_eq!(
+        result,
+        CheckResult::Illegal,
+        "INV-LIN-02: appending {} writes to an illegal history must preserve Illegal",
+        n_extras
+    );
+}
+
+// ===========================================================================
+// §3 — Partition / P-compositionality equivalence
+// ===========================================================================
+
+/// Generate a sequential KV history of length 2..=8 over `n_keys` keys.
+/// Read outputs are pre-set to the requested value, which may or may not
+/// match the actual register state — produces a mix of Ok/Illegal.
+#[hegel::composite]
+fn gen_kv_history(tc: TestCase, n_keys: u8) -> Vec<Operation<KvInput, i64>> {
+    let n = tc.draw(gs::integers::<usize>().min_value(2).max_value(8));
+    let mut ts = 0u64;
+    let mut history = Vec::with_capacity(n);
+    for i in 0..n {
+        let key = tc.draw(
+            gs::integers::<u8>()
+                .min_value(0)
+                .max_value(n_keys - 1),
+        );
+        let is_write = tc.draw(gs::integers::<u32>().min_value(0).max_value(1)) == 1;
+        let value = tc.draw(gs::integers::<i64>().min_value(0).max_value(10));
+        let call = ts;
+        let return_time = ts + 5;
+        ts = return_time + 1;
+        history.push(Operation {
+            client_id: i as u64,
+            input: KvInput { key, is_write, value },
+            call,
+            output: value,
+            return_time,
+        });
+    }
+    history
+}
+
+/// 3.1 — Partition equivalence (KvModel ≡ KvNoPartition).
+///
+/// INV-LIN-03.
+#[hegel::test]
+fn hegel_kv_partition_equivalence(tc: TestCase) {
+    let history = tc.draw(gen_kv_history(3));
+    let with_part = porcupine::checker::check_operations(&KvModel, &history, None);
+    let without = porcupine::checker::check_operations(&KvNoPartition, &history, None);
+    assert_eq!(
+        with_part, without,
+        "INV-LIN-03: per-partition and whole-history checks must agree"
+    );
+}
+
+/// 3.2 — Partition order invariance.
+///
+/// INV-LIN-03.
+#[hegel::test]
+fn hegel_kv_partition_order_invariance(tc: TestCase) {
+    let history = tc.draw(gen_kv_history(3));
+    let normal = porcupine::checker::check_operations(&KvModel, &history, None);
+    let reversed =
+        porcupine::checker::check_operations(&KvModelReversedPartition, &history, None);
+    assert_eq!(
+        normal, reversed,
+        "reversing the partition order must preserve the result"
+    );
+}
+
+/// 3.4 — Single-key partition fast-path equivalence.
+///
+/// INV-LIN-03.
+#[hegel::test]
+fn hegel_single_key_kv_partition_fast_path(tc: TestCase) {
+    let history = tc.draw(gen_kv_history(1));
+    let with_part = porcupine::checker::check_operations(&KvModel, &history, None);
+    let without = porcupine::checker::check_operations(&KvNoPartition, &history, None);
+    assert_eq!(
+        with_part, without,
+        "single-key fast path must agree with no-partition"
+    );
+}
+
+// ===========================================================================
+// §4 — Power-set / nondeterministic model invariants
+// ===========================================================================
+
+/// 4.1 — `PowerSetModel::step` output has no `PartialEq`-duplicates.
+///
+/// INV-ND-01.
+#[hegel::test]
+fn hegel_powerset_step_has_no_duplicates(tc: TestCase) {
+    let n_seed = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
+    let mut seed_states = Vec::with_capacity(n_seed);
+    for _ in 0..n_seed {
+        seed_states.push(tc.draw(gs::integers::<i64>().min_value(-10).max_value(10)));
+    }
+    let write_value = tc.draw(gs::integers::<i64>().min_value(-10).max_value(10));
+    let pm = PowerSetModel(LossyNdRegister);
+    if let Some(next) = pm.step(&seed_states, &LossyInput::Write(write_value), &None) {
+        for (i, s) in next.iter().enumerate() {
+            for s2 in &next[i + 1..] {
+                assert_ne!(s, s2, "PowerSetModel::step output had a duplicate state");
+            }
+        }
+    }
+}
+
+/// 4.2 — `PowerSetModel` ≡ `HashedPowerSetModel`.
+///
+/// INV-ND-01.
+#[hegel::test]
+fn hegel_powerset_eq_hashed_powerset(tc: TestCase) {
+    let n = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    let history: Vec<Operation<LossyInput, Option<i64>>> = (0..n)
+        .map(|i| {
+            let v = tc.draw(gs::integers::<i64>().min_value(-10).max_value(10));
+            Operation {
+                client_id: i as u64,
+                input: LossyInput::Write(v),
+                output: None,
+                call: (i as u64) * 2,
+                return_time: (i as u64) * 2 + 1,
+            }
+        })
+        .collect();
+    let pm = PowerSetModel(LossyNdRegister);
+    let hpm = HashedPowerSetModel(LossyNdRegister);
+    let r1 = porcupine::checker::check_operations(&pm, &history, None);
+    let r2 = porcupine::checker::check_operations(&hpm, &history, None);
+    assert_eq!(
+        r1, r2,
+        "PowerSetModel and HashedPowerSetModel must agree on Eq+Hash state types"
+    );
+}
+
+/// 4.3 — Concurrent lossy writes membership.
+///
+/// INV-ND-01.
+#[hegel::test]
+fn hegel_concurrent_lossy_writes_membership(tc: TestCase) {
+    let v1 = tc.draw(gs::integers::<i64>().min_value(1).max_value(50));
+    let v2 = tc.draw(gs::integers::<i64>().min_value(1).max_value(50));
+    let arb_out = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+    let output_kind = tc.draw(gs::integers::<u32>().min_value(0).max_value(3));
+    let read_output = match output_kind {
+        0 => 0,
+        1 => v1,
+        2 => v2,
+        _ => arb_out,
+    };
+    let history = vec![
+        Operation {
+            client_id: 0,
+            input: LossyInput::Write(v1),
+            output: None,
+            call: 0,
+            return_time: 10,
+        },
+        Operation {
+            client_id: 1,
+            input: LossyInput::Write(v2),
+            output: None,
+            call: 5,
+            return_time: 15,
+        },
+        Operation {
+            client_id: 2,
+            input: LossyInput::Read,
+            output: Some(read_output),
+            call: 16,
+            return_time: 25,
+        },
+    ];
+    let model = PowerSetModel(LossyNdRegister);
+    let result = porcupine::checker::check_operations(&model, &history, None);
+    let expected = if read_output == 0 || read_output == v1 || read_output == v2 {
+        CheckResult::Ok
+    } else {
+        CheckResult::Illegal
+    };
+    assert_eq!(
+        result, expected,
+        "lossy concurrent writes membership: v1={} v2={} read={} expected={:?}",
+        v1, v2, read_output, expected
+    );
+}
+
+/// 4.4 — Always-reject ND model: every non-empty history is Illegal.
+///
+/// INV-ND-01.
+#[hegel::test]
+fn hegel_always_reject_nd_history_illegal(tc: TestCase) {
+    let len = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    let model = PowerSetModel(AlwaysRejectNd);
+    let history: Vec<Operation<(), ()>> = (0..len)
+        .map(|i| Operation {
+            client_id: i as u64,
+            input: (),
+            output: (),
+            call: (i as u64) * 2,
+            return_time: (i as u64) * 2 + 1,
+        })
+        .collect();
+    let result = porcupine::checker::check_operations(&model, &history, None);
+    assert_eq!(
+        result,
+        CheckResult::Illegal,
+        "INV-ND-01: AlwaysRejectNd must reject every non-empty history"
+    );
+}
+
+/// 4.5 — Always-stutter ND model: every history is Ok.
+///
+/// INV-ND-01.
+#[hegel::test]
+fn hegel_always_stutter_nd_history_ok(tc: TestCase) {
+    let len = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
+    let model = PowerSetModel(AlwaysStutterNd);
+    let history: Vec<Operation<(), ()>> = (0..len)
+        .map(|i| Operation {
+            client_id: i as u64,
+            input: (),
+            output: (),
+            call: (i as u64) * 2,
+            return_time: (i as u64) * 2 + 1,
+        })
+        .collect();
+    let result = porcupine::checker::check_operations(&model, &history, None);
+    assert_eq!(
+        result,
+        CheckResult::Ok,
+        "INV-ND-01: AlwaysStutterNd must accept every history"
+    );
+}
+
+// ===========================================================================
+// §5 — Timeout semantics
+// ===========================================================================
+
+/// 5.1 — `None` timeout never returns `Unknown`.
+#[hegel::test]
+fn hegel_no_timeout_never_unknown(tc: TestCase) {
+    let history = tc.draw(gen_register_history());
+    let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    assert_ne!(
+        result,
+        CheckResult::Unknown,
+        "check_operations(_, None) must return Ok or Illegal, never Unknown"
+    );
+}
+
+/// 5.3 — Generous timeout matches unbounded.
+#[hegel::test]
+fn hegel_generous_timeout_matches_unbounded(tc: TestCase) {
+    let history = tc.draw(gen_register_history());
+    let r_none = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    let r_long = porcupine::checker::check_operations(
+        &RegisterModel,
+        &history,
+        Some(Duration::from_secs(10)),
+    );
+    assert_eq!(
+        r_none, r_long,
+        "Some(10s) timeout must match None on small histories"
+    );
+}
+
+// ===========================================================================
+// §6 — Edge-case timestamps (long-chain test only — fixed scenarios live in
+// the proptest suite, where #[test] form is more natural)
+// ===========================================================================
+
+/// 6.5 — Long sequential chain spilling Bitset past inline capacity.
+///
+/// INV-LIN-04.
+#[hegel::test]
+fn hegel_long_sequential_chain_ok(tc: TestCase) {
+    let len = tc.draw(gs::integers::<usize>().min_value(257).max_value(350));
+    let history = sequential_history(len);
+    let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    assert_eq!(
+        result,
+        CheckResult::Ok,
+        "long sequential chain ({} ops) must remain linearizable past Bitset spill",
+        len
+    );
+}
+
+// ===========================================================================
+// §9 — Round-trip / API equivalence
+// ===========================================================================
+
+/// 9.2 — Renumber idempotence.
+#[hegel::test]
+fn hegel_renumber_idempotence(tc: TestCase) {
+    let history = tc.draw(gen_concurrent_writes_history());
+    let events_dense = ops_to_events_sorted_by_time(&history);
+    let events_sparse: Vec<_> = events_dense
+        .iter()
+        .map(|ev| {
+            let mut ev = ev.clone();
+            ev.id = ev.id.wrapping_mul(1000).wrapping_add(7);
+            ev
+        })
+        .collect();
+    let r1 = porcupine::checker::check_events(&RegisterModel, &events_dense, None);
+    let r2 = porcupine::checker::check_events(&RegisterModel, &events_sparse, None);
+    assert_eq!(
+        r1, r2,
+        "renumber must produce a result that does not depend on input id density"
+    );
+}
+
+// ===========================================================================
+// §10 — Negative-control / false-positive guards
+// ===========================================================================
+
+/// 10.1 — Adversarial register read-after-writes is Illegal.
+///
+/// INV-LIN-02.
+#[hegel::test]
+fn hegel_adversarial_read_after_writes_is_illegal(tc: TestCase) {
+    let n = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+    let mut history: Vec<Operation<RegisterInput, i64>> = (0..n)
+        .map(|i| {
+            let v = tc.draw(gs::integers::<i64>().min_value(1).max_value(50));
+            Operation {
+                client_id: i as u64,
+                input: RegisterInput { is_write: true, value: v },
+                call: (i as u64) * 11,
+                output: 0,
+                return_time: (i as u64) * 11 + 5,
+            }
+        })
+        .collect();
+    let wrong_value = tc.draw(gs::integers::<i64>().min_value(-50).max_value(-1));
+    let last_return = history.last().unwrap().return_time;
+    history.push(Operation {
+        client_id: 100,
+        input: RegisterInput { is_write: false, value: 0 },
+        call: last_return + 1,
+        output: wrong_value,
+        return_time: last_return + 10,
+    });
+    let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    assert_eq!(
+        result,
+        CheckResult::Illegal,
+        "INV-LIN-02: a read of a value never written (and ≠ 0) must be Illegal"
+    );
+}
+
+/// 10.2 — Adversarial KV read is Illegal.
+///
+/// INV-LIN-02 + INV-LIN-03.
+#[hegel::test]
+fn hegel_adversarial_kv_read_is_illegal(tc: TestCase) {
+    let write_value = tc.draw(gs::integers::<i64>().min_value(1).max_value(50));
+    let wrong_value = tc.draw(gs::integers::<i64>().min_value(-50).max_value(-1));
+    let history = vec![
+        Operation {
+            client_id: 0,
+            input: KvInput { key: 1, is_write: true, value: write_value },
+            call: 0,
+            output: 0,
+            return_time: 10,
+        },
+        Operation {
+            client_id: 1,
+            input: KvInput { key: 1, is_write: false, value: 0 },
+            call: 11,
+            output: wrong_value,
+            return_time: 20,
+        },
+    ];
+    let result = porcupine::checker::check_operations(&KvModel, &history, None);
+    assert_eq!(
+        result,
+        CheckResult::Illegal,
+        "INV-LIN-02: a wrong KV read in a single-key partition must surface as Illegal"
+    );
+}
+
+// ===========================================================================
+// §7 — Stateful / state-machine extensions
+// ===========================================================================
+
+/// 7.1 — Multi-key incremental KV state machine.  Each rule appends a
+/// write or read on a randomly-chosen key, simulating a sequential KV
+/// trace, and asserts the entire growing history remains Ok.
+///
+/// INV-LIN-03.
+struct IncrementalKv {
+    history: Vec<Operation<KvInput, i64>>,
+    state: HashMap<u8, i64>,
+    next_ts: u64,
+}
+
+#[hegel::state_machine]
+impl IncrementalKv {
+    #[rule]
+    fn write_random_key(&mut self, tc: TestCase) {
+        let key = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
+        let value = tc.draw(gs::integers::<i64>().min_value(0).max_value(20));
+        let dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(5));
+        let call = self.next_ts;
+        let return_time = call + dur;
+        self.next_ts = return_time + 1;
+        self.history.push(Operation {
+            client_id: self.history.len() as u64,
+            input: KvInput { key, is_write: true, value },
+            call,
+            output: 0,
+            return_time,
+        });
+        self.state.insert(key, value);
+        let result = porcupine::checker::check_operations(&KvModel, &self.history, None);
+        assert_eq!(
+            result,
+            CheckResult::Ok,
+            "INV-LIN-03: multi-key sequential KV history must stay Ok (len={})",
+            self.history.len()
+        );
+    }
+
+    #[rule]
+    fn read_random_key(&mut self, tc: TestCase) {
+        let key = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
+        let expected = self.state.get(&key).copied().unwrap_or(0);
+        let dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(5));
+        let call = self.next_ts;
+        let return_time = call + dur;
+        self.next_ts = return_time + 1;
+        self.history.push(Operation {
+            client_id: self.history.len() as u64,
+            input: KvInput { key, is_write: false, value: 0 },
+            call,
+            output: expected,
+            return_time,
+        });
+        let result = porcupine::checker::check_operations(&KvModel, &self.history, None);
+        assert_eq!(
+            result,
+            CheckResult::Ok,
+            "INV-LIN-03: read of last-written value must keep history Ok (len={})",
+            self.history.len()
+        );
+    }
+}
+
+#[hegel::test]
+fn hegel_incremental_kv_is_linearizable(tc: TestCase) {
+    let machine = IncrementalKv {
+        history: Vec::new(),
+        state: HashMap::new(),
+        next_ts: 0,
+    };
+    hegel::stateful::run(machine, tc);
+}
+
+/// 7.3 — Concurrent writes-only state machine.  Each rule appends a
+/// write whose call window overlaps the previous op's window, building
+/// a chain of pairwise-overlapping writes.  Per §1.1, every such
+/// history must remain Ok.
+///
+/// INV-LIN-01.
+struct ConcurrentWritesChain {
+    history: Vec<Operation<RegisterInput, i64>>,
+    last_call: u64,
+    last_return: u64,
+}
+
+#[hegel::state_machine]
+impl ConcurrentWritesChain {
+    #[rule]
+    fn append_overlapping_write(&mut self, tc: TestCase) {
+        let value = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+        let dur = tc.draw(gs::integers::<u64>().min_value(2).max_value(10));
+        // Overlap with the previous op: call inside [last_call, last_return].
+        let call = if self.history.is_empty() {
+            0
+        } else {
+            // Pick somewhere strictly before last_return so windows overlap.
+            let max_call = self.last_return.saturating_sub(1);
+            let min_call = self.last_call;
+            if max_call > min_call {
+                tc.draw(
+                    gs::integers::<u64>()
+                        .min_value(min_call)
+                        .max_value(max_call),
+                )
+            } else {
+                min_call
+            }
+        };
+        let return_time = std::cmp::max(call, self.last_return) + dur;
+        self.last_call = call;
+        self.last_return = return_time;
+        self.history.push(Operation {
+            client_id: self.history.len() as u64,
+            input: RegisterInput { is_write: true, value },
+            call,
+            output: 0,
+            return_time,
+        });
+        let result = porcupine::checker::check_operations(&RegisterModel, &self.history, None);
+        assert_eq!(
+            result,
+            CheckResult::Ok,
+            "INV-LIN-01: chain of overlapping writes must stay Ok (len={})",
+            self.history.len()
+        );
+    }
+}
+
+#[hegel::test]
+fn hegel_concurrent_writes_chain_is_linearizable(tc: TestCase) {
+    let machine = ConcurrentWritesChain {
+        history: Vec::new(),
+        last_call: 0,
+        last_return: 0,
+    };
+    hegel::stateful::run(machine, tc);
 }
 
 // ===========================================================================
