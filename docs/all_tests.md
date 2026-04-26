@@ -336,7 +336,11 @@ Two `NondeterministicModel` implementations are used for the `prop_nd_*` tests:
 | `prop_nd_impossible_read_is_illegal` | INV-ND-01, INV-LIN-02 | A read of a value outside the reachable power-state is always `Illegal` |
 | `prop_nd_cache_sound_deterministic` | INV-LIN-04 | Two calls to `check_operations` with the same ND history return the same result |
 
-**Expected output**: 18 property tests, all passing.
+§§4.3–4.4 list the 18 original property tests. §§4.7–4.15 below catalogue
+33 additional properties added in the algebraic / partition / ND-extension /
+timeout / edge-case / round-trip / negative-control / codepath waves.
+
+**Expected output**: 51 property tests, all passing.
 
 ### 4.5 The illegal history used in `prop_illegal_history_is_detected`
 
@@ -351,6 +355,120 @@ This history has no valid linearization: `Illegal` is the only correct answer.
 ### 4.6 The KV model used in compositionality tests
 
 `KvModel` maps `key → i64`. Its `partition` function groups operation indices by key, giving independent sub-histories — one per key. `check_operations` uses this partition internally when `Model::partition` returns `Some(_)`, checking all partitions concurrently via rayon.
+
+For the §§4.9 / 4.15 tests three further `KvModel`-derived fixtures live in
+`tests/common/mod.rs`:
+
+- `KvNoPartition` — same step semantics, no `partition` override (history runs as one partition).
+- `KvModelReversedPartition` — overrides `partition` to return the same partitions in reversed order. Used by the partition-order-invariance test.
+- `KvEventPartitionModel` — overrides both `partition` and `partition_events`. Used by the events-form partition pipeline tests in §4.15.
+
+The §4.10 tests also use two degenerate `NondeterministicModel` fixtures in
+`tests/common/mod.rs`:
+
+- `AlwaysRejectNd` — `step` returns `vec![]` unconditionally.
+- `AlwaysStutterNd` — `step` returns the same `vec![state]` unconditionally.
+
+### 4.7 Test inventory — concurrent (overlapping) histories
+
+These exercise the DFS backtracking and cache pruning paths that
+sequential histories don't reach. See `// === Concurrent (overlapping)
+histories` block in `tests/property_tests.rs`.
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `prop_concurrent_writes_only_is_ok` | INV-LIN-01 | A writes-only history with arbitrary overlap is always linearizable |
+| `prop_concurrent_write_overlap_read_matches_membership` | INV-LIN-01, INV-LIN-02 | Write/read overlap: Ok iff read returns 0 or write_value |
+| `prop_two_writers_late_reader_matches_membership` | INV-LIN-01, INV-LIN-02, INV-HIST-02 | Two overlapping writes + strictly-later read: Ok iff read ∈ {v1, v2} |
+| `prop_events_agree_with_operations_on_concurrent_history` | INV-LIN-01, INV-LIN-02 | `check_events` ≡ `check_operations` on concurrent histories |
+
+### 4.8 Test inventory — algebraic invariance
+
+Cross-execution properties relating `check(h_1)` to `check(h_2)` where
+`h_2` is a representational transformation of `h_1`.
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `prop_time_shift_invariance` | INV-HIST-02 | Shifting all (call, return_time) by Δ preserves the result |
+| `prop_client_id_invariance` | INV-LIN-01 | Permuting `client_id` values preserves the result |
+| `prop_equal_timestamp_tiebreak_invariance` | INV-HIST-02 | Swapping two ops with identical timestamps preserves the result |
+| `prop_slice_order_invariance` | INV-HIST-02 | Permuting the input slice (with distinct timestamps) preserves the result |
+| `prop_append_preserves_illegal` | INV-LIN-02 | Appending well-formed writes to an Illegal history preserves Illegal |
+
+### 4.9 Test inventory — partition / P-compositionality equivalence
+
+Tests that pin down the operational form of INV-LIN-03 by comparing
+partitioned vs whole-history checks on the same KV history.
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `prop_kv_partition_equivalence` | INV-LIN-03 | `KvModel` (partitioned) and `KvNoPartition` (whole) agree on any KV history |
+| `prop_kv_partition_order_invariance` | INV-LIN-03 | Reversing partition order preserves the result |
+| `prop_disjoint_keys_independent` (`#[test]`) | INV-LIN-03 | Writes on disjoint keys with overlapping windows are independent |
+| `prop_single_key_kv_partition_fast_path` | INV-LIN-03 | Single-key history (single-partition fast path) ≡ no-partition |
+
+### 4.10 Test inventory — power-set / ND extensions
+
+Properties beyond the original `prop_nd_*` (§4.4): adapter equivalence,
+dedup invariant, and degenerate-model edge cases.
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `prop_powerset_step_has_no_duplicates` | INV-ND-01 | `PowerSetModel::step` output never contains `PartialEq`-equal duplicates |
+| `prop_powerset_eq_hashed_powerset` | INV-ND-01 | `PowerSetModel` and `HashedPowerSetModel` agree on `Eq + Hash` state types |
+| `prop_concurrent_lossy_writes_membership` | INV-ND-01 | Two overlapping lossy writes + late read: Ok iff read ∈ {0, v1, v2} |
+| `prop_always_reject_nd_history_illegal` | INV-ND-01 | Any non-empty history with `AlwaysRejectNd` is Illegal |
+| `prop_always_stutter_nd_history_ok` | INV-ND-01 | Any history with `AlwaysStutterNd` is Ok |
+
+### 4.11 Test inventory — timeout semantics
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `prop_no_timeout_never_unknown` | INV-LIN-01 (meta) | `check_operations(_, None)` returns Ok or Illegal — never Unknown |
+| `prop_generous_timeout_matches_unbounded` | INV-LIN-01 (meta) | A 10s timeout matches `None` on small histories |
+
+### 4.12 Test inventory — edge-case timestamps and degenerate histories
+
+These are mostly fixed `#[test]` scenarios — proptest's random search
+isn't useful for boundary values like `u64::MAX` or `i64::MIN`.
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `prop_zero_duration_op_handled` (`#[test]`) | INV-HIST-01 | Op with `call == return_time` is well-formed and works |
+| `prop_all_coincident_timestamps_handled` (`#[test]`) | INV-HIST-02 | Three ops at identical timestamps (full concurrency) are linearizable |
+| `prop_near_u64_max_timestamps_handled` (`#[test]`) | INV-HIST-01 | Timestamps near `u64::MAX` don't overflow |
+| `prop_extreme_i64_values_handled` (`#[test]`) | INV-HIST-01 | `i64::MIN` / `i64::MAX` round-trip through write/read |
+| `prop_long_sequential_chain_ok` | INV-LIN-04 | 257..350-op chain forces Bitset spill past inline `SmallVec<[u64; 4]>` |
+
+### 4.13 Test inventory — round-trip / API equivalence
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `prop_renumber_idempotence` | INV-LIN-01, INV-LIN-02 | Sparse vs dense event ids produce the same result |
+
+### 4.14 Test inventory — negative-control / false-positive guards
+
+Adversarial constructions that *deliberately* produce non-linearizable
+histories so we can confirm the checker doesn't return Ok by accident.
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `prop_adversarial_read_after_writes_is_illegal` | INV-LIN-02 | Sequential writes + read of a value never written ⇒ Illegal |
+| `prop_adversarial_kv_read_is_illegal` | INV-LIN-02, INV-LIN-03 | KV write + read of a wrong value on the same key ⇒ Illegal |
+
+### 4.15 Test inventory — codepath / boundary coverage
+
+Targeted at code paths the thematic suites don't reach naturally:
+`assert_well_formed_events` panic, `partition_events` branch, and the
+rayon-vs-sequential dispatch threshold in `check_parallel`.
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `prop_reversed_pair_order_panics_in_debug` (`#[test]`, `#[should_panic]`, debug-only) | INV-HIST-01 | `assert_well_formed_events` fires when a Return precedes its matching Call |
+| `prop_partition_events_agrees_with_partition_ops` | INV-LIN-03 | `KvEventPartitionModel.check_events` ≡ `KvModel.check_operations` on the same history |
+| `prop_partition_events_agrees_with_no_partition` | INV-LIN-03 | `KvEventPartitionModel.check_events` ≡ `KvNoPartition.check_events` |
+| `prop_parallel_above_threshold_agrees_with_sequential` (`#[test]`) | INV-LIN-03 | 1100-op KV history (2200 entries > `SEQUENTIAL_THRESHOLD`) — rayon path matches single-partition sequential |
+| `prop_parallel_above_threshold_surfaces_illegal` (`#[test]`) | INV-LIN-02, INV-LIN-03 | Same large input with one illegal stale read; rayon dispatch surfaces Illegal |
 
 ---
 
@@ -382,6 +500,12 @@ For a deeper comparison — pros and cons of each engine, when to reach for whic
 ### 4b.2 Models reused
 
 The same `RegisterModel`, `KvModel`, `DeterministicNdRegister`, and `LossyNdRegister` types as `tests/property_tests.rs`, plus a `KvSinglePartition` wrapper used by `hegel_partition_idempotent_with_single_partition`.
+
+The §§4b.7–4b.16 sections below also reuse the additional fixtures
+introduced in §4.6 (`KvNoPartition`, `KvModelReversedPartition`,
+`KvEventPartitionModel`, `AlwaysRejectNd`, `AlwaysStutterNd`) and the
+two helpers `build_overlap_write_read` / `build_two_writers_late_reader`
+in `tests/common/mod.rs`.
 
 ### 4b.3 Test inventory — operation API
 
@@ -420,7 +544,93 @@ The same `RegisterModel`, `KvModel`, `DeterministicNdRegister`, and `LossyNdRegi
 |------|-------|-------------|
 | `hegel_incremental_register_is_linearizable` | INV-LIN-01 | A Hegel state machine grows a sequential register history one op at a time (`append_write`, `append_read_of_last`); after each rule the checker must report `Ok`. Surfaces any soundness bug whose effect depends on history length or interleaving order |
 
-**Expected output**: 17 tests, all passing (≈ 7–10 s including the first-run `uv` install of ~5 MB).
+§§4b.3–4b.6 list the 17 original Hegel tests. §§4b.7–4b.16 below
+catalogue 27 additional properties added in the algebraic / partition /
+ND-extension / timeout / edge-case / round-trip / negative-control /
+stateful / codepath waves.
+
+### 4b.7 Test inventory — concurrent (overlapping) histories
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_concurrent_writes_only_is_ok` | INV-LIN-01 | Writes-only with arbitrary overlap is always linearizable |
+| `hegel_concurrent_write_overlap_read_matches_membership` | INV-LIN-01, INV-LIN-02 | Write/read overlap: Ok iff read returns 0 or write_value |
+| `hegel_two_writers_late_reader_matches_membership` | INV-LIN-01, INV-LIN-02, INV-HIST-02 | Two overlapping writes + strictly-later read: Ok iff read ∈ {v1, v2} |
+| `hegel_events_agree_with_operations_on_concurrent_history` | INV-LIN-01, INV-LIN-02 | `check_events` ≡ `check_operations` on concurrent histories |
+
+### 4b.8 Test inventory — algebraic invariance
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_time_shift_invariance` | INV-HIST-02 | Shifting all timestamps by Δ preserves the result |
+| `hegel_client_id_invariance` | INV-LIN-01 | Permuting `client_id` values preserves the result |
+| `hegel_equal_timestamp_tiebreak_invariance` | INV-HIST-02 | Swapping tied-timestamp ops preserves the result |
+| `hegel_slice_order_invariance` | INV-HIST-02 | Permuting the input slice preserves the result |
+| `hegel_append_preserves_illegal` | INV-LIN-02 | Appending writes to an Illegal history preserves Illegal |
+
+### 4b.9 Test inventory — partition / P-compositionality equivalence
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_kv_partition_equivalence` | INV-LIN-03 | `KvModel` ≡ `KvNoPartition` on the same KV history |
+| `hegel_kv_partition_order_invariance` | INV-LIN-03 | Reversing partition order preserves the result |
+| `hegel_single_key_kv_partition_fast_path` | INV-LIN-03 | Single-key fast path ≡ no-partition |
+
+### 4b.10 Test inventory — power-set / ND extensions
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_powerset_step_has_no_duplicates` | INV-ND-01 | `PowerSetModel::step` output is dedup-free |
+| `hegel_powerset_eq_hashed_powerset` | INV-ND-01 | `PowerSetModel` ≡ `HashedPowerSetModel` on `Eq + Hash` states |
+| `hegel_concurrent_lossy_writes_membership` | INV-ND-01 | Two overlapping lossy writes + late read: Ok iff read ∈ {0, v1, v2} |
+| `hegel_always_reject_nd_history_illegal` | INV-ND-01 | Any non-empty history with `AlwaysRejectNd` is Illegal |
+| `hegel_always_stutter_nd_history_ok` | INV-ND-01 | Any history with `AlwaysStutterNd` is Ok |
+
+### 4b.11 Test inventory — timeout semantics
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_no_timeout_never_unknown` | INV-LIN-01 (meta) | `check_operations(_, None)` returns Ok or Illegal — never Unknown |
+| `hegel_generous_timeout_matches_unbounded` | INV-LIN-01 (meta) | A 10s timeout matches `None` on small histories |
+
+### 4b.12 Test inventory — edge cases
+
+Most §6 boundary tests (zero-duration, all-coincident, near-`u64::MAX`,
+extreme `i64`) are fixed `#[test]` scenarios in the proptest suite —
+random search adds nothing. Hegel mirrors only the long-chain test.
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_long_sequential_chain_ok` | INV-LIN-04 | 257..350-op sequential chain past Bitset spill |
+
+### 4b.13 Test inventory — round-trip / API equivalence
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_renumber_idempotence` | INV-LIN-01, INV-LIN-02 | Sparse vs dense event ids produce the same result |
+
+### 4b.14 Test inventory — negative-control / false-positive guards
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_adversarial_read_after_writes_is_illegal` | INV-LIN-02 | Sequential writes + read of an unwritten value ⇒ Illegal |
+| `hegel_adversarial_kv_read_is_illegal` | INV-LIN-02, INV-LIN-03 | KV write + wrong-value read on the same key ⇒ Illegal |
+
+### 4b.15 Stateful tests (additions to §4b.6)
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_incremental_kv_is_linearizable` | INV-LIN-03 | Multi-key KV state machine — `write_random_key` / `read_random_key` rules build a sequential trace; checker must stay Ok at every step |
+| `hegel_concurrent_writes_chain_is_linearizable` | INV-LIN-01 | Each rule appends a write whose call window overlaps the previous op's window, building a chain of pairwise-overlapping writes; verdict must remain Ok |
+
+### 4b.16 Test inventory — codepath / boundary coverage
+
+| Test | INV-* | Description |
+|------|-------|-------------|
+| `hegel_partition_events_agrees_with_partition_ops` | INV-LIN-03 | `KvEventPartitionModel.check_events` ≡ `KvModel.check_operations` on the same history |
+| `hegel_partition_events_agrees_with_no_partition` | INV-LIN-03 | `KvEventPartitionModel.check_events` ≡ `KvNoPartition.check_events` |
+
+**Expected output**: 44 tests, all passing (≈ 6–8 s including the first-run `uv` install of ~5 MB).
 
 ---
 
