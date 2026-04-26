@@ -14,7 +14,7 @@ mod common;
 use common::{
     DeterministicNdRegister, KvInput, KvModel, LossyInput, LossyNdRegister, RegisterInput,
     RegisterModel, illegal_register_history, illegal_register_history_as_events,
-    sequential_history, sequential_ops_to_events, single_op_history,
+    ops_to_events_sorted_by_time, sequential_history, sequential_ops_to_events, single_op_history,
 };
 
 // ---------------------------------------------------------------------------
@@ -447,5 +447,217 @@ proptest! {
         let r2 = porcupine::checker::check_operations(&model, &history, None);
         prop_assert_eq!(r1, r2,
             "INV-LIN-04: identical ND inputs must yield identical results");
+    }
+}
+
+// ===========================================================================
+// Concurrent (overlapping) histories
+//
+// The properties above almost exclusively use sequential histories (no
+// overlap between ops), which means the DFS backtracking and cache pruning
+// paths in `checker.rs` are barely exercised.  These properties build
+// histories whose [call, return] windows overlap, forcing the checker into
+// the genuinely interesting code paths (lift / unlift / deferred-clone
+// cache probe / etc.).
+// ===========================================================================
+
+prop_compose! {
+    /// Generate a writes-only register history of length `min_len..=max_len`
+    /// where call/return windows are drawn independently in [0, 80] and so
+    /// pairwise-overlap with high probability.
+    fn arb_concurrent_writes(min_len: usize, max_len: usize)
+        (n in min_len..=max_len)
+        (specs in prop::collection::vec((0u64..40, 1u64..40), n..=n))
+        -> Vec<Operation<RegisterInput, i64>>
+    {
+        specs
+            .into_iter()
+            .enumerate()
+            .map(|(i, (call, dur))| Operation {
+                client_id: i as u64,
+                input: RegisterInput { is_write: true, value: i as i64 },
+                call,
+                output: 0,
+                return_time: call + dur,
+            })
+            .collect()
+    }
+}
+
+proptest! {
+    /// 1.1 — A writes-only register history is always linearizable, no
+    /// matter how the call/return windows overlap.  `RegisterModel::step`
+    /// accepts every write unconditionally, so any interleaving is a valid
+    /// linearization and the DFS must always succeed.
+    ///
+    /// INV-LIN-01.
+    #[test]
+    fn prop_concurrent_writes_only_is_ok(
+        history in arb_concurrent_writes(2, 8)
+    ) {
+        let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+        prop_assert_eq!(result, CheckResult::Ok,
+            "INV-LIN-01: a concurrent writes-only history must be linearizable");
+    }
+}
+
+prop_compose! {
+    /// Generate a 2-op (write, read) parameter set in which the read's
+    /// call lies strictly before the write's return — i.e. the windows
+    /// overlap.  `output_kind` biases `read_output` so the {Ok, Illegal}
+    /// branches both get exercised in a 100-case run.
+    fn arb_overlap_write_read()
+        (write_dur in 5u64..30, write_value in -50i64..50)
+        (write_dur in Just(write_dur),
+         write_value in Just(write_value),
+         read_call in 0u64..write_dur,
+         read_dur in 1u64..30,
+         arb_out in -50i64..50,
+         output_kind in 0u32..3)
+        -> (i64, u64, u64, u64, i64)
+    {
+        let read_output = match output_kind {
+            0 => 0,
+            1 => write_value,
+            _ => arb_out,
+        };
+        (write_value, write_dur, read_call, read_dur, read_output)
+    }
+}
+
+proptest! {
+    /// 1.2 — A write `[0, write_dur]` overlapping a read whose call lies
+    /// in `[0, write_dur)`.  Both linearizations are admissible:
+    ///   - `[read, write]`  → register state at read time is 0
+    ///   - `[write, read]`  → register state at read time is `write_value`
+    /// So the result is `Ok` iff the read returns either of those, and
+    /// `Illegal` otherwise.
+    ///
+    /// INV-LIN-01 + INV-LIN-02.
+    #[test]
+    fn prop_concurrent_write_overlap_read_matches_membership(
+        params in arb_overlap_write_read()
+    ) {
+        let (write_value, write_dur, read_call, read_dur, read_output) = params;
+        let history = vec![
+            Operation {
+                client_id: 0,
+                input: RegisterInput { is_write: true, value: write_value },
+                call: 0,
+                output: 0,
+                return_time: write_dur,
+            },
+            Operation {
+                client_id: 1,
+                input: RegisterInput { is_write: false, value: 0 },
+                call: read_call,
+                output: read_output,
+                return_time: read_call + read_dur,
+            },
+        ];
+        let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+        let expected = if read_output == 0 || read_output == write_value {
+            CheckResult::Ok
+        } else {
+            CheckResult::Illegal
+        };
+        prop_assert_eq!(result, expected,
+            "concurrent write/read: write_value={} read_output={} expected={:?}",
+            write_value, read_output, expected);
+    }
+}
+
+prop_compose! {
+    /// Generate a 3-op (write1, write2, late_read) parameter set with
+    /// `v1, v2 ≥ 1` (so 0 is *not* a valid late-read output), the two
+    /// writes overlapping each other, and the read strictly after both
+    /// writes complete.
+    fn arb_two_writers_late_reader()
+        (t1 in 10u64..30, v1 in 1i64..50, v2 in 1i64..50)
+        (t1 in Just(t1), v1 in Just(v1), v2 in Just(v2),
+         w2_call in 0u64..t1,
+         w2_dur in 1u64..30,
+         r_dur in 1u64..30,
+         arb_out in -50i64..50,
+         output_kind in 0u32..3)
+        -> (i64, i64, u64, u64, u64, u64, i64)
+    {
+        let read_output = match output_kind {
+            0 => v1,
+            1 => v2,
+            _ => arb_out,
+        };
+        (v1, v2, t1, w2_call, w2_dur, r_dur, read_output)
+    }
+}
+
+proptest! {
+    /// 1.3 — Two writes overlapping each other in real time, followed by
+    /// a read whose call is strictly after both writes return.  Real-time
+    /// order forces the read to come last in any linearization, but the
+    /// two writes can be ordered either way.  So the late read must
+    /// observe `v1` or `v2`; any other value (including 0, since both
+    /// writes are non-zero) is `Illegal`.
+    ///
+    /// INV-LIN-01 + INV-LIN-02 + INV-HIST-02.
+    #[test]
+    fn prop_two_writers_late_reader_matches_membership(
+        params in arb_two_writers_late_reader()
+    ) {
+        let (v1, v2, t1, w2_call, w2_dur, r_dur, read_output) = params;
+        let w2_return = w2_call + w2_dur;
+        let r_call = std::cmp::max(t1, w2_return) + 1;
+        let history = vec![
+            Operation {
+                client_id: 0,
+                input: RegisterInput { is_write: true, value: v1 },
+                call: 0,
+                output: 0,
+                return_time: t1,
+            },
+            Operation {
+                client_id: 1,
+                input: RegisterInput { is_write: true, value: v2 },
+                call: w2_call,
+                output: 0,
+                return_time: w2_return,
+            },
+            Operation {
+                client_id: 2,
+                input: RegisterInput { is_write: false, value: 0 },
+                call: r_call,
+                output: read_output,
+                return_time: r_call + r_dur,
+            },
+        ];
+        let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+        let expected = if read_output == v1 || read_output == v2 {
+            CheckResult::Ok
+        } else {
+            CheckResult::Illegal
+        };
+        prop_assert_eq!(result, expected,
+            "two writers + late read: v1={} v2={} read_output={} expected={:?}",
+            v1, v2, read_output, expected);
+    }
+}
+
+proptest! {
+    /// 1.4 — `check_events` must agree with `check_operations` on
+    /// concurrent (overlapping) histories.  The earlier sequential
+    /// equivalence test never exercises the event pipeline's handling of
+    /// interleaved Call/Return events, where bugs in `convert_entries` or
+    /// `renumber` would surface.
+    ///
+    /// INV-LIN-01 + INV-LIN-02.
+    #[test]
+    fn prop_events_agree_with_operations_on_concurrent_history(
+        history in arb_concurrent_writes(2, 6)
+    ) {
+        let events = ops_to_events_sorted_by_time(&history);
+        let ops_result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+        let events_result = porcupine::checker::check_events(&RegisterModel, &events, None);
+        prop_assert_eq!(ops_result, events_result,
+            "check_operations and check_events must agree on concurrent histories");
     }
 }

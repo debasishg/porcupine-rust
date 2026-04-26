@@ -275,6 +275,53 @@ pub fn sequential_ops_to_events(
         .collect()
 }
 
+/// Convert any operation history to an event slice ordered by time, with
+/// calls preceding returns at equal timestamps. Suitable for *concurrent*
+/// (overlapping) histories — unlike [`sequential_ops_to_events`] which
+/// emits events in slice order and is only correct when ops don't overlap.
+///
+/// Mirrors the tiebreak in `checker::make_entries`: at equal timestamps a
+/// `Call` always sorts before a `Return`.
+pub fn ops_to_events_sorted_by_time<I: Clone, O: Clone>(
+    ops: &[Operation<I, O>],
+) -> Vec<Event<I, O>> {
+    let mut entries: Vec<(u64, bool, usize)> = Vec::with_capacity(ops.len() * 2);
+    for (i, op) in ops.iter().enumerate() {
+        entries.push((op.call, true, i));        // true = Call
+        entries.push((op.return_time, false, i)); // false = Return
+    }
+    entries.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| match (a.1, b.1) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        })
+    });
+    entries
+        .into_iter()
+        .map(|(_, is_call, i)| {
+            let op = &ops[i];
+            if is_call {
+                Event {
+                    client_id: op.client_id,
+                    kind: EventKind::Call,
+                    input: Some(op.input.clone()),
+                    output: None,
+                    id: i as u64,
+                }
+            } else {
+                Event {
+                    client_id: op.client_id,
+                    kind: EventKind::Return,
+                    input: None,
+                    output: Some(op.output.clone()),
+                    id: i as u64,
+                }
+            }
+        })
+        .collect()
+}
+
 /// A 2-op illegal event history (write completes, subsequent read returns 0).
 pub fn illegal_register_history_as_events() -> Vec<Event<RegisterInput, i64>> {
     vec![

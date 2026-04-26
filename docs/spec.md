@@ -40,9 +40,13 @@ If operation A completes before operation B begins, A must appear before B in an
 linearization of the history.
 
 - **Enforced by**: entry ordering in linked-list construction inside `checker.rs` (structural)
-- **Checked by**: `tests/property_tests.rs` — `prop_real_time_order`
-  (no direct Hegel counterpart — covered transitively by the
-  `hegel_sequential_*_is_linearizable` suites)
+- **Checked by**:
+  - `tests/property_tests.rs` — `prop_real_time_order`,
+    `prop_two_writers_late_reader_matches_membership` (the late read must
+    follow both overlapping writes in any valid linearization)
+  - `tests/hegel_properties.rs` —
+    `hegel_two_writers_late_reader_matches_membership`; the
+    `hegel_sequential_*_is_linearizable` suites cover this transitively.
 - **Formal**: Quint `realTimeOrder`
 
 ---
@@ -80,11 +84,19 @@ at every step.
 - **Enforced by**: correctness of DFS + backtracking in `checker.rs` (structural)
 - **Checked by**:
   - `tests/property_tests.rs` — `prop_soundness`,
-    `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable`
+    `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable`,
+    `prop_concurrent_writes_only_is_ok`,
+    `prop_concurrent_write_overlap_read_matches_membership`,
+    `prop_two_writers_late_reader_matches_membership`,
+    `prop_events_agree_with_operations_on_concurrent_history`
   - `tests/hegel_properties.rs` — `hegel_sequential_history_is_linearizable`,
     `hegel_single_op_is_linearizable`, `hegel_empty_history_is_ok`,
     `hegel_prefixes_of_sequential_are_linearizable`,
-    `hegel_incremental_register_is_linearizable` (stateful)
+    `hegel_incremental_register_is_linearizable` (stateful),
+    `hegel_concurrent_writes_only_is_ok`,
+    `hegel_concurrent_write_overlap_read_matches_membership`,
+    `hegel_two_writers_late_reader_matches_membership`,
+    `hegel_events_agree_with_operations_on_concurrent_history`
 - **Formal**: Quint `soundness`
 
 ---
@@ -101,9 +113,15 @@ timeout supplied).
 - **Enforced by**: exhaustive DFS in `checker.rs` (structural)
 - **Checked by**:
   - `tests/property_tests.rs` — `prop_completeness`,
-    `prop_illegal_history_is_detected`
+    `prop_illegal_history_is_detected`,
+    `prop_concurrent_write_overlap_read_matches_membership`,
+    `prop_two_writers_late_reader_matches_membership`,
+    `prop_events_agree_with_operations_on_concurrent_history`
   - `tests/hegel_properties.rs` — `hegel_illegal_history_is_detected`,
-    `hegel_stale_read_is_always_illegal`
+    `hegel_stale_read_is_always_illegal`,
+    `hegel_concurrent_write_overlap_read_matches_membership`,
+    `hegel_two_writers_late_reader_matches_membership`,
+    `hegel_events_agree_with_operations_on_concurrent_history`
 - **Formal**: Quint `completeness`
 
 ---
@@ -198,10 +216,10 @@ agree on all histories.
 | ID | spec.md | invariants.rs | property_tests.rs | hegel_properties.rs | Quint |
 |----|---------|---------------|-------------------|---------------------|-------|
 | INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` | `hegel_well_formed_history` | `Porcupine.qnt histWellFormed` |
-| INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order` | (transitive via `hegel_sequential_*`) | `Porcupine.qnt realTimeOrder` |
+| INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order`, `prop_two_writers_late_reader_matches_membership` | `hegel_two_writers_late_reader_matches_membership` (+ transitive via `hegel_sequential_*`) | `Porcupine.qnt realTimeOrder` |
 | INV-HIST-03 | §1 | `assert_minimal_call` | `prop_soundness` | (transitive via `hegel_sequential_*`) | `Porcupine.qnt minimalCallFrontier` |
-| INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `hegel_sequential_history_is_linearizable`, `hegel_single_op_is_linearizable`, `hegel_empty_history_is_ok`, `hegel_prefixes_of_sequential_are_linearizable`, `hegel_incremental_register_is_linearizable` | `Porcupine.qnt resultConsistent` |
-| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` | `hegel_illegal_history_is_detected`, `hegel_stale_read_is_always_illegal` | `Porcupine.qnt resultConsistent` |
+| INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable`, `prop_concurrent_writes_only_is_ok`, `prop_concurrent_write_overlap_read_matches_membership`, `prop_two_writers_late_reader_matches_membership`, `prop_events_agree_with_operations_on_concurrent_history` | `hegel_sequential_history_is_linearizable`, `hegel_single_op_is_linearizable`, `hegel_empty_history_is_ok`, `hegel_prefixes_of_sequential_are_linearizable`, `hegel_incremental_register_is_linearizable`, `hegel_concurrent_writes_only_is_ok`, `hegel_concurrent_write_overlap_read_matches_membership`, `hegel_two_writers_late_reader_matches_membership`, `hegel_events_agree_with_operations_on_concurrent_history` | `Porcupine.qnt resultConsistent` |
+| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected`, `prop_concurrent_write_overlap_read_matches_membership`, `prop_two_writers_late_reader_matches_membership`, `prop_events_agree_with_operations_on_concurrent_history` | `hegel_illegal_history_is_detected`, `hegel_stale_read_is_always_illegal`, `hegel_concurrent_write_overlap_read_matches_membership`, `hegel_two_writers_late_reader_matches_membership`, `hegel_events_agree_with_operations_on_concurrent_history` | `Porcupine.qnt resultConsistent` |
 | INV-LIN-03 | §2 | `assert_partition_covers_ops`, `assert_partition_events_paired` | `prop_compositionality_*` | `hegel_partitions_are_disjoint_and_complete`, `hegel_kv_sequential_history_is_linearizable`, `hegel_partition_idempotent_with_single_partition` | `Porcupine.qnt pCompositionality` |
 | INV-LIN-04 | §2 | `assert_cache_sound` | `prop_cache_sound` | `hegel_cache_sound_deterministic_ops`, `hegel_cache_sound_deterministic_events` | `Porcupine.qnt cacheSound` |
 | INV-ND-01 | §3 | (structural in `PowerSetModel::step`) | `prop_nd_*` | `hegel_nd_deterministic_agrees_with_model`, `hegel_nd_sequential_writes_linearizable`, `hegel_nd_impossible_read_is_illegal` | `NondeterministicModel.qnt powerSetSoundnessInv` |

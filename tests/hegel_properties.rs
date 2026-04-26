@@ -36,7 +36,7 @@ mod common;
 
 use common::{
     DeterministicNdRegister, KvInput, KvModel, LossyInput, LossyNdRegister, RegisterInput,
-    RegisterModel, sequential_ops_to_events,
+    RegisterModel, ops_to_events_sorted_by_time, sequential_ops_to_events,
 };
 
 // ===========================================================================
@@ -414,6 +414,204 @@ fn hegel_events_agree_with_operations(tc: TestCase) {
     assert_eq!(
         ops_result, events_result,
         "check_operations and check_events must agree on the same sequential history"
+    );
+}
+
+// ===========================================================================
+// Concurrent (overlapping) histories
+//
+// The properties above almost exclusively use sequential (non-overlapping)
+// histories.  The DFS backtracking and cache pruning paths in `checker.rs`
+// only fire when ops overlap — these tests force the checker into those
+// paths so that bugs in `lift`/`unlift`, `match_idx` wiring, or the
+// deferred-clone cache probe become visible.
+// ===========================================================================
+
+/// Generate a writes-only register history of length 2..=8 with call/duration
+/// drawn independently in [0, 40] / [1, 40] — windows overlap with high
+/// probability.
+#[hegel::composite]
+fn gen_concurrent_writes_history(tc: TestCase) -> Vec<Operation<RegisterInput, i64>> {
+    let n = tc.draw(gs::integers::<usize>().min_value(2).max_value(8));
+    let mut ops = Vec::with_capacity(n);
+    for i in 0..n {
+        let call = tc.draw(gs::integers::<u64>().min_value(0).max_value(40));
+        let duration = tc.draw(gs::integers::<u64>().min_value(1).max_value(40));
+        ops.push(Operation {
+            client_id: i as u64,
+            input: RegisterInput {
+                is_write: true,
+                value: i as i64,
+            },
+            call,
+            output: 0,
+            return_time: call + duration,
+        });
+    }
+    ops
+}
+
+/// 1.1 — A writes-only register history is always linearizable, regardless
+/// of how the windows overlap.  `RegisterModel::step` accepts every write,
+/// so any DFS interleaving succeeds.
+///
+/// INV-LIN-01.
+#[hegel::test]
+fn hegel_concurrent_writes_only_is_ok(tc: TestCase) {
+    let history = tc.draw(gen_concurrent_writes_history());
+    let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    assert_eq!(
+        result,
+        CheckResult::Ok,
+        "INV-LIN-01: a concurrent writes-only history must be linearizable"
+    );
+}
+
+/// 1.2 — A write `[0, write_dur]` overlapping a read whose call lies in
+/// `[0, write_dur)`.  Both linearizations are admissible, so the result is
+/// `Ok` iff the read returns 0 (linearized before the write) or
+/// `write_value` (linearized after).  Anything else is `Illegal`.
+///
+/// INV-LIN-01 + INV-LIN-02.
+#[hegel::test]
+fn hegel_concurrent_write_overlap_read_matches_membership(tc: TestCase) {
+    let write_dur = tc.draw(gs::integers::<u64>().min_value(5).max_value(30));
+    let write_value = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+    let read_call = tc.draw(
+        gs::integers::<u64>()
+            .min_value(0)
+            .max_value(write_dur - 1),
+    );
+    let read_dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(30));
+    let arb_out = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+    let output_kind = tc.draw(gs::integers::<u32>().min_value(0).max_value(2));
+    let read_output = match output_kind {
+        0 => 0,
+        1 => write_value,
+        _ => arb_out,
+    };
+
+    let history = vec![
+        Operation {
+            client_id: 0,
+            input: RegisterInput {
+                is_write: true,
+                value: write_value,
+            },
+            call: 0,
+            output: 0,
+            return_time: write_dur,
+        },
+        Operation {
+            client_id: 1,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: read_call,
+            output: read_output,
+            return_time: read_call + read_dur,
+        },
+    ];
+    let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    let expected = if read_output == 0 || read_output == write_value {
+        CheckResult::Ok
+    } else {
+        CheckResult::Illegal
+    };
+    assert_eq!(
+        result, expected,
+        "concurrent write/read: write_value={} read_output={} expected={:?}",
+        write_value, read_output, expected
+    );
+}
+
+/// 1.3 — Two writes overlapping each other in real time, followed by a
+/// read whose call is strictly after both writes return.  Real-time order
+/// forces the read to come last in every valid linearization, so it must
+/// observe `v1` or `v2`.  Both writes are non-zero, so an output of 0
+/// (the initial state) is `Illegal`.
+///
+/// INV-LIN-01 + INV-LIN-02 + INV-HIST-02.
+#[hegel::test]
+fn hegel_two_writers_late_reader_matches_membership(tc: TestCase) {
+    let t1 = tc.draw(gs::integers::<u64>().min_value(10).max_value(30));
+    let w2_call = tc.draw(gs::integers::<u64>().min_value(0).max_value(t1 - 1));
+    let w2_dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(30));
+    let r_dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(30));
+    let v1 = tc.draw(gs::integers::<i64>().min_value(1).max_value(50));
+    let v2 = tc.draw(gs::integers::<i64>().min_value(1).max_value(50));
+    let arb_out = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
+    let output_kind = tc.draw(gs::integers::<u32>().min_value(0).max_value(2));
+    let read_output = match output_kind {
+        0 => v1,
+        1 => v2,
+        _ => arb_out,
+    };
+
+    let w2_return = w2_call + w2_dur;
+    let r_call = std::cmp::max(t1, w2_return) + 1;
+    let history = vec![
+        Operation {
+            client_id: 0,
+            input: RegisterInput {
+                is_write: true,
+                value: v1,
+            },
+            call: 0,
+            output: 0,
+            return_time: t1,
+        },
+        Operation {
+            client_id: 1,
+            input: RegisterInput {
+                is_write: true,
+                value: v2,
+            },
+            call: w2_call,
+            output: 0,
+            return_time: w2_return,
+        },
+        Operation {
+            client_id: 2,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: r_call,
+            output: read_output,
+            return_time: r_call + r_dur,
+        },
+    ];
+    let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    let expected = if read_output == v1 || read_output == v2 {
+        CheckResult::Ok
+    } else {
+        CheckResult::Illegal
+    };
+    assert_eq!(
+        result, expected,
+        "two writers + late read: v1={} v2={} read_output={} expected={:?}",
+        v1, v2, read_output, expected
+    );
+}
+
+/// 1.4 — `check_events` and `check_operations` must agree on concurrent
+/// histories.  This is the strongest property for the event pipeline: any
+/// bug in `convert_entries`, `renumber`, or the equal-timestamp
+/// Call-before-Return tiebreak that causes the two APIs to diverge will
+/// be caught here.
+///
+/// INV-LIN-01 + INV-LIN-02.
+#[hegel::test]
+fn hegel_events_agree_with_operations_on_concurrent_history(tc: TestCase) {
+    let history = tc.draw(gen_concurrent_writes_history());
+    let events = ops_to_events_sorted_by_time(&history);
+    let ops_result = porcupine::checker::check_operations(&RegisterModel, &history, None);
+    let events_result = porcupine::checker::check_events(&RegisterModel, &events, None);
+    assert_eq!(
+        ops_result, events_result,
+        "check_operations and check_events must agree on concurrent histories"
     );
 }
 
