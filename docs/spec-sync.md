@@ -662,9 +662,17 @@ The whole reconciliation lives in commits `1f6ec25` (policy change) and
    useful.
 
    - **Enforced by**: `debug_assert!` in `invariants::assert_my_thing`
-   - **Checked by**: `tests/property_tests.rs` — `prop_my_thing`
+   - **Checked by**:
+     - `tests/property_tests.rs` — `prop_my_thing`
+     - `tests/hegel_properties.rs` — `hegel_my_thing` (if a Hegel
+       counterpart exists; see `docs/hegel_v_proptest.md` for when to add
+       one)
    - **Formal**: Quint `myThing` (if applicable)
    ```
+
+   The `Checked by` line is purely documentary — `spec-sync.sh` doesn't
+   read it. But by convention every invariant in this repo gets *both*
+   a proptest and a Hegel test where one is feasible, so cite both.
 3. Add the assertion to `src/invariants.rs`. The message **must** start
    with `"INV-LIN-05: "` so the grep in `spec-sync.sh` matches.
 4. Wire a call to it from `src/checker.rs` at the appropriate point.
@@ -798,6 +806,10 @@ awk '/^### INV-/{ if(id) p(); match($0,/INV-[A-Z]+-[0-9]+/); id=substr($0,RSTART
 
 - `docs/spec.md` — the invariant definitions themselves.
 - `docs/all_tests.md` § *Invariant Coverage Matrix* — which test exercises each INV-*.
+- `docs/all_tests.md` § 4 (proptest) and § 4b (Hegel) — what each property
+  suite covers and how to run it.
+- `docs/hegel_v_proptest.md` — when to reach for Hegel vs proptest, and
+  why this repo keeps both.
 - `docs/self-verified-pipeline.md` — broader picture of how spec, code,
   and tests connect.
 - `.claude/CLAUDE.md` § *Invariants Convention* — the canonical policy

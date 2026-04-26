@@ -22,7 +22,9 @@ and every call event precedes its matching return event in the slice (position =
 - **Enforced by**:
   - `debug_assert!` in `invariants::assert_well_formed` (operation-based histories)
   - `debug_assert!` in `invariants::assert_well_formed_events` (event-based histories)
-- **Checked by**: `tests/property_tests.rs` — `prop_well_formed_history`
+- **Checked by**:
+  - `tests/property_tests.rs` — `prop_well_formed_history`
+  - `tests/hegel_properties.rs` — `hegel_well_formed_history`
 - **Formal**:  Quint `histWellFormed`
 
 ---
@@ -39,6 +41,8 @@ linearization of the history.
 
 - **Enforced by**: entry ordering in linked-list construction inside `checker.rs` (structural)
 - **Checked by**: `tests/property_tests.rs` — `prop_real_time_order`
+  (no direct Hegel counterpart — covered transitively by the
+  `hegel_sequential_*_is_linearizable` suites)
 - **Formal**: Quint `realTimeOrder`
 
 ---
@@ -55,6 +59,8 @@ ordering.
 
 - **Enforced by**: `debug_assert!` in `invariants::assert_minimal_call`
 - **Checked by**: implicit in DFS correctness, covered by `prop_soundness`
+  (`tests/property_tests.rs`) and the `hegel_sequential_*_is_linearizable`
+  suites in `tests/hegel_properties.rs`
 - **Formal**: Quint `minimalCallFrontier`
 
 ---
@@ -72,7 +78,13 @@ that (a) is consistent with real-time order and (b) satisfies the model's step f
 at every step.
 
 - **Enforced by**: correctness of DFS + backtracking in `checker.rs` (structural)
-- **Checked by**: `tests/property_tests.rs` — `prop_soundness`
+- **Checked by**:
+  - `tests/property_tests.rs` — `prop_soundness`,
+    `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable`
+  - `tests/hegel_properties.rs` — `hegel_sequential_history_is_linearizable`,
+    `hegel_single_op_is_linearizable`, `hegel_empty_history_is_ok`,
+    `hegel_prefixes_of_sequential_are_linearizable`,
+    `hegel_incremental_register_is_linearizable` (stateful)
 - **Formal**: Quint `soundness`
 
 ---
@@ -87,7 +99,11 @@ If a valid linearization exists, the checker will find it (given sufficient time
 timeout supplied).
 
 - **Enforced by**: exhaustive DFS in `checker.rs` (structural)
-- **Checked by**: `tests/property_tests.rs` — `prop_completeness`
+- **Checked by**:
+  - `tests/property_tests.rs` — `prop_completeness`,
+    `prop_illegal_history_is_detected`
+  - `tests/hegel_properties.rs` — `hegel_illegal_history_is_detected`,
+    `hegel_stale_read_is_always_illegal`
 - **Formal**: Quint `completeness`
 
 ---
@@ -109,8 +125,13 @@ truly independent sub-histories (no cross-partition real-time dependencies).
   `assert_partition_independent!` macro was retired in favour of these two
   stronger checks (disjoint + complete + in-bounds, plus call/return pairing
   for the events form).
-- **Checked by**: `tests/property_tests.rs` — `prop_compositionality`,
-  plus `src/invariants.rs::tests` for the structural cases.
+- **Checked by**:
+  - `tests/property_tests.rs` — `prop_compositionality`, plus
+    `src/invariants.rs::tests` for the structural cases.
+  - `tests/hegel_properties.rs` —
+    `hegel_partitions_are_disjoint_and_complete`,
+    `hegel_kv_sequential_history_is_linearizable`,
+    `hegel_partition_idempotent_with_single_partition`
 - **Formal**: Quint `pCompositionality`
 
 ---
@@ -127,7 +148,10 @@ always yield the same sub-tree result. The cache may safely prune any node whose
 `(bitset, state)` pair has been seen before.
 
 - **Enforced by**: `debug_assert!` in `invariants::assert_cache_sound`
-- **Checked by**: `tests/property_tests.rs` — `prop_cache_sound`
+- **Checked by**:
+  - `tests/property_tests.rs` — `prop_cache_sound`
+  - `tests/hegel_properties.rs` — `hegel_cache_sound_deterministic_ops`,
+    `hegel_cache_sound_deterministic_events`
 - **Formal**: Quint `cacheSound`
 
 ---
@@ -160,22 +184,26 @@ successor is equivalent to the corresponding deterministic `Model`; the two must
 agree on all histories.
 
 - **Enforced by**: `PowerSetModel::step` in `src/model.rs` (structural)
-- **Checked by**: `tests/property_tests.rs` — `prop_nd_*`
+- **Checked by**:
+  - `tests/property_tests.rs` — `prop_nd_*`
+  - `tests/hegel_properties.rs` — `hegel_nd_deterministic_agrees_with_model`,
+    `hegel_nd_sequential_writes_linearizable`,
+    `hegel_nd_impossible_read_is_illegal`
 - **Formal**: `tla/NondeterministicModel.qnt` — `powerSetSoundnessInv`
 
 ---
 
 ## 4. Invariant Traceability Matrix
 
-| ID | spec.md | invariants.rs | property_tests.rs | Quint |
-|----|---------|---------------|-------------------|-------|
-| INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` | `Porcupine.qnt histWellFormed` |
-| INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order` | `Porcupine.qnt realTimeOrder` |
-| INV-HIST-03 | §1 | `assert_minimal_call` | `prop_soundness` | `Porcupine.qnt minimalCallFrontier` |
-| INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `Porcupine.qnt resultConsistent` |
-| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` | `Porcupine.qnt resultConsistent` |
-| INV-LIN-03 | §2 | `assert_partition_covers_ops`, `assert_partition_events_paired` | `prop_compositionality_*` | `Porcupine.qnt pCompositionality` |
-| INV-LIN-04 | §2 | `assert_cache_sound` | `prop_cache_sound` | `Porcupine.qnt cacheSound` |
-| INV-ND-01 | §3 | (structural in `PowerSetModel::step`) | `prop_nd_*` | `NondeterministicModel.qnt powerSetSoundnessInv` |
+| ID | spec.md | invariants.rs | property_tests.rs | hegel_properties.rs | Quint |
+|----|---------|---------------|-------------------|---------------------|-------|
+| INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` | `hegel_well_formed_history` | `Porcupine.qnt histWellFormed` |
+| INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order` | (transitive via `hegel_sequential_*`) | `Porcupine.qnt realTimeOrder` |
+| INV-HIST-03 | §1 | `assert_minimal_call` | `prop_soundness` | (transitive via `hegel_sequential_*`) | `Porcupine.qnt minimalCallFrontier` |
+| INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` | `hegel_sequential_history_is_linearizable`, `hegel_single_op_is_linearizable`, `hegel_empty_history_is_ok`, `hegel_prefixes_of_sequential_are_linearizable`, `hegel_incremental_register_is_linearizable` | `Porcupine.qnt resultConsistent` |
+| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` | `hegel_illegal_history_is_detected`, `hegel_stale_read_is_always_illegal` | `Porcupine.qnt resultConsistent` |
+| INV-LIN-03 | §2 | `assert_partition_covers_ops`, `assert_partition_events_paired` | `prop_compositionality_*` | `hegel_partitions_are_disjoint_and_complete`, `hegel_kv_sequential_history_is_linearizable`, `hegel_partition_idempotent_with_single_partition` | `Porcupine.qnt pCompositionality` |
+| INV-LIN-04 | §2 | `assert_cache_sound` | `prop_cache_sound` | `hegel_cache_sound_deterministic_ops`, `hegel_cache_sound_deterministic_events` | `Porcupine.qnt cacheSound` |
+| INV-ND-01 | §3 | (structural in `PowerSetModel::step`) | `prop_nd_*` | `hegel_nd_deterministic_agrees_with_model`, `hegel_nd_sequential_writes_linearizable`, `hegel_nd_impossible_read_is_illegal` | `NondeterministicModel.qnt powerSetSoundnessInv` |
 
 > **Parallel execution**: `check_operations` and `check_events` always use rayon to check partitions concurrently (unconditional dependency, no feature flag), matching Go's goroutine-per-partition behaviour.
