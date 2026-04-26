@@ -6,14 +6,14 @@
 /// `tests/common/mod.rs`.
 ///
 /// Run:  cargo test --test property_tests
-use porcupine::{CheckResult, Event, Model, Operation, model::PowerSetModel};
+use porcupine::{CheckResult, Event, EventKind, Model, Operation, model::PowerSetModel};
 use proptest::prelude::*;
 
 mod common;
 
 use common::{
-    AlwaysRejectNd, AlwaysStutterNd, DeterministicNdRegister, KvInput, KvModel,
-    KvModelReversedPartition, KvNoPartition, LossyInput, LossyNdRegister, RegisterInput,
+    AlwaysRejectNd, AlwaysStutterNd, DeterministicNdRegister, KvEventPartitionModel, KvInput,
+    KvModel, KvModelReversedPartition, KvNoPartition, LossyInput, LossyNdRegister, RegisterInput,
     RegisterModel, build_overlap_write_read, build_two_writers_late_reader,
     illegal_register_history, illegal_register_history_as_events, ops_to_events_sorted_by_time,
     sequential_history, sequential_ops_to_events, single_op_history,
@@ -1378,4 +1378,152 @@ proptest! {
         prop_assert_eq!(result, CheckResult::Illegal,
             "INV-LIN-02: a wrong KV read in a single-key partition must surface as Illegal");
     }
+}
+
+// ===========================================================================
+// §11 — Codepath / boundary coverage
+//
+// These tests exercise specific code paths that the thematic property
+// suites above don't reach naturally:
+//   * 11.1 — `assert_well_formed_events` debug-assert on malformed input
+//   * 11.2 / 11.3 — `Model::partition_events` (events-form partition)
+//   * 11.4 / 11.5 — `check_parallel`'s rayon vs sequential threshold
+// ===========================================================================
+
+/// 11.1 — `assert_well_formed_events` panics in debug builds when a
+/// Return event precedes its matching Call.  In release builds the
+/// `debug_assert!` is a no-op, so this test is gated on
+/// `debug_assertions` to avoid spurious failures under `--release`.
+///
+/// INV-HIST-01.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "INV-HIST-01")]
+fn prop_reversed_pair_order_panics_in_debug() {
+    let events = vec![
+        Event {
+            client_id: 0,
+            kind: EventKind::Return,
+            input: None,
+            output: Some(0),
+            id: 0,
+        },
+        Event {
+            client_id: 0,
+            kind: EventKind::Call,
+            input: Some(RegisterInput { is_write: true, value: 1 }),
+            output: None,
+            id: 0,
+        },
+    ];
+    let _ = porcupine::checker::check_events(&RegisterModel, &events, None);
+}
+
+proptest! {
+    /// 11.2 — `partition_events` agrees with `partition` on the same
+    /// history.  Strongest cross-API test for the events partition
+    /// pipeline: same logical KV history routed through both
+    /// `check_events` (with `partition_events`) and `check_operations`
+    /// (with `partition`) must yield the same verdict.
+    ///
+    /// INV-LIN-03.
+    #[test]
+    fn prop_partition_events_agrees_with_partition_ops(
+        history in arb_kv_history(2, 6, 3)
+    ) {
+        let events = ops_to_events_sorted_by_time(&history);
+        let r_events = porcupine::checker::check_events(&KvEventPartitionModel, &events, None);
+        let r_ops    = porcupine::checker::check_operations(&KvModel, &history, None);
+        prop_assert_eq!(r_events, r_ops,
+            "INV-LIN-03: partition_events path must agree with partition path on the same history");
+    }
+}
+
+proptest! {
+    /// 11.3 — `partition_events` agrees with no-partition fallback.
+    /// Catches bugs in the partition_events branch by direct comparison
+    /// against the single-partition fallback (`KvNoPartition` doesn't
+    /// override `partition_events`, so events run as one partition).
+    ///
+    /// INV-LIN-03.
+    #[test]
+    fn prop_partition_events_agrees_with_no_partition(
+        history in arb_kv_history(2, 6, 3)
+    ) {
+        let events = ops_to_events_sorted_by_time(&history);
+        let r_partitioned = porcupine::checker::check_events(&KvEventPartitionModel, &events, None);
+        let r_whole       = porcupine::checker::check_events(&KvNoPartition, &events, None);
+        prop_assert_eq!(r_partitioned, r_whole,
+            "INV-LIN-03: partition_events path must agree with no-partition fallback");
+    }
+}
+
+/// 11.4 — `check_parallel`'s rayon path agrees with the sequential
+/// path on a large multi-partition history.
+///
+/// `SEQUENTIAL_THRESHOLD` in `checker.rs` is 2000 total entries; below
+/// it, partitions run sequentially, above it on rayon.  This test
+/// builds a 1100-op KV history (2200 entries) over 4 keys to force the
+/// rayon dispatch.  `KvModel` (rayon) and `KvNoPartition`
+/// (single-partition sequential) must produce the same verdict.
+///
+/// INV-LIN-03.
+#[test]
+fn prop_parallel_above_threshold_agrees_with_sequential() {
+    let n_ops = 1100;
+    let n_keys: u8 = 4;
+    let history: Vec<Operation<KvInput, i64>> = (0..n_ops)
+        .map(|i| Operation {
+            client_id:   i as u64,
+            input:       KvInput {
+                key:      (i as u8) % n_keys,
+                is_write: true,
+                value:    i as i64,
+            },
+            call:        (i as u64) * 2,
+            output:      0,
+            return_time: (i as u64) * 2 + 1,
+        })
+        .collect();
+    let r_partitioned = porcupine::checker::check_operations(&KvModel, &history, None);
+    let r_whole       = porcupine::checker::check_operations(&KvNoPartition, &history, None);
+    assert_eq!(r_partitioned, r_whole,
+        "rayon path and single-partition sequential path must agree on a 2200-entry KV history");
+    assert_eq!(r_partitioned, CheckResult::Ok,
+        "sequential writes-only KV history must be Ok");
+}
+
+/// 11.5 — Rayon path correctly surfaces Illegal across partitions on a
+/// large input.  Same setup as 11.4 but with the last op flipped to an
+/// illegal stale read, so one partition is Illegal while others are Ok.
+/// The rayon dispatch's kill-flag race must surface Illegal, not Ok.
+///
+/// INV-LIN-02 + INV-LIN-03.
+#[test]
+fn prop_parallel_above_threshold_surfaces_illegal() {
+    let n_ops = 1100;
+    let n_keys: u8 = 4;
+    let mut history: Vec<Operation<KvInput, i64>> = (0..n_ops)
+        .map(|i| Operation {
+            client_id:   i as u64,
+            input:       KvInput {
+                key:      (i as u8) % n_keys,
+                is_write: true,
+                value:    i as i64,
+            },
+            call:        (i as u64) * 2,
+            output:      0,
+            return_time: (i as u64) * 2 + 1,
+        })
+        .collect();
+    // Convert the last write into an illegal read of a value never written.
+    let last = history.last_mut().unwrap();
+    last.input.is_write = false;
+    last.output = -9999;
+    let r_partitioned = porcupine::checker::check_operations(&KvModel, &history, None);
+    let r_whole       = porcupine::checker::check_operations(&KvNoPartition, &history, None);
+    assert_eq!(r_partitioned, r_whole,
+        "rayon and sequential paths must agree on illegal verdict");
+    assert_eq!(r_partitioned, CheckResult::Illegal,
+        "INV-LIN-02 + INV-LIN-03: an illegal partition must surface through rayon dispatch");
 }

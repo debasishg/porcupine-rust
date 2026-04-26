@@ -35,8 +35,8 @@ use porcupine::{CheckResult, Event, Model, Operation, model::PowerSetModel};
 mod common;
 
 use common::{
-    AlwaysRejectNd, AlwaysStutterNd, DeterministicNdRegister, KvInput, KvModel,
-    KvModelReversedPartition, KvNoPartition, LossyInput, LossyNdRegister, RegisterInput,
+    AlwaysRejectNd, AlwaysStutterNd, DeterministicNdRegister, KvEventPartitionModel, KvInput,
+    KvModel, KvModelReversedPartition, KvNoPartition, LossyInput, LossyNdRegister, RegisterInput,
     RegisterModel, build_overlap_write_read, build_two_writers_late_reader,
     illegal_register_history, ops_to_events_sorted_by_time, sequential_history,
     sequential_ops_to_events,
@@ -1525,4 +1525,45 @@ fn hegel_incremental_register_is_linearizable(tc: TestCase) {
         next_ts: 0,
     };
     hegel::stateful::run(machine, tc);
+}
+
+// ===========================================================================
+// §11 — Codepath / boundary coverage (events partition)
+//
+// Hegel mirrors of the partition_events tests in property_tests.rs §11.
+// The reversed-pair-order panic test (§11.1) and the parallel/sequential
+// threshold tests (§11.4/11.5) are fixed scenarios that don't benefit
+// from Hegel's random inputs and live in the proptest suite only.
+// ===========================================================================
+
+/// 11.2 — `partition_events` agrees with `partition` on the same history.
+///
+/// INV-LIN-03.
+#[hegel::test]
+fn hegel_partition_events_agrees_with_partition_ops(tc: TestCase) {
+    let history = tc.draw(gen_kv_history(3));
+    let events = ops_to_events_sorted_by_time(&history);
+    let r_events =
+        porcupine::checker::check_events(&KvEventPartitionModel, &events, None);
+    let r_ops = porcupine::checker::check_operations(&KvModel, &history, None);
+    assert_eq!(
+        r_events, r_ops,
+        "INV-LIN-03: partition_events path must agree with partition path on the same history"
+    );
+}
+
+/// 11.3 — `partition_events` agrees with no-partition fallback.
+///
+/// INV-LIN-03.
+#[hegel::test]
+fn hegel_partition_events_agrees_with_no_partition(tc: TestCase) {
+    let history = tc.draw(gen_kv_history(3));
+    let events = ops_to_events_sorted_by_time(&history);
+    let r_partitioned =
+        porcupine::checker::check_events(&KvEventPartitionModel, &events, None);
+    let r_whole = porcupine::checker::check_events(&KvNoPartition, &events, None);
+    assert_eq!(
+        r_partitioned, r_whole,
+        "INV-LIN-03: partition_events path must agree with no-partition fallback"
+    );
 }

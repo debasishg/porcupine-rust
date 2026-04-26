@@ -26,7 +26,9 @@ and every call event precedes its matching return event in the slice (position =
   - `tests/property_tests.rs` — `prop_well_formed_history`,
     `prop_zero_duration_op_handled` (boundary `call == return_time`),
     `prop_near_u64_max_timestamps_handled` (no overflow),
-    `prop_extreme_i64_values_handled`
+    `prop_extreme_i64_values_handled`,
+    `prop_reversed_pair_order_panics_in_debug` (debug-assert fires on
+    a Return event preceding its matching Call)
   - `tests/hegel_properties.rs` — `hegel_well_formed_history`
 - **Formal**:  Quint `histWellFormed`
 
@@ -180,7 +182,11 @@ truly independent sub-histories (no cross-partition real-time dependencies).
     `prop_kv_partition_order_invariance`,
     `prop_disjoint_keys_independent`,
     `prop_single_key_kv_partition_fast_path`,
-    `prop_adversarial_kv_read_is_illegal`
+    `prop_adversarial_kv_read_is_illegal`,
+    `prop_partition_events_agrees_with_partition_ops`,
+    `prop_partition_events_agrees_with_no_partition`,
+    `prop_parallel_above_threshold_agrees_with_sequential`,
+    `prop_parallel_above_threshold_surfaces_illegal`
   - `tests/hegel_properties.rs` —
     `hegel_partitions_are_disjoint_and_complete`,
     `hegel_kv_sequential_history_is_linearizable`,
@@ -189,7 +195,9 @@ truly independent sub-histories (no cross-partition real-time dependencies).
     `hegel_kv_partition_order_invariance`,
     `hegel_single_key_kv_partition_fast_path`,
     `hegel_adversarial_kv_read_is_illegal`,
-    `hegel_incremental_kv_is_linearizable` (stateful)
+    `hegel_incremental_kv_is_linearizable` (stateful),
+    `hegel_partition_events_agrees_with_partition_ops`,
+    `hegel_partition_events_agrees_with_no_partition`
 - **Formal**: Quint `pCompositionality`
 
 ---
@@ -279,12 +287,12 @@ negative-control) — find them under the matching `// ===` headers in
 
 | ID | spec.md | invariants.rs | property_tests.rs | hegel_properties.rs | Quint |
 |----|---------|---------------|-------------------|---------------------|-------|
-| INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` (+ edge-case timestamp/value tests) | `hegel_well_formed_history` | `Porcupine.qnt histWellFormed` |
+| INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` (+ edge-case timestamp/value tests, debug-assert panic on reversed pair order) | `hegel_well_formed_history` | `Porcupine.qnt histWellFormed` |
 | INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order`, `prop_two_writers_late_reader_matches_membership` (+ algebraic invariance, all-coincident edge case) | `hegel_two_writers_late_reader_matches_membership` (+ algebraic invariance; transitive via `hegel_sequential_*`) | `Porcupine.qnt realTimeOrder`, `shiftHistory` |
 | INV-HIST-03 | §1 | `assert_minimal_call` | `prop_soundness` | (transitive via `hegel_sequential_*`) | `Porcupine.qnt minimalCallFrontier` |
 | INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` (+ concurrent histories, algebraic invariance, always-stutter ND, timeout semantics) | `hegel_sequential_history_is_linearizable`, `hegel_single_op_is_linearizable`, `hegel_incremental_register_is_linearizable`, `hegel_concurrent_writes_chain_is_linearizable` (+ same families) | `Porcupine.qnt resultConsistent` |
-| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` (+ concurrent histories, append-preserves-Illegal, always-reject ND, adversarial reads) | `hegel_illegal_history_is_detected`, `hegel_stale_read_is_always_illegal` (+ same families) | `Porcupine.qnt resultConsistent`, `appendHistory` |
-| INV-LIN-03 | §2 | `assert_partition_covers_ops`, `assert_partition_events_paired` | `prop_compositionality_*` (+ partition equivalence/order/disjoint/single-key, adversarial KV) | `hegel_partitions_are_disjoint_and_complete`, `hegel_partition_idempotent_with_single_partition`, `hegel_incremental_kv_is_linearizable` (+ partition equivalence/order/single-key, adversarial KV) | `Porcupine.qnt pCompositionality` |
+| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` (+ concurrent histories, append-preserves-Illegal, always-reject ND, adversarial reads, rayon dispatch surfacing Illegal above threshold) | `hegel_illegal_history_is_detected`, `hegel_stale_read_is_always_illegal` (+ same families) | `Porcupine.qnt resultConsistent`, `appendHistory` |
+| INV-LIN-03 | §2 | `assert_partition_covers_ops`, `assert_partition_events_paired` | `prop_compositionality_*` (+ partition equivalence/order/disjoint/single-key, adversarial KV, events-partition codepath, rayon vs sequential threshold) | `hegel_partitions_are_disjoint_and_complete`, `hegel_partition_idempotent_with_single_partition`, `hegel_incremental_kv_is_linearizable` (+ partition equivalence/order/single-key, adversarial KV, events-partition codepath) | `Porcupine.qnt pCompositionality` |
 | INV-LIN-04 | §2 | `assert_cache_sound` | `prop_cache_sound`, `prop_long_sequential_chain_ok` (Bitset spill) | `hegel_cache_sound_deterministic_ops`, `hegel_cache_sound_deterministic_events`, `hegel_long_sequential_chain_ok` | `Porcupine.qnt cacheSound` |
 | INV-ND-01 | §3 | (structural in `PowerSetModel::step`) | `prop_nd_*` (+ PowerSet dedup, PowerSet≡HashedPowerSet, lossy concurrent, always-reject, always-stutter) | `hegel_nd_*` (+ same five families) | `NondeterministicModel.qnt powerSetSoundnessInv` |
 

@@ -206,6 +206,49 @@ impl Model for KvModelReversedPartition {
     }
 }
 
+/// `KvModel` step semantics that also partitions *event* histories by
+/// key (not just operation histories).  Exercises the
+/// `Model::partition_events` codepath in `check_events`, which is
+/// unreachable from the other test fixtures (none of them override
+/// `partition_events`).
+#[derive(Clone)]
+pub struct KvEventPartitionModel;
+
+impl Model for KvEventPartitionModel {
+    type State = HashMap<u8, i64>;
+    type Input = KvInput;
+    type Output = i64;
+    fn init(&self) -> Self::State {
+        HashMap::new()
+    }
+    fn step(&self, state: &Self::State, input: &KvInput, output: &i64) -> Option<Self::State> {
+        KvModel.step(state, input, output)
+    }
+    fn partition(&self, history: &[Operation<KvInput, i64>]) -> Option<Vec<Vec<usize>>> {
+        KvModel.partition(history)
+    }
+    fn partition_events(
+        &self,
+        history: &[Event<KvInput, i64>],
+    ) -> Option<Vec<Vec<usize>>> {
+        // Build id → key map from Call events (Calls carry the input).
+        let mut key_by_id: HashMap<u64, u8> = HashMap::new();
+        for ev in history {
+            if let (EventKind::Call, Some(input)) = (ev.kind, &ev.input) {
+                key_by_id.insert(ev.id, input.key);
+            }
+        }
+        // Group event indices by their op's key — keeps each Call/Return pair together.
+        let mut by_key: HashMap<u8, Vec<usize>> = HashMap::new();
+        for (i, ev) in history.iter().enumerate() {
+            if let Some(&key) = key_by_id.get(&ev.id) {
+                by_key.entry(key).or_default().push(i);
+            }
+        }
+        Some(by_key.into_values().collect())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Degenerate ND fixtures (used by §4 always-reject / always-stutter tests)
 // ---------------------------------------------------------------------------
