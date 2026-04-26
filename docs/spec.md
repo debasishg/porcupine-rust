@@ -267,21 +267,25 @@ agree on all histories.
 
 The matrix below cites primary tests per invariant; for the full set of
 asserts and properties exercising each ID, see the `Checked by` lines in
-§§1–3 above. Test files are organised into sub-sections (§1 concurrent
-histories, §2 algebraic invariance, §3 partition equivalence, §4
-nondeterministic, §5 timeout, §6 edge cases, §7 stateful, §9 round-trip,
-§10 negative-control) which are referenced where individual enumeration
-would be too verbose.
+§§1–3 above.
+
+**Notation**: the *spec.md* column's `§1`/`§2`/`§3` are sections of *this
+document* (History, Linearizability, ND). Parenthetical `(+ family-name)`
+annotations in the test columns refer to thematic test-file sections
+(concurrent histories, algebraic invariance, partition equivalence,
+nondeterministic, timeout, edge cases, stateful, round-trip,
+negative-control) — find them under the matching `// ===` headers in
+`tests/property_tests.rs` and `tests/hegel_properties.rs`.
 
 | ID | spec.md | invariants.rs | property_tests.rs | hegel_properties.rs | Quint |
 |----|---------|---------------|-------------------|---------------------|-------|
-| INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` (+ §6 boundary tests) | `hegel_well_formed_history` | `Porcupine.qnt histWellFormed` |
-| INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order`, `prop_two_writers_late_reader_matches_membership` (+ §2 algebraic, §6 all-coincident) | `hegel_two_writers_late_reader_matches_membership` (+ §2 algebraic, transitive via `hegel_sequential_*`) | `Porcupine.qnt realTimeOrder`, `shiftHistory` |
+| INV-HIST-01 | §1 | `assert_well_formed`, `assert_well_formed_events` | `prop_well_formed_history` (+ edge-case timestamp/value tests) | `hegel_well_formed_history` | `Porcupine.qnt histWellFormed` |
+| INV-HIST-02 | §1 | (entry ordering) | `prop_real_time_order`, `prop_two_writers_late_reader_matches_membership` (+ algebraic invariance, all-coincident edge case) | `hegel_two_writers_late_reader_matches_membership` (+ algebraic invariance; transitive via `hegel_sequential_*`) | `Porcupine.qnt realTimeOrder`, `shiftHistory` |
 | INV-HIST-03 | §1 | `assert_minimal_call` | `prop_soundness` | (transitive via `hegel_sequential_*`) | `Porcupine.qnt minimalCallFrontier` |
-| INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` (+ §1 concurrent, §2 algebraic, §4 always-stutter, §5 timeout) | `hegel_sequential_history_is_linearizable`, `hegel_single_op_is_linearizable`, `hegel_incremental_register_is_linearizable`, `hegel_concurrent_writes_chain_is_linearizable` (+ §1, §2, §4, §5) | `Porcupine.qnt resultConsistent` |
-| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` (+ §1 concurrent, §2.5 append, §4.4 always-reject, §10 adversarial) | `hegel_illegal_history_is_detected`, `hegel_stale_read_is_always_illegal` (+ §1, §2.5, §4.4, §10) | `Porcupine.qnt resultConsistent`, `appendHistory` |
-| INV-LIN-03 | §2 | `assert_partition_covers_ops`, `assert_partition_events_paired` | `prop_compositionality_*` (+ §3 equivalence/order/disjoint/single-key, §10.2 adversarial KV) | `hegel_partitions_are_disjoint_and_complete`, `hegel_partition_idempotent_with_single_partition`, `hegel_incremental_kv_is_linearizable` (+ §3, §10.2) | `Porcupine.qnt pCompositionality` |
+| INV-LIN-01 | §2 | (DFS correctness) | `prop_soundness`, `prop_sequential_history_is_linearizable`, `prop_single_op_linearizable` (+ concurrent histories, algebraic invariance, always-stutter ND, timeout semantics) | `hegel_sequential_history_is_linearizable`, `hegel_single_op_is_linearizable`, `hegel_incremental_register_is_linearizable`, `hegel_concurrent_writes_chain_is_linearizable` (+ same families) | `Porcupine.qnt resultConsistent` |
+| INV-LIN-02 | §2 | (DFS exhaustive) | `prop_completeness`, `prop_illegal_history_is_detected` (+ concurrent histories, append-preserves-Illegal, always-reject ND, adversarial reads) | `hegel_illegal_history_is_detected`, `hegel_stale_read_is_always_illegal` (+ same families) | `Porcupine.qnt resultConsistent`, `appendHistory` |
+| INV-LIN-03 | §2 | `assert_partition_covers_ops`, `assert_partition_events_paired` | `prop_compositionality_*` (+ partition equivalence/order/disjoint/single-key, adversarial KV) | `hegel_partitions_are_disjoint_and_complete`, `hegel_partition_idempotent_with_single_partition`, `hegel_incremental_kv_is_linearizable` (+ partition equivalence/order/single-key, adversarial KV) | `Porcupine.qnt pCompositionality` |
 | INV-LIN-04 | §2 | `assert_cache_sound` | `prop_cache_sound`, `prop_long_sequential_chain_ok` (Bitset spill) | `hegel_cache_sound_deterministic_ops`, `hegel_cache_sound_deterministic_events`, `hegel_long_sequential_chain_ok` | `Porcupine.qnt cacheSound` |
-| INV-ND-01 | §3 | (structural in `PowerSetModel::step`) | `prop_nd_*` (+ §4 dedup, PowerSet≡HashedPowerSet, lossy concurrent, always-reject/stutter) | `hegel_nd_*` (+ §4 same five families) | `NondeterministicModel.qnt powerSetSoundnessInv` |
+| INV-ND-01 | §3 | (structural in `PowerSetModel::step`) | `prop_nd_*` (+ PowerSet dedup, PowerSet≡HashedPowerSet, lossy concurrent, always-reject, always-stutter) | `hegel_nd_*` (+ same five families) | `NondeterministicModel.qnt powerSetSoundnessInv` |
 
 > **Parallel execution**: `check_operations` and `check_events` always use rayon to check partitions concurrently (unconditional dependency, no feature flag), matching Go's goroutine-per-partition behaviour.
