@@ -80,11 +80,7 @@ impl Model for KvModel {
             Some(next)
         } else {
             let stored = state.get(&input.key).copied().unwrap_or(0);
-            if *output == stored {
-                Some(next)
-            } else {
-                None
-            }
+            if *output == stored { Some(next) } else { None }
         }
     }
 
@@ -227,10 +223,7 @@ impl Model for KvEventPartitionModel {
     fn partition(&self, history: &[Operation<KvInput, i64>]) -> Option<Vec<Vec<usize>>> {
         KvModel.partition(history)
     }
-    fn partition_events(
-        &self,
-        history: &[Event<KvInput, i64>],
-    ) -> Option<Vec<Vec<usize>>> {
+    fn partition_events(&self, history: &[Event<KvInput, i64>]) -> Option<Vec<Vec<usize>>> {
         // Build id → key map from Call events (Calls carry the input).
         let mut key_by_id: HashMap<u64, u8> = HashMap::new();
         for ev in history {
@@ -495,7 +488,7 @@ pub fn ops_to_events_sorted_by_time<I: Clone, O: Clone>(
 ) -> Vec<Event<I, O>> {
     let mut entries: Vec<(u64, bool, usize)> = Vec::with_capacity(ops.len() * 2);
     for (i, op) in ops.iter().enumerate() {
-        entries.push((op.call, true, i));        // true = Call
+        entries.push((op.call, true, i)); // true = Call
         entries.push((op.return_time, false, i)); // false = Return
     }
     entries.sort_by(|a, b| {

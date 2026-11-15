@@ -255,10 +255,7 @@ fn branching_counter_events_single_ok() {
 fn branching_counter_events_single_illegal() {
     let model = PowerSetModel(BranchingCounter);
     let history = vec![call_evt(0, 0), ret_evt(0, 0, 5)];
-    assert_eq!(
-        check_events(&model, &history, None),
-        CheckResult::Illegal
-    );
+    assert_eq!(check_events(&model, &history, None), CheckResult::Illegal);
 }
 
 // op 0: out=2 (0→2, skip branch)

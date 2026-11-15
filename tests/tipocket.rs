@@ -27,7 +27,7 @@ struct NoopModel;
 
 #[derive(Clone, PartialEq)]
 struct NoopInput {
-    op: u8,    // 0 = read, 1 = write
+    op: u8, // 0 = read, 1 = write
     value: i32,
 }
 
@@ -79,8 +79,14 @@ fn noop_op(
 ) -> Operation<NoopInput, NoopOutput> {
     Operation {
         client_id: id,
-        input: NoopInput { op, value: in_value },
-        output: NoopOutput { value: out_value, unknown },
+        input: NoopInput {
+            op,
+            value: in_value,
+        },
+        output: NoopOutput {
+            value: out_value,
+            unknown,
+        },
         call,
         return_time: ret,
     }
@@ -92,25 +98,31 @@ fn noop_op(
 fn noop_read_initial_ok() {
     // Single read returning the initial value (10). Always linearizable.
     let history = vec![noop_op(1, 0, 0, 10, false, 0, 5)];
-    assert_eq!(check_operations(&NoopModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&NoopModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
 fn noop_write_then_read_ok() {
     // Sequential: write 99, then read 99. The write response carries the new value.
     let history = vec![
-        noop_op(1, 1, 99, 99, false, 0, 5),   // write 99 → response value 99
-        noop_op(2, 0, 0, 99, false, 10, 15),   // read → 99
+        noop_op(1, 1, 99, 99, false, 0, 5), // write 99 → response value 99
+        noop_op(2, 0, 0, 99, false, 10, 15), // read → 99
     ];
-    assert_eq!(check_operations(&NoopModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&NoopModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
 fn noop_illegal_stale_read() {
     // Sequential: write 42, then read 10 (stale — should be 42). Illegal.
     let history = vec![
-        noop_op(1, 1, 42, 42, false, 0, 5),   // write 42
-        noop_op(2, 0, 0, 10, false, 10, 15),   // read → 10 (stale)
+        noop_op(1, 1, 42, 42, false, 0, 5),  // write 42
+        noop_op(2, 0, 0, 10, false, 10, 15), // read → 10 (stale)
     ];
     assert_eq!(
         check_operations(&NoopModel, &history, None),
@@ -132,7 +144,7 @@ struct RawKvModel;
 
 #[derive(Clone, PartialEq)]
 struct RawKvInput {
-    op: u8,   // 0 = get, 1 = put, 2 = delete
+    op: u8, // 0 = get, 1 = put, 2 = delete
     key: i32,
     val: u32,
 }
@@ -187,10 +199,7 @@ impl Model for RawKvModel {
         }
     }
 
-    fn partition(
-        &self,
-        history: &[Operation<RawKvInput, RawKvOutput>],
-    ) -> Option<Vec<Vec<usize>>> {
+    fn partition(&self, history: &[Operation<RawKvInput, RawKvOutput>]) -> Option<Vec<Vec<usize>>> {
         let mut by_key: HashMap<i32, Vec<usize>> = HashMap::new();
         for (i, op) in history.iter().enumerate() {
             by_key.entry(op.input.key).or_default().push(i);
@@ -199,6 +208,7 @@ impl Model for RawKvModel {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // flat constructor mirroring the TiPocket record fields
 fn rawkv_op(
     id: u64,
     op: u8,
@@ -211,8 +221,15 @@ fn rawkv_op(
 ) -> Operation<RawKvInput, RawKvOutput> {
     Operation {
         client_id: id,
-        input: RawKvInput { op, key, val: in_val },
-        output: RawKvOutput { val: out_val, unknown },
+        input: RawKvInput {
+            op,
+            key,
+            val: in_val,
+        },
+        output: RawKvOutput {
+            val: out_val,
+            unknown,
+        },
         call,
         return_time: ret,
     }
@@ -224,28 +241,37 @@ fn rawkv_op(
 fn rawkv_get_empty_ok() {
     // Get on an absent key returns 0. Trivially linearizable.
     let history = vec![rawkv_op(1, 0, 5, 0, 0, false, 0, 5)];
-    assert_eq!(check_operations(&RawKvModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&RawKvModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
 fn rawkv_put_then_get_ok() {
     // Sequential: put(key=1, val=42), then get(key=1) → 42.
     let history = vec![
-        rawkv_op(1, 1, 1, 42, 0, false, 0, 5),    // put key=1 val=42
-        rawkv_op(2, 0, 1, 0, 42, false, 10, 15),   // get key=1 → 42
+        rawkv_op(1, 1, 1, 42, 0, false, 0, 5),   // put key=1 val=42
+        rawkv_op(2, 0, 1, 0, 42, false, 10, 15), // get key=1 → 42
     ];
-    assert_eq!(check_operations(&RawKvModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&RawKvModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
 fn rawkv_delete_ok() {
     // Sequential: put, delete, get → 0 (key absent after delete).
     let history = vec![
-        rawkv_op(1, 1, 3, 7, 0, false, 0, 5),    // put key=3 val=7
-        rawkv_op(2, 2, 3, 0, 0, false, 10, 15),   // delete key=3
-        rawkv_op(3, 0, 3, 0, 0, false, 20, 25),   // get key=3 → 0
+        rawkv_op(1, 1, 3, 7, 0, false, 0, 5),   // put key=3 val=7
+        rawkv_op(2, 2, 3, 0, 0, false, 10, 15), // delete key=3
+        rawkv_op(3, 0, 3, 0, 0, false, 20, 25), // get key=3 → 0
     ];
-    assert_eq!(check_operations(&RawKvModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&RawKvModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
@@ -253,18 +279,21 @@ fn rawkv_unknown_get_ok() {
     // Put and get are concurrent; the get has an unknown response.
     // Unknown responses are always valid — the checker accepts them regardless of state.
     let history = vec![
-        rawkv_op(1, 1, 2, 99, 0, false, 0, 20),   // put key=2 val=99 (long window)
-        rawkv_op(2, 0, 2, 0, 0, true, 5, 15),     // get key=2 → unknown
+        rawkv_op(1, 1, 2, 99, 0, false, 0, 20), // put key=2 val=99 (long window)
+        rawkv_op(2, 0, 2, 0, 0, true, 5, 15),   // get key=2 → unknown
     ];
-    assert_eq!(check_operations(&RawKvModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&RawKvModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
 fn rawkv_illegal_stale_get() {
     // Sequential: put(key=7, val=100), then get returns 50. Illegal.
     let history = vec![
-        rawkv_op(1, 1, 7, 100, 0, false, 0, 5),   // put key=7 val=100
-        rawkv_op(2, 0, 7, 0, 50, false, 10, 15),  // get key=7 → 50 (wrong)
+        rawkv_op(1, 1, 7, 100, 0, false, 0, 5),  // put key=7 val=100
+        rawkv_op(2, 0, 7, 0, 50, false, 10, 15), // get key=7 → 50 (wrong)
     ];
     assert_eq!(
         check_operations(&RawKvModel, &history, None),
@@ -279,12 +308,15 @@ fn rawkv_two_key_partition_ok() {
     //   key=2 partition: put(2,20), get(2)→20
     // Each sub-history is independently linearizable.
     let history = vec![
-        rawkv_op(1, 1, 1, 10, 0, false, 0, 30),    // put key=1 val=10
-        rawkv_op(2, 1, 2, 20, 0, false, 0, 30),    // put key=2 val=20
-        rawkv_op(3, 0, 1, 0, 10, false, 5, 25),    // get key=1 → 10
-        rawkv_op(4, 0, 2, 0, 20, false, 5, 25),    // get key=2 → 20
+        rawkv_op(1, 1, 1, 10, 0, false, 0, 30), // put key=1 val=10
+        rawkv_op(2, 1, 2, 20, 0, false, 0, 30), // put key=2 val=20
+        rawkv_op(3, 0, 1, 0, 10, false, 5, 25), // get key=1 → 10
+        rawkv_op(4, 0, 2, 0, 20, false, 5, 25), // get key=2 → 20
     ];
-    assert_eq!(check_operations(&RawKvModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&RawKvModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 // ============================================================================
@@ -303,9 +335,17 @@ struct VBankModel;
 #[derive(Clone, PartialEq)]
 enum VBankInput {
     Read,
-    Transfer { from_id: i32, to_id: i32, amount: f64 },
-    CreateAccount { new_id: i32 },
-    DeleteAccount { victim_id: i32 },
+    Transfer {
+        from_id: i32,
+        to_id: i32,
+        amount: f64,
+    },
+    CreateAccount {
+        new_id: i32,
+    },
+    DeleteAccount {
+        victim_id: i32,
+    },
 }
 
 #[derive(Clone, PartialEq)]
@@ -344,7 +384,11 @@ impl Model for VBankModel {
                     _ => None,
                 }
             }
-            VBankInput::Transfer { from_id, to_id, amount } => {
+            VBankInput::Transfer {
+                from_id,
+                to_id,
+                amount,
+            } => {
                 if output.aborted {
                     return Some(state.clone());
                 }
@@ -379,7 +423,13 @@ fn vbank_op(
     call: u64,
     ret: u64,
 ) -> Operation<VBankInput, VBankOutput> {
-    Operation { client_id: id, input, output, call, return_time: ret }
+    Operation {
+        client_id: id,
+        input,
+        output,
+        call,
+        return_time: ret,
+    }
 }
 
 fn init_accounts() -> BTreeMap<i32, f64> {
@@ -387,27 +437,51 @@ fn init_accounts() -> BTreeMap<i32, f64> {
 }
 
 fn read_ok(accounts: BTreeMap<i32, f64>) -> VBankOutput {
-    VBankOutput { ok: true, read_result: Some(accounts), aborted: false }
+    VBankOutput {
+        ok: true,
+        read_result: Some(accounts),
+        aborted: false,
+    }
 }
 
 fn transfer_ok() -> VBankOutput {
-    VBankOutput { ok: true, read_result: None, aborted: false }
+    VBankOutput {
+        ok: true,
+        read_result: None,
+        aborted: false,
+    }
 }
 
 fn transfer_aborted() -> VBankOutput {
-    VBankOutput { ok: true, read_result: None, aborted: true }
+    VBankOutput {
+        ok: true,
+        read_result: None,
+        aborted: true,
+    }
 }
 
 fn op_failed() -> VBankOutput {
-    VBankOutput { ok: false, read_result: None, aborted: false }
+    VBankOutput {
+        ok: false,
+        read_result: None,
+        aborted: false,
+    }
 }
 
 fn create_ok() -> VBankOutput {
-    VBankOutput { ok: true, read_result: None, aborted: false }
+    VBankOutput {
+        ok: true,
+        read_result: None,
+        aborted: false,
+    }
 }
 
 fn delete_ok() -> VBankOutput {
-    VBankOutput { ok: true, read_result: None, aborted: false }
+    VBankOutput {
+        ok: true,
+        read_result: None,
+        aborted: false,
+    }
 }
 
 // --- VBank tests ------------------------------------------------------------
@@ -422,7 +496,10 @@ fn vbank_read_initial_ok() {
         0,
         5,
     )];
-    assert_eq!(check_operations(&VBankModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&VBankModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
@@ -436,14 +513,21 @@ fn vbank_transfer_ok() {
     let history = vec![
         vbank_op(
             1,
-            VBankInput::Transfer { from_id: 0, to_id: 1, amount: 5.0 },
+            VBankInput::Transfer {
+                from_id: 0,
+                to_id: 1,
+                amount: 5.0,
+            },
             transfer_ok(),
             0,
             5,
         ),
         vbank_op(2, VBankInput::Read, read_ok(after_transfer), 10, 15),
     ];
-    assert_eq!(check_operations(&VBankModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&VBankModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
@@ -453,10 +537,19 @@ fn vbank_create_account_ok() {
     after_create.insert(10, 10.0);
 
     let history = vec![
-        vbank_op(1, VBankInput::CreateAccount { new_id: 10 }, create_ok(), 0, 5),
+        vbank_op(
+            1,
+            VBankInput::CreateAccount { new_id: 10 },
+            create_ok(),
+            0,
+            5,
+        ),
         vbank_op(2, VBankInput::Read, read_ok(after_create), 10, 15),
     ];
-    assert_eq!(check_operations(&VBankModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&VBankModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
@@ -468,10 +561,19 @@ fn vbank_delete_account_ok() {
     *after_delete.get_mut(&0).unwrap() += 20.0;
 
     let history = vec![
-        vbank_op(1, VBankInput::DeleteAccount { victim_id: 9 }, delete_ok(), 0, 5),
+        vbank_op(
+            1,
+            VBankInput::DeleteAccount { victim_id: 9 },
+            delete_ok(),
+            0,
+            5,
+        ),
         vbank_op(2, VBankInput::Read, read_ok(after_delete), 10, 15),
     ];
-    assert_eq!(check_operations(&VBankModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&VBankModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
@@ -481,7 +583,11 @@ fn vbank_illegal_stale_read() {
     let history = vec![
         vbank_op(
             1,
-            VBankInput::Transfer { from_id: 0, to_id: 1, amount: 5.0 },
+            VBankInput::Transfer {
+                from_id: 0,
+                to_id: 1,
+                amount: 5.0,
+            },
             transfer_ok(),
             0,
             5,
@@ -507,14 +613,21 @@ fn vbank_aborted_transfer_ok() {
     let history = vec![
         vbank_op(
             1,
-            VBankInput::Transfer { from_id: 3, to_id: 4, amount: 10.0 },
+            VBankInput::Transfer {
+                from_id: 3,
+                to_id: 4,
+                amount: 10.0,
+            },
             transfer_aborted(),
             0,
             20,
         ),
         vbank_op(2, VBankInput::Read, read_ok(init_accounts()), 5, 15),
     ];
-    assert_eq!(check_operations(&VBankModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&VBankModel, &history, None),
+        CheckResult::Ok
+    );
 }
 
 #[test]
@@ -524,12 +637,19 @@ fn vbank_failed_op_ok() {
     let history = vec![
         vbank_op(
             1,
-            VBankInput::Transfer { from_id: 0, to_id: 1, amount: 5.0 },
+            VBankInput::Transfer {
+                from_id: 0,
+                to_id: 1,
+                amount: 5.0,
+            },
             op_failed(),
             0,
             5,
         ),
         vbank_op(2, VBankInput::Read, read_ok(init_accounts()), 10, 15),
     ];
-    assert_eq!(check_operations(&VBankModel, &history, None), CheckResult::Ok);
+    assert_eq!(
+        check_operations(&VBankModel, &history, None),
+        CheckResult::Ok
+    );
 }

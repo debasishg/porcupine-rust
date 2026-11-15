@@ -110,13 +110,13 @@ fn make_entries_from_indices<I: Clone, O: Clone>(
         });
     }
     entries.sort_by(|a, b| {
-        a.time.cmp(&b.time).then_with(|| {
-            match (&a.value, &b.value) {
+        a.time
+            .cmp(&b.time)
+            .then_with(|| match (&a.value, &b.value) {
                 (EntryValue::Call(_), EntryValue::Return(_)) => std::cmp::Ordering::Less,
                 (EntryValue::Return(_), EntryValue::Call(_)) => std::cmp::Ordering::Greater,
                 _ => std::cmp::Ordering::Equal,
-            }
-        })
+            })
     });
     entries
 }
@@ -208,9 +208,9 @@ fn convert_entries_from_indices<I: Clone, O: Clone>(
 struct Node<I, O> {
     value: Option<EntryValue<I, O>>,
     id: u32,
-    match_idx: u32,   // NodeRef::NONE if absent
+    match_idx: u32, // NodeRef::NONE if absent
     prev: u32,
-    next: u32,        // NodeRef::NONE if absent
+    next: u32, // NodeRef::NONE if absent
 }
 
 struct NodeArena<I, O> {
@@ -296,21 +296,33 @@ impl<I, O> NodeArena<I, O> {
     #[inline]
     fn head_next(&self) -> Option<NodeRef> {
         let n = self.nodes[0].next;
-        if n == NodeRef::NONE { None } else { Some(NodeRef(n)) }
+        if n == NodeRef::NONE {
+            None
+        } else {
+            Some(NodeRef(n))
+        }
     }
 
     /// Next node after `r`, or `None` if at end.
     #[inline]
     fn next_of(&self, r: NodeRef) -> Option<NodeRef> {
         let n = self.nodes[r.get()].next;
-        if n == NodeRef::NONE { None } else { Some(NodeRef(n)) }
+        if n == NodeRef::NONE {
+            None
+        } else {
+            Some(NodeRef(n))
+        }
     }
 
     /// Match index for a call node, or `None` for return/sentinel.
     #[inline]
     fn match_of(&self, r: NodeRef) -> Option<NodeRef> {
         let m = self.nodes[r.get()].match_idx;
-        if m == NodeRef::NONE { None } else { Some(NodeRef(m)) }
+        if m == NodeRef::NONE {
+            None
+        } else {
+            Some(NodeRef(m))
+        }
     }
 
     /// Remove `call_ref` and its matched return node from the live list.
@@ -372,14 +384,14 @@ impl<I, O> NodeArena<I, O> {
 /// particular DFS path.
 ///
 /// Each concurrent operation in the history is assigned a numeric ID (op_id).
-/// Setting bit i in the Bitset means "operation i has already been placed into the 
-/// linearization order." So the Bitset is essentially a compact representation of a 
+/// Setting bit i in the Bitset means "operation i has already been placed into the
+/// linearization order." So the Bitset is essentially a compact representation of a
 /// subset of operations.
-/// 
-/// Why a bitset and not, say, a HashSet<usize>: The set of linearized ops only needs 
-/// membership tracking and equality comparison. A bitset is far more compact 
-/// (one bit per operation, inline up to 256 ops via SmallVec<[u64; 4]>) and supports 
-/// O(1) set/test, plus cheap hashing and equality — critical since cache probes happen 
+///
+/// Why a bitset and not, say, a HashSet<usize>: The set of linearized ops only needs
+/// membership tracking and equality comparison. A bitset is far more compact
+/// (one bit per operation, inline up to 256 ops via SmallVec<[u64; 4]>) and supports
+/// O(1) set/test, plus cheap hashing and equality — critical since cache probes happen
 /// on every DFS step.
 struct CacheEntry<S> {
     linearized: Bitset,
@@ -529,7 +541,8 @@ fn check_single<M: Model>(
                             // cache hit we skip immediately — zero allocations.  The
                             // earlier cache_contains required cloning the bitset before
                             // the probe, wasting an allocation on every hit.
-                            if !cache_contains_with_bit(&cache, h, &linearized, op_id, &next_state) {
+                            if !cache_contains_with_bit(&cache, h, &linearized, op_id, &next_state)
+                            {
                                 // INV-LIN-04: new (bitset, state) pair — safe to cache.
                                 // Clone deferred to here: only cache misses pay for it.
                                 let mut new_linearized = linearized.clone();

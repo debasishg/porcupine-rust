@@ -51,14 +51,21 @@ enum S2Input {
 /// The output side of an S2 operation, observed at return time.
 #[derive(Clone, PartialEq, Debug)]
 enum S2Output {
-    AppendSuccess { tail: u32 },
+    AppendSuccess {
+        tail: u32,
+    },
     /// The append definitely did not become durable (validation/fencing error).
     AppendDefiniteFailure,
     /// Network or server error — the append may or may not have become durable.
     AppendIndefiniteFailure,
-    ReadSuccess { tail: u32, xxh3: u64 },
+    ReadSuccess {
+        tail: u32,
+        xxh3: u64,
+    },
     ReadFailure,
-    CheckTailSuccess { tail: u32 },
+    CheckTailSuccess {
+        tail: u32,
+    },
     CheckTailFailure,
 }
 
@@ -348,7 +355,14 @@ fn basic_no_concurrency() {
         call(0, 0, append_input(4, 12345)),
         ret(0, 0, S2Output::AppendSuccess { tail: 4 }),
         call(0, 1, S2Input::Read),
-        ret(0, 1, S2Output::ReadSuccess { tail: 4, xxh3: 12345 }),
+        ret(
+            0,
+            1,
+            S2Output::ReadSuccess {
+                tail: 4,
+                xxh3: 12345,
+            },
+        ),
         call(0, 2, S2Input::CheckTail),
         ret(0, 2, S2Output::CheckTailSuccess { tail: 4 }),
     ];
@@ -363,13 +377,27 @@ fn definite_failure_linearizable() {
         call(0, 0, append_input(4, 12345)),
         ret(0, 0, S2Output::AppendSuccess { tail: 4 }),
         call(0, 1, S2Input::Read),
-        ret(0, 1, S2Output::ReadSuccess { tail: 4, xxh3: 12345 }),
+        ret(
+            0,
+            1,
+            S2Output::ReadSuccess {
+                tail: 4,
+                xxh3: 12345,
+            },
+        ),
         call(0, 2, S2Input::CheckTail),
         ret(0, 2, S2Output::CheckTailSuccess { tail: 4 }),
         call(0, 3, append_input(5, 67890)),
         ret(0, 3, S2Output::AppendDefiniteFailure),
         call(0, 4, S2Input::Read),
-        ret(0, 4, S2Output::ReadSuccess { tail: 4, xxh3: 12345 }),
+        ret(
+            0,
+            4,
+            S2Output::ReadSuccess {
+                tail: 4,
+                xxh3: 12345,
+            },
+        ),
     ];
     assert_eq!(check(&events), CheckResult::Ok);
 }
@@ -382,14 +410,28 @@ fn definite_failure_illegal() {
         call(0, 0, append_input(4, 12345)),
         ret(0, 0, S2Output::AppendSuccess { tail: 4 }),
         call(0, 1, S2Input::Read),
-        ret(0, 1, S2Output::ReadSuccess { tail: 4, xxh3: 12345 }),
+        ret(
+            0,
+            1,
+            S2Output::ReadSuccess {
+                tail: 4,
+                xxh3: 12345,
+            },
+        ),
         call(0, 2, S2Input::CheckTail),
         ret(0, 2, S2Output::CheckTailSuccess { tail: 4 }),
         call(0, 3, append_input(5, 67890)),
         ret(0, 3, S2Output::AppendDefiniteFailure),
         // Read returns updated tail despite definite failure — illegal.
         call(0, 4, S2Input::Read),
-        ret(0, 4, S2Output::ReadSuccess { tail: 9, xxh3: 67890 }),
+        ret(
+            0,
+            4,
+            S2Output::ReadSuccess {
+                tail: 9,
+                xxh3: 67890,
+            },
+        ),
     ];
     assert_eq!(check(&events), CheckResult::Illegal);
 }
@@ -403,13 +445,27 @@ fn indefinite_failure_updated_tail_ok() {
         call(0, 0, append_input(4, 12345)),
         ret(0, 0, S2Output::AppendSuccess { tail: 4 }),
         call(0, 1, S2Input::Read),
-        ret(0, 1, S2Output::ReadSuccess { tail: 4, xxh3: 12345 }),
+        ret(
+            0,
+            1,
+            S2Output::ReadSuccess {
+                tail: 4,
+                xxh3: 12345,
+            },
+        ),
         call(0, 2, S2Input::CheckTail),
         ret(0, 2, S2Output::CheckTailSuccess { tail: 4 }),
         call(0, 3, append_input(5, 67890)),
         ret(0, 3, S2Output::AppendIndefiniteFailure),
         call(0, 4, S2Input::Read),
-        ret(0, 4, S2Output::ReadSuccess { tail: 9, xxh3: 67890 }),
+        ret(
+            0,
+            4,
+            S2Output::ReadSuccess {
+                tail: 9,
+                xxh3: 67890,
+            },
+        ),
     ];
     assert_eq!(check(&events), CheckResult::Ok);
 }
@@ -423,13 +479,27 @@ fn indefinite_failure_original_tail_ok() {
         call(0, 0, append_input(4, 12345)),
         ret(0, 0, S2Output::AppendSuccess { tail: 4 }),
         call(0, 1, S2Input::Read),
-        ret(0, 1, S2Output::ReadSuccess { tail: 4, xxh3: 12345 }),
+        ret(
+            0,
+            1,
+            S2Output::ReadSuccess {
+                tail: 4,
+                xxh3: 12345,
+            },
+        ),
         call(0, 2, S2Input::CheckTail),
         ret(0, 2, S2Output::CheckTailSuccess { tail: 4 }),
         call(0, 3, append_input(5, 67890)),
         ret(0, 3, S2Output::AppendIndefiniteFailure),
         call(0, 4, S2Input::Read),
-        ret(0, 4, S2Output::ReadSuccess { tail: 4, xxh3: 12345 }),
+        ret(
+            0,
+            4,
+            S2Output::ReadSuccess {
+                tail: 4,
+                xxh3: 12345,
+            },
+        ),
     ];
     assert_eq!(check(&events), CheckResult::Ok);
 }
@@ -446,13 +516,13 @@ fn indefinite_failure_original_tail_ok() {
 
 #[test]
 fn check_jsonl_file_if_present() {
-    let path = std::env::var("S2_HISTORY_FILE")
-        .unwrap_or_else(|_| "test_data/s2_records.jsonl".into());
+    let path =
+        std::env::var("S2_HISTORY_FILE").unwrap_or_else(|_| "test_data/s2_records.jsonl".into());
     if !std::path::Path::new(&path).exists() {
         return;
     }
-    let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
     let events = parse_s2_jsonl(&content);
     let result = check_events(&PowerSetModel(S2StreamModel), &events, None);
     assert_eq!(

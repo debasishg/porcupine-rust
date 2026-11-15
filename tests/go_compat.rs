@@ -291,7 +291,10 @@ impl Model for KvNoPartitionModel {
             }
             KvOp::Append => {
                 let current = state.get(&*input.key).cloned().unwrap_or_default();
-                next.insert(input.key.to_string(), format!("{}{}", current, &*input.value));
+                next.insert(
+                    input.key.to_string(),
+                    format!("{}{}", current, &*input.value),
+                );
                 Some(next)
             }
         }
