@@ -10,8 +10,8 @@
 //!   cargo bench --bench linearizability -- etcd_seq      # one group
 //!   cargo bench --bench linearizability -- --test        # dry-run (no timing)
 
-use criterion::{BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main};
 use criterion::measurement::WallTime;
+use criterion::{BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main};
 use porcupine::checker::check_events;
 use porcupine::{Event, EventKind, Model};
 use rayon::prelude::*;
@@ -83,9 +83,7 @@ impl Model for EtcdModel {
                         }
                     }
                 };
-                let ok = (st_matches && output.ok)
-                    || (!st_matches && !output.ok)
-                    || output.unknown;
+                let ok = (st_matches && output.ok) || (!st_matches && !output.ok) || output.unknown;
                 if ok { Some(next_state) } else { None }
             }
         }
@@ -200,14 +198,26 @@ fn parse_jepsen_log(n: usize) -> Vec<Event<EtcdInput, EtcdOutput>> {
                 pending.insert(process, eid);
 
                 let input = match op_str {
-                    ":read" => EtcdInput { op: EtcdOp::Read, arg1: 0, arg2: 0 },
-                    ":write" => EtcdInput { op: EtcdOp::Write, arg1: val.parse().unwrap(), arg2: 0 },
+                    ":read" => EtcdInput {
+                        op: EtcdOp::Read,
+                        arg1: 0,
+                        arg2: 0,
+                    },
+                    ":write" => EtcdInput {
+                        op: EtcdOp::Write,
+                        arg1: val.parse().unwrap(),
+                        arg2: 0,
+                    },
                     ":cas" => {
                         let inner = val.trim_start_matches('[').trim_end_matches(']');
                         let mut it = inner.split_whitespace();
                         let arg1 = it.next().unwrap().parse().unwrap();
                         let arg2 = it.next().unwrap().parse().unwrap();
-                        EtcdInput { op: EtcdOp::Cas, arg1, arg2 }
+                        EtcdInput {
+                            op: EtcdOp::Cas,
+                            arg1,
+                            arg2,
+                        }
                     }
                     _ => continue,
                 };
@@ -231,7 +241,12 @@ fn parse_jepsen_log(n: usize) -> Vec<Event<EtcdInput, EtcdOutput>> {
                         client_id: process,
                         kind: EventKind::Return,
                         input: None,
-                        output: Some(EtcdOutput { ok: false, exists: false, value: 0, unknown: true }),
+                        output: Some(EtcdOutput {
+                            ok: false,
+                            exists: false,
+                            value: 0,
+                            unknown: true,
+                        }),
                         id: eid,
                     });
                     continue;
@@ -245,7 +260,12 @@ fn parse_jepsen_log(n: usize) -> Vec<Event<EtcdInput, EtcdOutput>> {
                 let output = match op_str {
                     ":read" => {
                         if val == "nil" {
-                            EtcdOutput { ok: true, exists: false, value: 0, unknown: false }
+                            EtcdOutput {
+                                ok: true,
+                                exists: false,
+                                value: 0,
+                                unknown: false,
+                            }
                         } else {
                             EtcdOutput {
                                 ok: true,
@@ -255,7 +275,12 @@ fn parse_jepsen_log(n: usize) -> Vec<Event<EtcdInput, EtcdOutput>> {
                             }
                         }
                     }
-                    ":write" => EtcdOutput { ok: true, exists: false, value: 0, unknown: false },
+                    ":write" => EtcdOutput {
+                        ok: true,
+                        exists: false,
+                        value: 0,
+                        unknown: false,
+                    },
                     ":cas" => EtcdOutput {
                         ok: status == ":ok",
                         exists: false,
@@ -283,7 +308,12 @@ fn parse_jepsen_log(n: usize) -> Vec<Event<EtcdInput, EtcdOutput>> {
             client_id: _proc,
             kind: EventKind::Return,
             input: None,
-            output: Some(EtcdOutput { ok: false, exists: false, value: 0, unknown: true }),
+            output: Some(EtcdOutput {
+                ok: false,
+                exists: false,
+                value: 0,
+                unknown: true,
+            }),
             id: eid,
         });
     }
@@ -296,7 +326,11 @@ fn load_all_jepsen_logs() -> Vec<Vec<Event<EtcdInput, EtcdOutput>>> {
     (0..=102)
         .filter_map(|n| {
             let path = test_data_path(&format!("test_data/jepsen/etcd_{n:03}.log"));
-            if path.exists() { Some(parse_jepsen_log(n)) } else { None }
+            if path.exists() {
+                Some(parse_jepsen_log(n))
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -386,7 +420,11 @@ fn kv_field_value(line: &str) -> String {
     let start = line.rfind(key).unwrap() + key.len();
     let end = line.rfind('}').unwrap();
     let rest = line[start..end].trim();
-    if rest == "nil" { String::new() } else { rest.trim_matches('"').to_string() }
+    if rest == "nil" {
+        String::new()
+    } else {
+        rest.trim_matches('"').to_string()
+    }
 }
 
 // ============================================================================
@@ -411,25 +449,18 @@ fn bench_etcd_sequential(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     group.bench_function("single_file", |b| {
+        b.iter(|| pool.install(|| check_events(&EtcdModel, &single_history, None)));
+    });
+
+    group.bench_function(BenchmarkId::new("all_files", n_loaded), |b| {
         b.iter(|| {
             pool.install(|| {
-                check_events(&EtcdModel, &single_history, None)
+                for h in &all_histories {
+                    let _ = check_events(&EtcdModel, h, None);
+                }
             })
         });
     });
-
-    group.bench_function(
-        BenchmarkId::new("all_files", n_loaded),
-        |b| {
-            b.iter(|| {
-                pool.install(|| {
-                    for h in &all_histories {
-                        let _ = check_events(&EtcdModel, h, None);
-                    }
-                })
-            });
-        },
-    );
 
     group.finish();
 }
@@ -449,16 +480,13 @@ fn bench_etcd_parallel(c: &mut Criterion) {
         b.iter(|| check_events(&EtcdModel, &single_history, None));
     });
 
-    group.bench_function(
-        BenchmarkId::new("all_files", n_loaded),
-        |b| {
-            b.iter(|| {
-                all_histories.par_iter().for_each(|h| {
-                    let _ = check_events(&EtcdModel, h, None);
-                });
+    group.bench_function(BenchmarkId::new("all_files", n_loaded), |b| {
+        b.iter(|| {
+            all_histories.par_iter().for_each(|h| {
+                let _ = check_events(&EtcdModel, h, None);
             });
-        },
-    );
+        });
+    });
 
     group.finish();
 }
@@ -474,7 +502,7 @@ fn bench_kv_partitioned(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let c10_ok  = parse_kv_log("c10-ok");
+    let c10_ok = parse_kv_log("c10-ok");
     let c10_bad = parse_kv_log("c10-bad");
 
     let mut group: BenchmarkGroup<WallTime> = c.benchmark_group("kv_partitioned");

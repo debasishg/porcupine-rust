@@ -196,7 +196,9 @@ pub(crate) fn assert_partition_events_paired<I, O>(
                         cpart == part,
                         "INV-LIN-03: event id={} has Call in partition {} but Return in partition {} \
                          — call/return pairs must not be split across partitions",
-                        ev.id, cpart, part
+                        ev.id,
+                        cpart,
+                        part
                     );
                 }
                 // Returns without a matching Call are an INV-HIST-01 violation

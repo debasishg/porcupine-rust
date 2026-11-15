@@ -366,12 +366,7 @@ fn hegel_partition_idempotent_with_single_partition(tc: TestCase) {
         fn init(&self) -> Self::State {
             HashMap::new()
         }
-        fn step(
-            &self,
-            state: &Self::State,
-            input: &KvInput,
-            output: &i64,
-        ) -> Option<Self::State> {
+        fn step(&self, state: &Self::State, input: &KvInput, output: &i64) -> Option<Self::State> {
             KvModel.step(state, input, output)
         }
     }
@@ -391,7 +386,10 @@ fn hegel_cache_sound_deterministic_ops(tc: TestCase) {
     let history = tc.draw(gen_sequential_history());
     let r1 = porcupine::checker::check_operations(&RegisterModel, &history, None);
     let r2 = porcupine::checker::check_operations(&RegisterModel, &history, None);
-    assert_eq!(r1, r2, "INV-LIN-04: identical inputs must yield identical results");
+    assert_eq!(
+        r1, r2,
+        "INV-LIN-04: identical inputs must yield identical results"
+    );
 }
 
 #[hegel::test]
@@ -482,11 +480,7 @@ fn hegel_concurrent_writes_only_is_ok(tc: TestCase) {
 fn hegel_concurrent_write_overlap_read_matches_membership(tc: TestCase) {
     let write_dur = tc.draw(gs::integers::<u64>().min_value(5).max_value(30));
     let write_value = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
-    let read_call = tc.draw(
-        gs::integers::<u64>()
-            .min_value(0)
-            .max_value(write_dur - 1),
-    );
+    let read_call = tc.draw(gs::integers::<u64>().min_value(0).max_value(write_dur - 1));
     let read_dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(30));
     let arb_out = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
     let output_kind = tc.draw(gs::integers::<u32>().min_value(0).max_value(2));
@@ -640,11 +634,7 @@ fn gen_register_history(tc: TestCase) -> Vec<Operation<RegisterInput, i64>> {
         1 => {
             let write_dur = tc.draw(gs::integers::<u64>().min_value(5).max_value(30));
             let write_value = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
-            let read_call = tc.draw(
-                gs::integers::<u64>()
-                    .min_value(0)
-                    .max_value(write_dur - 1),
-            );
+            let read_call = tc.draw(gs::integers::<u64>().min_value(0).max_value(write_dur - 1));
             let read_dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(30));
             let arb_out = tc.draw(gs::integers::<i64>().min_value(-50).max_value(50));
             let output_kind = tc.draw(gs::integers::<u32>().min_value(0).max_value(2));
@@ -811,10 +801,7 @@ fn hegel_slice_order_invariance(tc: TestCase) {
     let shuffled: Vec<_> = perm.iter().map(|&i| history[i].clone()).collect();
     let r1 = porcupine::checker::check_operations(&RegisterModel, &history, None);
     let r2 = porcupine::checker::check_operations(&RegisterModel, &shuffled, None);
-    assert_eq!(
-        r1, r2,
-        "slice-order permutation must not change the result"
-    );
+    assert_eq!(r1, r2, "slice-order permutation must not change the result");
 }
 
 /// 2.5 — Append-preserves-Illegal.
@@ -867,11 +854,7 @@ fn gen_kv_history(tc: TestCase, n_keys: u8) -> Vec<Operation<KvInput, i64>> {
     let mut ts = 0u64;
     let mut history = Vec::with_capacity(n);
     for i in 0..n {
-        let key = tc.draw(
-            gs::integers::<u8>()
-                .min_value(0)
-                .max_value(n_keys - 1),
-        );
+        let key = tc.draw(gs::integers::<u8>().min_value(0).max_value(n_keys - 1));
         let is_write = tc.draw(gs::integers::<u32>().min_value(0).max_value(1)) == 1;
         let value = tc.draw(gs::integers::<i64>().min_value(0).max_value(10));
         let call = ts;
@@ -879,7 +862,11 @@ fn gen_kv_history(tc: TestCase, n_keys: u8) -> Vec<Operation<KvInput, i64>> {
         ts = return_time + 1;
         history.push(Operation {
             client_id: i as u64,
-            input: KvInput { key, is_write, value },
+            input: KvInput {
+                key,
+                is_write,
+                value,
+            },
             call,
             output: value,
             return_time,
@@ -909,8 +896,7 @@ fn hegel_kv_partition_equivalence(tc: TestCase) {
 fn hegel_kv_partition_order_invariance(tc: TestCase) {
     let history = tc.draw(gen_kv_history(3));
     let normal = porcupine::checker::check_operations(&KvModel, &history, None);
-    let reversed =
-        porcupine::checker::check_operations(&KvModelReversedPartition, &history, None);
+    let reversed = porcupine::checker::check_operations(&KvModelReversedPartition, &history, None);
     assert_eq!(
         normal, reversed,
         "reversing the partition order must preserve the result"
@@ -1177,7 +1163,10 @@ fn hegel_adversarial_read_after_writes_is_illegal(tc: TestCase) {
             let v = tc.draw(gs::integers::<i64>().min_value(1).max_value(50));
             Operation {
                 client_id: i as u64,
-                input: RegisterInput { is_write: true, value: v },
+                input: RegisterInput {
+                    is_write: true,
+                    value: v,
+                },
                 call: (i as u64) * 11,
                 output: 0,
                 return_time: (i as u64) * 11 + 5,
@@ -1188,7 +1177,10 @@ fn hegel_adversarial_read_after_writes_is_illegal(tc: TestCase) {
     let last_return = history.last().unwrap().return_time;
     history.push(Operation {
         client_id: 100,
-        input: RegisterInput { is_write: false, value: 0 },
+        input: RegisterInput {
+            is_write: false,
+            value: 0,
+        },
         call: last_return + 1,
         output: wrong_value,
         return_time: last_return + 10,
@@ -1211,14 +1203,22 @@ fn hegel_adversarial_kv_read_is_illegal(tc: TestCase) {
     let history = vec![
         Operation {
             client_id: 0,
-            input: KvInput { key: 1, is_write: true, value: write_value },
+            input: KvInput {
+                key: 1,
+                is_write: true,
+                value: write_value,
+            },
             call: 0,
             output: 0,
             return_time: 10,
         },
         Operation {
             client_id: 1,
-            input: KvInput { key: 1, is_write: false, value: 0 },
+            input: KvInput {
+                key: 1,
+                is_write: false,
+                value: 0,
+            },
             call: 11,
             output: wrong_value,
             return_time: 20,
@@ -1259,7 +1259,11 @@ impl IncrementalKv {
         self.next_ts = return_time + 1;
         self.history.push(Operation {
             client_id: self.history.len() as u64,
-            input: KvInput { key, is_write: true, value },
+            input: KvInput {
+                key,
+                is_write: true,
+                value,
+            },
             call,
             output: 0,
             return_time,
@@ -1284,7 +1288,11 @@ impl IncrementalKv {
         self.next_ts = return_time + 1;
         self.history.push(Operation {
             client_id: self.history.len() as u64,
-            input: KvInput { key, is_write: false, value: 0 },
+            input: KvInput {
+                key,
+                is_write: false,
+                value: 0,
+            },
             call,
             output: expected,
             return_time,
@@ -1349,7 +1357,10 @@ impl ConcurrentWritesChain {
         self.last_return = return_time;
         self.history.push(Operation {
             client_id: self.history.len() as u64,
-            input: RegisterInput { is_write: true, value },
+            input: RegisterInput {
+                is_write: true,
+                value,
+            },
             call,
             output: 0,
             return_time,
@@ -1417,11 +1428,7 @@ fn hegel_nd_impossible_read_is_illegal(tc: TestCase) {
     // Read returns a value that was never written and is not 0 (the initial
     // state). Both branches of the lossy step (write succeeded → `written`,
     // write lost → 0) reject it.
-    let observed = tc.draw(
-        gs::integers::<i64>()
-            .min_value(-1000)
-            .max_value(-1),
-    );
+    let observed = tc.draw(gs::integers::<i64>().min_value(-1000).max_value(-1));
     let history = vec![
         Operation {
             client_id: 0,
@@ -1543,8 +1550,7 @@ fn hegel_incremental_register_is_linearizable(tc: TestCase) {
 fn hegel_partition_events_agrees_with_partition_ops(tc: TestCase) {
     let history = tc.draw(gen_kv_history(3));
     let events = ops_to_events_sorted_by_time(&history);
-    let r_events =
-        porcupine::checker::check_events(&KvEventPartitionModel, &events, None);
+    let r_events = porcupine::checker::check_events(&KvEventPartitionModel, &events, None);
     let r_ops = porcupine::checker::check_operations(&KvModel, &history, None);
     assert_eq!(
         r_events, r_ops,
@@ -1559,8 +1565,7 @@ fn hegel_partition_events_agrees_with_partition_ops(tc: TestCase) {
 fn hegel_partition_events_agrees_with_no_partition(tc: TestCase) {
     let history = tc.draw(gen_kv_history(3));
     let events = ops_to_events_sorted_by_time(&history);
-    let r_partitioned =
-        porcupine::checker::check_events(&KvEventPartitionModel, &events, None);
+    let r_partitioned = porcupine::checker::check_events(&KvEventPartitionModel, &events, None);
     let r_whole = porcupine::checker::check_events(&KvNoPartition, &events, None);
     assert_eq!(
         r_partitioned, r_whole,

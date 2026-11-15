@@ -683,9 +683,17 @@ fn arb_mixed_register_history() -> impl Strategy<Value = Vec<Operation<RegisterI
     prop_oneof![
         arb_concurrent_writes(2, 6).boxed(),
         arb_overlap_write_read()
-            .prop_map(|(write_value, write_dur, read_call, read_dur, read_output)| {
-                build_overlap_write_read(write_value, write_dur, read_call, read_dur, read_output)
-            })
+            .prop_map(
+                |(write_value, write_dur, read_call, read_dur, read_output)| {
+                    build_overlap_write_read(
+                        write_value,
+                        write_dur,
+                        read_call,
+                        read_dur,
+                        read_output,
+                    )
+                }
+            )
             .boxed(),
         arb_two_writers_late_reader()
             .prop_map(|(v1, v2, t1, w2_call, w2_dur, r_dur, read_output)| {
@@ -963,14 +971,57 @@ proptest! {
 #[test]
 fn prop_disjoint_keys_independent() {
     let history = vec![
-        Operation { client_id: 0, input: KvInput { key: 1, is_write: true,  value: 100 }, call: 0,  output: 0,   return_time: 10 },
-        Operation { client_id: 1, input: KvInput { key: 2, is_write: true,  value: 200 }, call: 5,  output: 0,   return_time: 15 }, // overlaps key 1's write but disjoint key
-        Operation { client_id: 2, input: KvInput { key: 1, is_write: false, value: 0   }, call: 11, output: 100, return_time: 20 },
-        Operation { client_id: 3, input: KvInput { key: 2, is_write: false, value: 0   }, call: 16, output: 200, return_time: 25 },
+        Operation {
+            client_id: 0,
+            input: KvInput {
+                key: 1,
+                is_write: true,
+                value: 100,
+            },
+            call: 0,
+            output: 0,
+            return_time: 10,
+        },
+        Operation {
+            client_id: 1,
+            input: KvInput {
+                key: 2,
+                is_write: true,
+                value: 200,
+            },
+            call: 5,
+            output: 0,
+            return_time: 15,
+        }, // overlaps key 1's write but disjoint key
+        Operation {
+            client_id: 2,
+            input: KvInput {
+                key: 1,
+                is_write: false,
+                value: 0,
+            },
+            call: 11,
+            output: 100,
+            return_time: 20,
+        },
+        Operation {
+            client_id: 3,
+            input: KvInput {
+                key: 2,
+                is_write: false,
+                value: 0,
+            },
+            call: 16,
+            output: 200,
+            return_time: 25,
+        },
     ];
     let result = porcupine::checker::check_operations(&KvModel, &history, None);
-    assert_eq!(result, CheckResult::Ok,
-        "INV-LIN-03: writes to disjoint keys must be independent regardless of real-time overlap");
+    assert_eq!(
+        result,
+        CheckResult::Ok,
+        "INV-LIN-03: writes to disjoint keys must be independent regardless of real-time overlap"
+    );
 }
 
 proptest! {
@@ -1205,14 +1256,20 @@ proptest! {
 fn prop_zero_duration_op_handled() {
     let history = vec![Operation {
         client_id: 0,
-        input: RegisterInput { is_write: true, value: 42 },
+        input: RegisterInput {
+            is_write: true,
+            value: 42,
+        },
         call: 5,
         output: 0,
         return_time: 5, // zero duration — call == return_time
     }];
     let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
-    assert_eq!(result, CheckResult::Ok,
-        "zero-duration op must be handled without panicking");
+    assert_eq!(
+        result,
+        CheckResult::Ok,
+        "zero-duration op must be handled without panicking"
+    );
 }
 
 /// 6.2 — All-coincident timestamps: full concurrency among all ops.
@@ -1223,13 +1280,43 @@ fn prop_zero_duration_op_handled() {
 #[test]
 fn prop_all_coincident_timestamps_handled() {
     let history = vec![
-        Operation { client_id: 0, input: RegisterInput { is_write: true, value: 1 }, call: 0, output: 0, return_time: 1 },
-        Operation { client_id: 1, input: RegisterInput { is_write: true, value: 2 }, call: 0, output: 0, return_time: 1 },
-        Operation { client_id: 2, input: RegisterInput { is_write: true, value: 3 }, call: 0, output: 0, return_time: 1 },
+        Operation {
+            client_id: 0,
+            input: RegisterInput {
+                is_write: true,
+                value: 1,
+            },
+            call: 0,
+            output: 0,
+            return_time: 1,
+        },
+        Operation {
+            client_id: 1,
+            input: RegisterInput {
+                is_write: true,
+                value: 2,
+            },
+            call: 0,
+            output: 0,
+            return_time: 1,
+        },
+        Operation {
+            client_id: 2,
+            input: RegisterInput {
+                is_write: true,
+                value: 3,
+            },
+            call: 0,
+            output: 0,
+            return_time: 1,
+        },
     ];
     let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
-    assert_eq!(result, CheckResult::Ok,
-        "all-coincident-timestamp writes must be linearizable");
+    assert_eq!(
+        result,
+        CheckResult::Ok,
+        "all-coincident-timestamp writes must be linearizable"
+    );
 }
 
 /// 6.3 — Timestamps near `u64::MAX` must not overflow in the entry-list
@@ -1239,12 +1326,33 @@ fn prop_all_coincident_timestamps_handled() {
 fn prop_near_u64_max_timestamps_handled() {
     let base = u64::MAX - 1000;
     let history = vec![
-        Operation { client_id: 0, input: RegisterInput { is_write: true, value: 1 }, call: base,           output: 0, return_time: base + 100 },
-        Operation { client_id: 1, input: RegisterInput { is_write: false, value: 0 }, call: base + 200,     output: 1, return_time: base + 300 },
+        Operation {
+            client_id: 0,
+            input: RegisterInput {
+                is_write: true,
+                value: 1,
+            },
+            call: base,
+            output: 0,
+            return_time: base + 100,
+        },
+        Operation {
+            client_id: 1,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: base + 200,
+            output: 1,
+            return_time: base + 300,
+        },
     ];
     let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
-    assert_eq!(result, CheckResult::Ok,
-        "timestamps near u64::MAX must not overflow");
+    assert_eq!(
+        result,
+        CheckResult::Ok,
+        "timestamps near u64::MAX must not overflow"
+    );
 }
 
 /// 6.4 — Extreme `i64` values (`MIN`, `MAX`) flow through `RegisterInput`
@@ -1252,14 +1360,53 @@ fn prop_near_u64_max_timestamps_handled() {
 #[test]
 fn prop_extreme_i64_values_handled() {
     let history = vec![
-        Operation { client_id: 0, input: RegisterInput { is_write: true,  value: i64::MIN }, call: 0,  output: 0,        return_time: 10 },
-        Operation { client_id: 1, input: RegisterInput { is_write: false, value: 0 },        call: 11, output: i64::MIN, return_time: 20 },
-        Operation { client_id: 2, input: RegisterInput { is_write: true,  value: i64::MAX }, call: 21, output: 0,        return_time: 30 },
-        Operation { client_id: 3, input: RegisterInput { is_write: false, value: 0 },        call: 31, output: i64::MAX, return_time: 40 },
+        Operation {
+            client_id: 0,
+            input: RegisterInput {
+                is_write: true,
+                value: i64::MIN,
+            },
+            call: 0,
+            output: 0,
+            return_time: 10,
+        },
+        Operation {
+            client_id: 1,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: 11,
+            output: i64::MIN,
+            return_time: 20,
+        },
+        Operation {
+            client_id: 2,
+            input: RegisterInput {
+                is_write: true,
+                value: i64::MAX,
+            },
+            call: 21,
+            output: 0,
+            return_time: 30,
+        },
+        Operation {
+            client_id: 3,
+            input: RegisterInput {
+                is_write: false,
+                value: 0,
+            },
+            call: 31,
+            output: i64::MAX,
+            return_time: 40,
+        },
     ];
     let result = porcupine::checker::check_operations(&RegisterModel, &history, None);
-    assert_eq!(result, CheckResult::Ok,
-        "i64::MIN/MAX values must round-trip through write/read correctly");
+    assert_eq!(
+        result,
+        CheckResult::Ok,
+        "i64::MIN/MAX values must round-trip through write/read correctly"
+    );
 }
 
 proptest! {
@@ -1411,7 +1558,10 @@ fn prop_reversed_pair_order_panics_in_debug() {
         Event {
             client_id: 0,
             kind: EventKind::Call,
-            input: Some(RegisterInput { is_write: true, value: 1 }),
+            input: Some(RegisterInput {
+                is_write: true,
+                value: 1,
+            }),
             output: None,
             id: 0,
         },
@@ -1474,23 +1624,28 @@ fn prop_parallel_above_threshold_agrees_with_sequential() {
     let n_keys: u8 = 4;
     let history: Vec<Operation<KvInput, i64>> = (0..n_ops)
         .map(|i| Operation {
-            client_id:   i as u64,
-            input:       KvInput {
-                key:      (i as u8) % n_keys,
+            client_id: i as u64,
+            input: KvInput {
+                key: (i as u8) % n_keys,
                 is_write: true,
-                value:    i as i64,
+                value: i as i64,
             },
-            call:        (i as u64) * 2,
-            output:      0,
+            call: (i as u64) * 2,
+            output: 0,
             return_time: (i as u64) * 2 + 1,
         })
         .collect();
     let r_partitioned = porcupine::checker::check_operations(&KvModel, &history, None);
-    let r_whole       = porcupine::checker::check_operations(&KvNoPartition, &history, None);
-    assert_eq!(r_partitioned, r_whole,
-        "rayon path and single-partition sequential path must agree on a 2200-entry KV history");
-    assert_eq!(r_partitioned, CheckResult::Ok,
-        "sequential writes-only KV history must be Ok");
+    let r_whole = porcupine::checker::check_operations(&KvNoPartition, &history, None);
+    assert_eq!(
+        r_partitioned, r_whole,
+        "rayon path and single-partition sequential path must agree on a 2200-entry KV history"
+    );
+    assert_eq!(
+        r_partitioned,
+        CheckResult::Ok,
+        "sequential writes-only KV history must be Ok"
+    );
 }
 
 /// 11.5 — Rayon path correctly surfaces Illegal across partitions on a
@@ -1505,14 +1660,14 @@ fn prop_parallel_above_threshold_surfaces_illegal() {
     let n_keys: u8 = 4;
     let mut history: Vec<Operation<KvInput, i64>> = (0..n_ops)
         .map(|i| Operation {
-            client_id:   i as u64,
-            input:       KvInput {
-                key:      (i as u8) % n_keys,
+            client_id: i as u64,
+            input: KvInput {
+                key: (i as u8) % n_keys,
                 is_write: true,
-                value:    i as i64,
+                value: i as i64,
             },
-            call:        (i as u64) * 2,
-            output:      0,
+            call: (i as u64) * 2,
+            output: 0,
             return_time: (i as u64) * 2 + 1,
         })
         .collect();
@@ -1521,9 +1676,14 @@ fn prop_parallel_above_threshold_surfaces_illegal() {
     last.input.is_write = false;
     last.output = -9999;
     let r_partitioned = porcupine::checker::check_operations(&KvModel, &history, None);
-    let r_whole       = porcupine::checker::check_operations(&KvNoPartition, &history, None);
-    assert_eq!(r_partitioned, r_whole,
-        "rayon and sequential paths must agree on illegal verdict");
-    assert_eq!(r_partitioned, CheckResult::Illegal,
-        "INV-LIN-02 + INV-LIN-03: an illegal partition must surface through rayon dispatch");
+    let r_whole = porcupine::checker::check_operations(&KvNoPartition, &history, None);
+    assert_eq!(
+        r_partitioned, r_whole,
+        "rayon and sequential paths must agree on illegal verdict"
+    );
+    assert_eq!(
+        r_partitioned,
+        CheckResult::Illegal,
+        "INV-LIN-02 + INV-LIN-03: an illegal partition must surface through rayon dispatch"
+    );
 }
