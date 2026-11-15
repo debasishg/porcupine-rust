@@ -44,16 +44,18 @@ Benchmarks are run with [Criterion.rs](https://github.com/bheisler/criterion.rs)
 
 ### Results (Apple M1, 3-run average)
 
+Rust figures measured with Rust 1.100.0 and Criterion 0.8; Go figures are from the earlier Go run and were not re-measured.
+
 | Benchmark | Rust | Go | Speedup |
 |-----------|------|----|---------|
-| etcd — single file (sequential) | 40.8 µs | 114 µs | **2.8×** |
-| etcd — 102 files (sequential) | 145.1 ms | 290 ms | **2.0×** |
-| etcd — single file (parallel) | 31.9 µs | 114 µs | **3.6×** |
-| etcd — 102 files (parallel) | 77.8 ms | 290 ms | **3.7×** |
-| kv `c10-ok` (sequential) | 180.4 µs | 239 µs | **1.32×** |
-| kv `c10-bad` (sequential) | 84.7 µs | 168 µs | **1.98×** |
-| kv `c10-ok` (parallel) | 175.5 µs | 239 µs | **1.36×** |
-| kv `c10-bad` (parallel) | 79.8 µs | 168 µs | **2.10×** |
+| etcd — single file (sequential) | 32.8 µs | 114 µs | **3.5×** |
+| etcd — 102 files (sequential) | 142.8 ms | 290 ms | **2.0×** |
+| etcd — single file (parallel) | 28.2 µs | 114 µs | **4.0×** |
+| etcd — 102 files (parallel) | 73.8 ms | 290 ms | **3.9×** |
+| kv `c10-ok` (sequential) | 164.8 µs | 239 µs | **1.45×** |
+| kv `c10-bad` (sequential) | 76.2 µs | 168 µs | **2.20×** |
+| kv `c10-ok` (parallel) | 158.7 µs | 239 µs | **1.51×** |
+| kv `c10-bad` (parallel) | 73.0 µs | 168 µs | **2.30×** |
 
 Rust leads Go on every benchmark. The key contributors are: compact `Node` struct with `u32` indices and sentinel-based linked-list (3× smaller index overhead per node, better cache-line utilization); deferred bitset clone with incremental hash computation (clone only on cache miss, `hash_with_bit()` avoids O(chunks) scan); `FxHashMap` for the DFS cache (replacing SipHash); `SmallVec<[u64; 4]>` for the bitset (zero heap allocation for ≤ 256 operations); `SmallVec<[CacheEntry; 2]>` for the DFS cache collision list (eliminates heap allocation for the common 0–1 collision case); `Arc<str>` for KV model state (atomic refcount bump instead of `String` clone on every DFS step); a single-partition fast path that skips rayon dispatch; a sequential fallback for small inputs (< 2000 total entries); and `#[inline]` hints on the hot-path `lift`/`unlift`/`cache_contains` functions called thousands of times per history check.
 
@@ -70,7 +72,7 @@ Rust leads Go on every benchmark. The key contributors are: compact `Node` struc
 | kv `c10-ok` (parallel) | 100.5 µs | 188 µs | **1.9×** |
 | kv `c10-bad` (parallel) | 43.5 µs | 93 µs | **2.1×** |
 
-The M5 Pro gives both languages a ~1.3–1.8× raw speedup over M1. Rust benefits more from M5's wider execution pipeline — the etcd parallel all-files benchmark improved from 3.5× → 5.9× advantage over Go. The KV partitioned benchmarks also widened their Rust-over-Go margin slightly.
+The M5 Pro gives both languages a ~1.3–1.8× raw speedup over M1. Rust benefits more from M5's wider execution pipeline — the etcd parallel all-files benchmark improved from 3.9× → 5.9× advantage over Go. The KV partitioned benchmarks also widened their Rust-over-Go margin slightly.
 
 ## Status
 
