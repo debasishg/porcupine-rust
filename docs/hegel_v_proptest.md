@@ -73,37 +73,43 @@ generators on both sides produce comparable inputs.
 
 ### Speed
 
-proptest runs entirely in-process. Hegel talks to a Python `hegel-core`
-server over a local socket — every `tc.draw` is a round-trip.
+Both run in-process. (Through `hegeltest 0.8.x`, Hegel talked to a Python
+`hegel-core` server over a local socket, so every `tc.draw` was a
+round-trip; from `0.42` onward a native Rust port of the engine is the only
+backend.)
 
-Concrete numbers from this project, 100 cases per test:
+Concrete numbers from this project (Rust 1.100, `hegeltest 0.52`, debug
+build):
 
 | Suite | Tests | Wall time |
 | --- | --- | --- |
-| `cargo test --test property_tests` | 18 | ~0.05 s |
-| `cargo test --test hegel_properties` | 17 | ~2.2 s |
+| `cargo test --test property_tests` | 51 | ~0.11 s |
+| `cargo test --test hegel_properties` | 44 | ~0.27 s |
 
-For tight inner loops or large case counts, proptest is two orders of
-magnitude cheaper.
+The gap that used to be two orders of magnitude (~0.05 s vs ~2.2 s under
+the Python sidecar) is now a small constant factor.
 
 ### Zero extra runtime
 
 proptest is pure Rust, vendored as a normal cargo dependency.
 
-Hegel needs `uv` and a Python sidecar. The first run downloads `uv 0.11.x`
-into `~/.cache/hegel` (~5 MB) and starts a Python server. Subsequent runs
-are instant once the cache is warm, but it is one more thing that can go
-wrong (network on first run, Python compatibility, sidecar crashes, log
-files in `.hegel/` to gitignore).
+Hegel is now pure Rust as well. The old `uv` download, Python sidecar and
+`.hegel/server.*.log` files went away with the native engine. The sidecar
+was fragile in practice: under `hegeltest 0.8.x`, `uv` resolved
+`hegel-core 0.4.7` against a newer Hypothesis that no longer had
+`ConjectureRunner.interesting_examples`, and every Hegel test hung until
+we upgraded. Hegel still writes an example database to `.hegel/`.
 
 ### Stability
 
 proptest is mature and stable; the API has not meaningfully changed in
 years.
 
-`hegeltest 0.8.x` ships with an explicit beta disclaimer and reserves the
-right to make breaking changes "if it makes Hegel a better PBT library." The
-underlying Hypothesis engine is rock-solid; the Rust binding is not yet.
+`hegeltest` is still pre-1.0 and changes quickly. Going from 0.8 to 0.52
+broke two APIs used here: `#[hegel::composite]` generators now take
+`&TestCase`, and `hegel::stateful::run(m, tc)` became the builder
+`hegel::stateful::machine(m).run(tc)`. Expect to touch the Hegel suite on
+upgrades.
 
 ### Ecosystem
 

@@ -22,8 +22,8 @@
 //!
 //! Run:  cargo test --test hegel_properties
 //!
-//! Hegel will download a private copy of `uv` on first use if `uv` is not on
-//! your `PATH` (see https://hegel.dev/reference/installation).
+//! Hegel (`hegeltest` ≥ 0.42) runs its engine in-process; no Python or `uv`
+//! install is needed.
 
 use std::collections::{HashMap, HashSet};
 
@@ -80,7 +80,7 @@ impl Model for KvSinglePartition {
 /// Generate a sequential register history of length `len` with arbitrary
 /// payload values. All ops are writes; outputs are ignored.
 #[hegel::composite]
-fn gen_sequential_history(tc: TestCase) -> Vec<Operation<RegisterInput, i64>> {
+fn gen_sequential_history(tc: &TestCase) -> Vec<Operation<RegisterInput, i64>> {
     let len = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
     let mut ts = 0u64;
     let mut ops = Vec::with_capacity(len);
@@ -105,7 +105,7 @@ fn gen_sequential_history(tc: TestCase) -> Vec<Operation<RegisterInput, i64>> {
 }
 
 #[hegel::composite]
-fn gen_kv_sequential_history(tc: TestCase) -> Vec<Operation<KvInput, i64>> {
+fn gen_kv_sequential_history(tc: &TestCase) -> Vec<Operation<KvInput, i64>> {
     let len = tc.draw(gs::integers::<usize>().min_value(0).max_value(10));
     let mut ts = 0u64;
     let mut ops = Vec::with_capacity(len);
@@ -434,7 +434,7 @@ fn hegel_events_agree_with_operations(tc: TestCase) {
 /// drawn independently in [0, 40] / [1, 40] — windows overlap with high
 /// probability.
 #[hegel::composite]
-fn gen_concurrent_writes_history(tc: TestCase) -> Vec<Operation<RegisterInput, i64>> {
+fn gen_concurrent_writes_history(tc: &TestCase) -> Vec<Operation<RegisterInput, i64>> {
     let n = tc.draw(gs::integers::<usize>().min_value(2).max_value(8));
     let mut ops = Vec::with_capacity(n);
     for i in 0..n {
@@ -627,7 +627,7 @@ fn hegel_events_agree_with_operations_on_concurrent_history(tc: TestCase) {
 /// Mix of generators producing both Ok and Illegal histories so the
 /// algebraic checks below exercise both verdicts.
 #[hegel::composite]
-fn gen_register_history(tc: TestCase) -> Vec<Operation<RegisterInput, i64>> {
+fn gen_register_history(tc: &TestCase) -> Vec<Operation<RegisterInput, i64>> {
     let kind = tc.draw(gs::integers::<u32>().min_value(0).max_value(3));
     match kind {
         0 => tc.draw(gen_concurrent_writes_history()),
@@ -849,7 +849,7 @@ fn hegel_append_preserves_illegal(tc: TestCase) {
 /// Read outputs are pre-set to the requested value, which may or may not
 /// match the actual register state — produces a mix of Ok/Illegal.
 #[hegel::composite]
-fn gen_kv_history(tc: TestCase, n_keys: u8) -> Vec<Operation<KvInput, i64>> {
+fn gen_kv_history(tc: &TestCase, n_keys: u8) -> Vec<Operation<KvInput, i64>> {
     let n = tc.draw(gs::integers::<usize>().min_value(2).max_value(8));
     let mut ts = 0u64;
     let mut history = Vec::with_capacity(n);
@@ -1314,7 +1314,7 @@ fn hegel_incremental_kv_is_linearizable(tc: TestCase) {
         state: HashMap::new(),
         next_ts: 0,
     };
-    hegel::stateful::run(machine, tc);
+    hegel::stateful::machine(machine).run(tc);
 }
 
 /// 7.3 — Concurrent writes-only state machine.  Each rule appends a
@@ -1382,7 +1382,7 @@ fn hegel_concurrent_writes_chain_is_linearizable(tc: TestCase) {
         last_call: 0,
         last_return: 0,
     };
-    hegel::stateful::run(machine, tc);
+    hegel::stateful::machine(machine).run(tc);
 }
 
 // ===========================================================================
@@ -1531,7 +1531,7 @@ fn hegel_incremental_register_is_linearizable(tc: TestCase) {
         history: Vec::new(),
         next_ts: 0,
     };
-    hegel::stateful::run(machine, tc);
+    hegel::stateful::machine(machine).run(tc);
 }
 
 // ===========================================================================

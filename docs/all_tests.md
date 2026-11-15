@@ -11,7 +11,6 @@ All tests, how to run them, what they verify, and which invariants they cover.
 | Rust / Cargo | stable | `rustup update stable` |
 | Quint CLI | ≥ 0.31.0 | `npm install -g @informalsystems/quint` |
 | Java | ≥ 17 | Required by Apalache (invoked by `quint verify`) |
-| `uv` (Python runner) | any recent | Auto-downloaded into `~/.cache/hegel` on first Hegel test run if not on `PATH`; or install per [astral.sh/uv](https://docs.astral.sh/uv/) |
 
 Verify:
 
@@ -482,7 +481,7 @@ rayon-vs-sequential dispatch threshold in `check_parallel`.
 cargo test --test hegel_properties
 ```
 
-Uses [Hegel](https://hegel.dev), Antithesis's universal property-based testing protocol — a [Hypothesis](https://github.com/hypothesisworks/hypothesis)-powered generator/shrinker engine with a Rust binding (the `hegeltest` crate, imported as `hegel`). On first run Hegel downloads a private copy of `uv` into `~/.cache/hegel` if `uv` is not already on `PATH`, then talks to a `hegel-core` Python sidecar over a local socket.
+Uses [Hegel](https://hegel.dev), Antithesis's universal property-based testing protocol — a [Hypothesis](https://github.com/hypothesisworks/hypothesis)-powered generator/shrinker engine with a Rust binding (the `hegeltest` crate, imported as `hegel`). Since `hegeltest 0.42` the engine is a native Rust port that runs in-process; there is no Python or `uv` dependency.
 
 This suite mirrors the `proptest` suite (§4) using Hegel's generator/shrinker, plus a few properties that aren't covered by `proptest` (history prefixes, partition idempotence, an incremental stateful machine).
 
@@ -493,7 +492,7 @@ This suite mirrors the `proptest` suite (§4) using Hegel's generator/shrinker, 
 - Tests are written against the same Hegel protocol available in Go, C++, TS, and OCaml — useful if the porcupine spec ever needs to be cross-validated against a non-Rust implementation.
 - Hegel tests can be lifted into Antithesis's deterministic simulator without rewriting; each `tc.draw` becomes a controlled choice point.
 
-Tradeoff: each test case round-trips through the `hegel-core` sidecar, so the suite is slower than proptest (~7.5 s for 17 × 100 cases). Keep proptest for fast inner-loop coverage; use Hegel as the deeper, slower gate.
+Tradeoff: the suite is somewhat slower than proptest (~0.27 s for the 44 Hegel tests vs ~0.11 s for the 51 proptest tests, debug build). Keep proptest for fast inner-loop coverage; use Hegel as the deeper gate.
 
 For a deeper comparison — pros and cons of each engine, when to reach for which, and the rationale for keeping both — see [`docs/hegel_v_proptest.md`](./hegel_v_proptest.md).
 
@@ -630,7 +629,7 @@ random search adds nothing. Hegel mirrors only the long-chain test.
 | `hegel_partition_events_agrees_with_partition_ops` | INV-LIN-03 | `KvEventPartitionModel.check_events` ≡ `KvModel.check_operations` on the same history |
 | `hegel_partition_events_agrees_with_no_partition` | INV-LIN-03 | `KvEventPartitionModel.check_events` ≡ `KvNoPartition.check_events` |
 
-**Expected output**: 44 tests, all passing (≈ 6–8 s including the first-run `uv` install of ~5 MB).
+**Expected output**: 44 tests, all passing (≈ 0.3 s, debug build).
 
 ---
 
@@ -859,7 +858,7 @@ Runs all suites without feature flags: **153 tests** passing across eight test t
 | S2 stream model | `cargo test --test s2_model` | 6 |
 | Doc tests | `cargo test --doc` | 2 |
 
-rayon is an unconditional dependency; no feature flags are required for any of the above. The Hegel suite auto-installs `uv` into `~/.cache/hegel` on first run if `uv` is not already on `PATH`.
+rayon is an unconditional dependency; no feature flags are required for any of the above. The Hegel suite needs no external runtime.
 
 ### Run everything including MBT (Quint required)
 
