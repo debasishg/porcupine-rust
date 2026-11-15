@@ -199,6 +199,7 @@ impl Model for RawKvModel {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // flat constructor mirroring the TiPocket record fields
 fn rawkv_op(
     id: u64,
     op: u8,

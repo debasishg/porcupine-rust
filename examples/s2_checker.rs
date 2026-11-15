@@ -92,18 +92,15 @@ impl NondeterministicModel for S2StreamModel {
                 match output {
                     S2Output::AppendDefiniteFailure => vec![state.clone()],
                     S2Output::AppendIndefiniteFailure => {
-                        if let Some(bt) = fencing_token {
-                            if let Some(ft) = &state.fencing_token {
-                                if bt != ft {
+                        if let Some(bt) = fencing_token
+                            && let Some(ft) = &state.fencing_token
+                                && bt != ft {
                                     return vec![state.clone()];
                                 }
-                            }
-                        }
-                        if let Some(msn) = match_seq_num {
-                            if *msn != state.tail {
+                        if let Some(msn) = match_seq_num
+                            && *msn != state.tail {
                                 return vec![state.clone()];
                             }
-                        }
                         vec![optimistic, state.clone()]
                     }
                     S2Output::AppendSuccess { tail } => {
@@ -114,11 +111,10 @@ impl NondeterministicModel for S2StreamModel {
                                 _ => {}
                             }
                         }
-                        if let Some(msn) = match_seq_num {
-                            if *msn != state.tail {
+                        if let Some(msn) = match_seq_num
+                            && *msn != state.tail {
                                 return vec![];
                             }
-                        }
                         if *tail != optimistic.tail {
                             return vec![];
                         }
