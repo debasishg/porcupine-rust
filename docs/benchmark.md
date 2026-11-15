@@ -38,7 +38,7 @@ hyperfine --warmup 3 --runs 10 \
 Add this to `Cargo.toml` (dev-dependencies):
 ```toml
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 ```
 
 Create `benches/linearizability.rs`:
